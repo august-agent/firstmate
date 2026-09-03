@@ -1,0 +1,12 @@
+Auto-arm failed-claim evidence
+================================
+hook_exit=2
+operator_visible_output:
+firstmate watcher auto-arm FAILED - the Stop-owned automatic supervision mechanism could not claim recovery: stale session lock recovery failed.
+Do not launch a manual background arm from this notice; investigate the automatic Stop hook claim path before ending blind.
+persisted_failure_epoch:
+epoch=17884388780000001 owner_pid=29817 outcome=failed baseline=absent reset=0 updated_at=1788438878 session_owner_pid=9999999 claimant_pid=1951
+notice_marker=/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-claude-stop-autoarm.KZKNoL/evidence-stale-recovery/state/.claude-autoarm-failure-notified/0.1951
+notice_marker_present=yes
+arm_invoked=no
+mutation_fence_owner=9999999 claimant=1951

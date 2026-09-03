@@ -1,0 +1,26 @@
+Claude Stop auto-arm live evidence
+==================================
+Tracked Stop hook registration (normalized JSON):
+[{"hooks":[{"type":"command","command":"[ -z \"${GROK_AGENT:-}${GROK_HOOK_EVENT:-}\" ] || exit 0; exec \"$CLAUDE_PROJECT_DIR\"/bin/fm-turnend-guard.sh --claude"},{"type":"command","command":"[ -z \"${GROK_AGENT:-}${GROK_HOOK_EVENT:-}\" ] || exit 0; exec \"$CLAUDE_PROJECT_DIR\"/bin/fm-claude-stop-autoarm.sh","asyncRewake":true,"timeout":28800}]}]
+
+Final persisted lifecycle state:
+session_lock=20797
+epoch=epoch=2 owner_pid=23941 outcome=rewake updated_at=1788438762 session_owner_pid=20797
+arm_cycles=2
+  arm-run=1 pid=23644
+  arm-run=2 pid=24429
+model_wake_drains=2
+stop_feedback_deliveries=3
+visible_rewake_reasons:
+  stale: fixture-rapid-1
+  stale: fixture-rapid-2
+authenticated_stop_deliveries:
+  autoarm_trace hook_pid=23195 lock_pid=20797 foreground_owner_in_hook_ancestry=1 spawned_by_authorizes_lock_owner=0 session_lock_owned_by_self=1
+  autoarm_trace hook_pid=23941 lock_pid=20797 foreground_owner_in_hook_ancestry=1 spawned_by_authorizes_lock_owner=0 session_lock_owned_by_self=1
+  autoarm_trace hook_pid=25214 lock_pid=20797 foreground_owner_in_hook_ancestry=1 spawned_by_authorizes_lock_owner=0 session_lock_owned_by_self=1
+model_issued_tool_calls:
+  bin/fm-session-start.sh
+  bin/fm-wake-drain.sh
+  bin/fm-wake-drain.sh
+failure_marker_count=0
+remaining_autoarm_or_watcher_lock_count=0

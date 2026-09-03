@@ -1,0 +1,7 @@
+Turn-end guard attended alarm evidence
+=======================================
+guard_exit=0
+user_visible_hook_response:
+{"systemMessage":"FIRSTMATE SUPERVISION IS GENUINELY DOWN: 1 task(s) in flight, the Stop-owned auto-arm exhausted its bounded retries and one failure notice, no watcher or automatic continuation exists, and the block budget is exhausted. Keep this session attended and diagnose the automatic Stop-hook and watcher startup before relying on unattended supervision."}
+persisted_alarm_markers:
+state/.claude-autoarm-failure-alarmed/0
