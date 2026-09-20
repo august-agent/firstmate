@@ -361,10 +361,21 @@ function metadataWorkspace(file) {
     descriptor = fs.openSync(file, "r");
     const buffer = Buffer.alloc(65536);
     const length = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
-    const newline = buffer.indexOf(10, 0);
-    if (newline < 0 || newline >= length) return null;
-    const record = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
-    return record?.payload?.record?.workspace_root ?? null;
+    const lines = buffer.subarray(0, length).toString("utf8").split("\n");
+    if (length === buffer.length && buffer[length - 1] !== 10) lines.pop();
+    for (const line of lines) {
+      if (!line) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (record?.payload_type !== "runtime.session.metadata") continue;
+      const workspace = record?.payload?.record?.workspace_root;
+      if (typeof workspace === "string" && workspace.length > 0) return workspace;
+    }
+    return null;
   } catch {
     return null;
   } finally {

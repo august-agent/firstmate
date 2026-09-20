@@ -90,7 +90,8 @@ A two-turn session produced exactly two run brackets, the second closed by an Es
 78 {"kind":"run","run_id":"b50dac92-...","event":{"kind":"terminal","terminal":"cancelled","reason":"cancelled during model step"}}
 ```
 
-The log's first record carries the workspace binding key:
+Muse 0.1 writes the workspace binding metadata as the first record.
+Muse 1.3 writes a retained permission transaction first and the same `runtime.session.metadata` record immediately after it, so the resolver scans the bounded opening records rather than assuming the first line is metadata:
 
 ```
 "payload_type": "runtime.session.metadata",

@@ -27,10 +27,15 @@ TMP_ROOT=$(fm_test_tmproot fm-muse-harness)
 
 # --- session-log fixtures ---------------------------------------------------
 
-# muse_log_metadata <workspace-root>: the first record of every session log,
-# which is what binds a log to a task worktree.
+# muse_log_metadata <workspace-root>: the metadata record that binds a log to a
+# task worktree. Muse 0.1 writes it first; Muse 1.3 writes a retained permission
+# frame first and the metadata record second.
 muse_log_metadata() {
   printf '{"schema_version":1,"id":"d77de583","stream":{"kind":"session","id":"52f21aea"},"sequence":1,"record_type":"event","durability":"durable","payload_type":"runtime.session.metadata","payload":{"kind":"metadata","record":{"workspace_root":"%s","provider_id":"meta","build":{"sha":"427a430436","semver":"0.1.0"}}}}\n' "$1"
+}
+
+muse_log_permission_frame() {
+  printf '%s\n' '{"retained_frame":"session_permission_transaction","frame_schema_version":1,"outer_log_ordinal":1,"transaction_id":"permission-1","children":[{"child_index":0,"record_json":"{\"schema_version\":1,\"payload_type\":\"runtime.session.permission_format_declared\",\"payload\":{\"schema_version\":1,\"format\":\"profile_v1\"}}"}]}'
 }
 
 muse_log_run_started() {  # <run-id>
@@ -60,6 +65,18 @@ write_session_log() {
   mkdir -p "$dir"
   path="$dir/session.jsonl"
   muse_log_metadata "$ws" > "$path"
+  cat >> "$path"
+  printf '%s\n' "$path"
+}
+
+# write_muse_13_session_log has Muse 1.3's permission frame before metadata.
+write_muse_13_session_log() {
+  local root=$1 y=$2 m=$3 d=$4 uuid=$5 ws=$6 dir path
+  dir="$root/$y/$m/$d/$uuid"
+  mkdir -p "$dir"
+  path="$dir/session.jsonl"
+  muse_log_permission_frame > "$path"
+  muse_log_metadata "$ws" >> "$path"
   cat >> "$path"
   printf '%s\n' "$path"
 }
@@ -1088,6 +1105,44 @@ EOF
   pass "the session binding folds only the log matching this task's worktree"
 }
 
+test_muse_13_permission_frame_does_not_hide_workspace_metadata() {
+  local dir state id root verdict target today year month day pin
+  dir="$TMP_ROOT/muse-13-permission-frame"
+  state="$dir/state"
+  root="$dir/sessions"
+  id=muse13task
+  mkdir -p "$state"
+  today=$(date '+%Y/%m/%d')
+  year=${today%%/*}
+  today=${today#*/}
+  month=${today%%/*}
+  day=${today#*/}
+
+  write_muse_13_session_log "$root" "$year" "$month" "$day" unrelated-a "$dir/other-a" >/dev/null <<EOF
+$(muse_log_run_started unrelated-a)
+$(muse_log_run_terminal unrelated-a completed)
+EOF
+  target=$(write_muse_13_session_log "$root" "$year" "$month" "$day" target "$dir/ws" <<EOF
+$(muse_log_run_started target-run)
+$(muse_log_run_terminal target-run completed)
+EOF
+)
+  write_muse_13_session_log "$root" "$year" "$month" "$day" unrelated-b "$dir/other-b" >/dev/null <<EOF
+$(muse_log_run_started unrelated-b)
+EOF
+
+  printf 'sessions_root=%s\nworkspace_root=%s\nbinding_id=muse-13-incarnation\n' \
+    "$root" "$dir/ws" > "$state/$id.muse-session"
+  verdict=$(classify_muse "$state" "$id")
+  [ "$verdict" = "idle muse-session-log" ] \
+    || fail "Muse 1.3's leading permission frame hid the settled worker log: got '$verdict'"
+  pin="$state/$id.muse-session-current"
+  assert_present "$pin" "Muse 1.3 worker did not persist its resolved session pin"
+  assert_grep "session_log=$target" "$pin" \
+    "Muse 1.3 worker pinned a session from another same-day workspace"
+  pass "Muse 1.3 workspace metadata resolves after its leading permission frame"
+}
+
 test_workspace_binding_treats_glob_characters_literally() {
   local dir state id root verdict
   dir="$TMP_ROOT/workspace-literal"
@@ -1411,6 +1466,7 @@ test_failed_clear_is_reported
 test_run_fold_tracks_open_and_settled_turns
 test_nested_terminal_record_does_not_settle_a_run
 test_binding_selects_the_matching_main_log
+test_muse_13_permission_frame_does_not_hide_workspace_metadata
 test_workspace_binding_treats_glob_characters_literally
 test_binding_excludes_preexisting_log_when_mtimes_tie
 test_session_log_cache_reuses_and_refreshes_binding
