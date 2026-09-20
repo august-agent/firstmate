@@ -1126,7 +1126,7 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$?
+  local status=$? muse_owner=
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&
@@ -1215,6 +1215,13 @@ spawn_abort_cleanup() {
   if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ]; then
     if ! spawn_fresh_commit_rollback; then
       status=1
+    fi
+  fi
+  if [ -n "$SPAWN_MUSE_BIN" ] && [ "$SPAWN_MUSE_BIN_COMMITTED" != 1 ] &&
+    [ -f "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ]; then
+    muse_owner=$(fm_meta_get "$STATE/$ID.meta" muse_bin)
+    if [ "$muse_owner" = "$SPAWN_MUSE_BIN_NAME" ]; then
+      SPAWN_MUSE_BIN_COMMITTED=1
     fi
   fi
   if [ "$SPAWN_META_LOCK_HELD" = 1 ]; then
@@ -4014,6 +4021,7 @@ if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
   echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
   exit 1
 fi
+SPAWN_LAUNCH_PREPARE_MODE=wait
 if [ "$RELAUNCH" -eq 1 ]; then
   # No worktree is acquired: the recorded one is reused as-is. What must be
   # proven instead is that the adopted endpoint's shell is actually sitting in
@@ -5174,12 +5182,14 @@ if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
     echo "error: task $ID was republished but its backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR); fix the backlog and re-run the relaunch" >&2
   fi
 fi
+if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -eq 0 ] && [ -n "$SPAWN_MUSE_BIN" ]; then
+  SPAWN_MUSE_BIN_COMMITTED=1
+fi
 trap - HUP INT TERM
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
 fi
 if [ -n "$SPAWN_MUSE_BIN" ]; then
-  SPAWN_MUSE_BIN_COMMITTED=1
   if ! fm_muse_cleanup_task_binaries "$STATE" "$ID" "$SPAWN_MUSE_BIN_NAME"; then
     echo "warning: could not retire stale pinned Muse executables for task $ID; task metadata preserves the current identity for retry" >&2
   fi

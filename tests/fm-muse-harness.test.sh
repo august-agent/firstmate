@@ -112,6 +112,10 @@ case "${1:-}" in
     for shell_line in "$@"; do
       case "$shell_line" in
         *".launch-ready."*)
+          if [ "${FM_FAKE_DELAYED_EXPORTS:-}" = 1 ] && [ -s "$FM_FAKE_PENDING_EXPORTS" ]; then
+            cat "$FM_FAKE_PENDING_EXPORTS" >>"$FM_FAKE_APPLIED_EXPORTS"
+            : >"$FM_FAKE_PENDING_EXPORTS"
+          fi
           if [ -n "${FM_FAKE_SHELL_UMASK_FILE:-}" ]; then
             [ -e "$FM_FAKE_SHELL_UMASK_FILE" ] || printf '0022\n' >"$FM_FAKE_SHELL_UMASK_FILE"
             case "$shell_line" in umask\ 077\;*) printf '0077\n' >"$FM_FAKE_SHELL_UMASK_FILE" ;; esac
@@ -127,8 +131,19 @@ case "${1:-}" in
     done
     if [ "${*: -1}" = C-c ]; then
       [ -z "${FM_FAKE_STARTUP_INTERRUPTED:-}" ] || : >"$FM_FAKE_STARTUP_INTERRUPTED"
+      [ "${FM_FAKE_DELAYED_EXPORTS:-}" != 1 ] || : >"$FM_FAKE_PENDING_EXPORTS"
       : > "${FM_FAKE_COMPOSER_FILE:?}"
       exit 0
+    fi
+    if [ "${FM_FAKE_DELAYED_EXPORTS:-}" = 1 ] && [ "${*: -1}" = Enter ]; then
+      for shell_line in "$@"; do
+        case "$shell_line" in
+          export\ GOTMPDIR=* | export\ FM_TASK_ID=* | export\ TRACEPARENT=*)
+            printf '%s\n' "$shell_line" >>"$FM_FAKE_PENDING_EXPORTS"
+            exit 0
+            ;;
+        esac
+      done
     fi
     if [ "${*: -1}" = Enter ] && [ -s "${FM_FAKE_COMPOSER_FILE:?}" ]; then
       if [ "${FM_FAKE_MUSE_ENTER_FAILURE:-}" = 1 ]; then
@@ -157,7 +172,11 @@ case "${1:-}" in
         if [ "${FM_FAKE_EXECUTE_MUSE_LAUNCH:-}" = 1 ]; then
           case "$arg" in
             *"$FM_FAKE_MUSE_EXECUTABLE"* | *"$FM_FAKE_MUSE_TASK_BINARY"*)
-              (cd "$FM_FAKE_PANE_PATH" && bash -c "$arg")
+              (
+                cd "$FM_FAKE_PANE_PATH"
+                [ ! -f "${FM_FAKE_APPLIED_EXPORTS:-}" ] || . "$FM_FAKE_APPLIED_EXPORTS"
+                bash -c "$arg"
+              )
               ;;
           esac
         fi
@@ -202,6 +221,9 @@ if [ "${1:-}" = --version ]; then
 fi
 if [ -n "${FM_FAKE_MUSE_INVOCATION_LOG:-}" ]; then
   printf '%s|%s|%s\n' "$version" "${0##*/}" "$*" > "$FM_FAKE_MUSE_INVOCATION_LOG"
+fi
+if [ -n "${FM_FAKE_MUSE_ENV_LOG:-}" ]; then
+  printf '%s|%s|%s\n' "${GOTMPDIR:-}" "${FM_TASK_ID:-}" "${TRACEPARENT:-}" >"$FM_FAKE_MUSE_ENV_LOG"
 fi
 [ -n "${FM_FAKE_HARNESS_RESULT:-}" ] || exit 0
 exec "$FM_FAKE_MUSE_VERSIONED" -c 'result=$($FM_FAKE_HARNESS_PROBE); printf "%s" "$result" > "$FM_FAKE_HARNESS_RESULT"'
@@ -335,6 +357,7 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_HARNESS_RESULT="${FM_FAKE_HARNESS_RESULT:-}" \
     FM_FAKE_MUSE_INFLIGHT_UPDATE="${FM_FAKE_MUSE_INFLIGHT_UPDATE:-}" \
     FM_FAKE_MUSE_INVOCATION_LOG="${FM_FAKE_MUSE_INVOCATION_LOG:-}" \
+    FM_FAKE_MUSE_ENV_LOG="${FM_FAKE_MUSE_ENV_LOG:-}" \
     FM_FAKE_MUSE_TRANSITION="${FM_FAKE_MUSE_TRANSITION:-}" \
     FM_FAKE_MUSE_TRANSPORT_FAILURE="${FM_FAKE_MUSE_TRANSPORT_FAILURE:-}" \
     FM_FAKE_MUSE_ENTER_FAILURE="${FM_FAKE_MUSE_ENTER_FAILURE:-}" \
@@ -343,6 +366,9 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_SHELL_UMASK_FILE="${FM_FAKE_SHELL_UMASK_FILE:-}" \
     FM_FAKE_SHELL_START_DELAY="${FM_FAKE_SHELL_START_DELAY:-}" \
     FM_FAKE_STARTUP_INTERRUPTED="${FM_FAKE_STARTUP_INTERRUPTED:-}" \
+    FM_FAKE_DELAYED_EXPORTS="${FM_FAKE_DELAYED_EXPORTS:-}" \
+    FM_FAKE_PENDING_EXPORTS="${FM_FAKE_PENDING_EXPORTS:-}" \
+    FM_FAKE_APPLIED_EXPORTS="${FM_FAKE_APPLIED_EXPORTS:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
     FM_FAKE_MUSE_TASK_VERSION_OBSERVED="${FM_FAKE_MUSE_TASK_VERSION_OBSERVED:-}" \
@@ -354,6 +380,9 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_BLOCK_MUSE_RM_RELEASE="${FM_FAKE_BLOCK_MUSE_RM_RELEASE:-}" \
     FM_FAKE_REAL_RM="${FM_FAKE_REAL_RM:-}" \
     FM_FAKE_FAIL_MUSE_RM_PREFIX="${FM_FAKE_FAIL_MUSE_RM_PREFIX:-}" \
+    FM_FAKE_REAL_MV="${FM_FAKE_REAL_MV:-}" \
+    FM_FAKE_SIGNAL_META="${FM_FAKE_SIGNAL_META:-}" \
+    FM_FAKE_SIGNAL_OBSERVED="${FM_FAKE_SIGNAL_OBSERVED:-}" \
     FM_FAKE_WORKER_META_KEY="${FM_TEST_MUSE_WORKER_KEY-present}" \
     META_API_KEY="${FM_TEST_MUSE_KEY-test-key}" \
     XDG_CONFIG_HOME="${FM_TEST_MUSE_CONFIG_HOME-$home/xdgconfig}" \
@@ -769,6 +798,106 @@ done
 exec "${FM_FAKE_REAL_RM:-/bin/rm}" "$@"
 SH
   chmod +x "$fakebin/rm"
+}
+
+install_muse_publish_signal() {
+  local fakebin=$1
+  cat >"$fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+"$FM_FAKE_REAL_MV" "$@"
+status=$?
+target=${*: -1}
+if [ "$status" -eq 0 ] && [ "$target" = "$FM_FAKE_SIGNAL_META" ] \
+  && [ ! -e "$FM_FAKE_SIGNAL_OBSERVED" ]; then
+  : >"$FM_FAKE_SIGNAL_OBSERVED"
+  kill -TERM "$PPID"
+fi
+exit "$status"
+SH
+  chmod +x "$fakebin/mv"
+}
+
+test_relaunch_delayed_exports_survive_final_readiness() {
+  local rec case_dir home proj wt fakebin id pending applied env_log out status
+  local tasktmp traceparent observed
+  rec=$(make_spawn_case relaunch-delayed-exports)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  pending="$case_dir/pending-exports"
+  applied="$case_dir/applied-exports"
+  env_log="$case_dir/muse-env"
+  : >"$pending"
+  : >"$applied"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  printf '%s on\n' "$$" >"$home/state/.trace-context-effective"
+  printf '%s\n' "$$" >"$home/state/.lock"
+
+  out=$(FM_FAKE_DELAYED_EXPORTS=1 FM_FAKE_PENDING_EXPORTS="$pending" \
+    FM_FAKE_APPLIED_EXPORTS="$applied" FM_FAKE_EXECUTE_MUSE_LAUNCH=1 \
+    FM_FAKE_MUSE_ENV_LOG="$env_log" \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse relaunch with delayed exports should succeed: $out"
+  assert_present "$env_log" "Muse relaunch did not execute with the settled pane environment"
+  tasktmp=$(awk -F= '$1 == "tasktmp" { print substr($0, index($0, "=") + 1); exit }' "$home/state/$id.meta")
+  traceparent=$(awk -F= '$1 == "traceparent" { print substr($0, index($0, "=") + 1); exit }' "$home/state/$id.meta")
+  observed=$(cat "$env_log")
+  [ "$observed" = "$tasktmp/gotmp|$id|$traceparent" ] \
+    || fail "Muse relaunch lost delayed pane exports: $observed"
+  pass "Muse relaunch preserves delayed exports through final readiness"
+}
+
+test_relaunch_signal_after_pin_publication_preserves_owner() {
+  local rec case_dir home proj wt fakebin id observed out status replacement
+  rec=$(make_spawn_case relaunch-pin-signal)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  observed="$case_dir/publish-signalled"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  install_muse_publish_signal "$fakebin"
+
+  out=$(FM_FAKE_REAL_MV="$(command -v mv)" FM_FAKE_SIGNAL_META="$home/state/$id.meta" \
+    FM_FAKE_SIGNAL_OBSERVED="$observed" \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "signalled Muse relaunch unexpectedly succeeded"
+  assert_present "$observed" "Muse relaunch was not signalled after metadata publication"
+  replacement=$(muse_committed_binary "$home" "$id") \
+    || fail "signalled Muse relaunch lost its published executable identity"
+  assert_present "$replacement" "signalled Muse relaunch removed its metadata-owned executable"
+  pass "Muse relaunch signal preserves metadata-owned executable"
+}
+
+test_fresh_signal_with_retained_record_preserves_owner() {
+  local rec case_dir home proj wt fakebin id observed out status pinned
+  rec=$(make_spawn_case fresh-pin-signal)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  observed="$case_dir/publish-signalled"
+  install_muse_publish_signal "$fakebin"
+  install_muse_rm_failure "$fakebin"
+
+  out=$(FM_FAKE_REAL_MV="$(command -v mv)" FM_FAKE_SIGNAL_META="$home/state/$id.meta" \
+    FM_FAKE_SIGNAL_OBSERVED="$observed" \
+    FM_FAKE_FAIL_MUSE_RM_PREFIX="$home/state/$id.meta" \
+    FM_FAKE_REAL_RM="$(command -v rm)" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "signalled fresh Muse spawn unexpectedly succeeded"
+  assert_present "$observed" "fresh Muse spawn was not signalled after metadata publication"
+  pinned=$(muse_committed_binary "$home" "$id") \
+    || fail "signalled fresh Muse spawn lost its retained executable identity"
+  assert_present "$pinned" "signalled fresh Muse spawn removed its metadata-owned executable"
+  pass "fresh Muse signal preserves metadata-owned executable"
 }
 
 test_launch_retry_clears_failed_enter_input() {
@@ -1890,6 +2019,9 @@ test_failed_max_relaunch_removes_replacement_binary
 test_nonmax_relaunch_retires_prior_binary
 test_max_relaunch_preserves_replacement_binary
 test_max_relaunch_transport_failure_preserves_published_binary
+test_relaunch_delayed_exports_survive_final_readiness
+test_relaunch_signal_after_pin_publication_preserves_owner
+test_fresh_signal_with_retained_record_preserves_owner
 test_launch_retry_clears_failed_enter_input
 test_fresh_launch_waits_without_interrupting_startup
 test_launch_readiness_preserves_shell_umask
