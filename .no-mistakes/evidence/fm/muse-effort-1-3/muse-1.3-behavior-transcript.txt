@@ -1,0 +1,20 @@
+$ fm_busy_classify tmux fake:0 muse review-worker <state>
+busy muse-session-log
+$ cat <state>/review-worker.muse-session-current
+binding_id=review-incarnation
+session_log=/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-evidence.Y0zq4O/sessions/2026/09/21/target/session.jsonl
+namespace_day=<fixture>/sessions/2026/09/21
+namespace_signature=4159692610:394
+$ fm_busy_classify tmux fake:0 muse review-worker <state>  # after terminal event
+idle muse-session-log
+
+$ fm-spawn.sh evidence-max <project> muse --mode no-mistakes --yolo off --effort max
+spawned muse-evidence-max-x1 harness=muse kind=ship mode=no-mistakes yolo=off window=firstmate:fm-muse-evidence-max-x1 worktree=<fixture>
+exit_status=0
+$ recorded Muse process invocation (first line)
+Muse Code 1.3.0 (1.3.0-R3401.1)|muse-bin-muse-evidence-max-x1+6ACVtvND1xHz|--yolo --reasoning-effort max ⁣FIRSTMATE_OP: v1 launch-brief: # Current worker role contract
+$ durable metadata ownership
+harness=muse
+model=default
+effort=max
+muse_bin=muse-bin-muse-evidence-max-x1+6ACVtvND1xHz
