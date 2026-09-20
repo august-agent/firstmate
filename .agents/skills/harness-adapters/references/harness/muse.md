@@ -1,6 +1,6 @@
 # Muse Code
 
-Verified 2026-08-05 on Muse Code 0.1.0-R708.1, build sha 427a430436.
+Core adapter behavior was verified 2026-08-05 on Muse Code 0.1.0-R708.1, build sha 427a430436.
 The router owns Muse's task-kind boundary.
 
 ## Operating facts
@@ -64,7 +64,7 @@ Inspect, never force past, that refusal.
 
 ## Maturity and primary limit
 
-Muse 0.1.0 is day-zero beta; its hourly channel poll can replace the binary and process name.
+Muse's hourly channel poll can replace the binary and process name without Firstmate action.
 The captain accepted this, so Firstmate does not set `MUSE_NO_AUTO_UPDATE=1`; a fleet may set it without adapter change.
 Plugins report unavailable unless `MUSE_EXPERIMENTAL_PLUGINS=on`, so busy state uses logs.
 The compatibility dialect explicitly lacks `asyncRewake` and model reawakening; the router owns the resulting primary boundary.

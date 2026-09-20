@@ -7,9 +7,9 @@ The skill tree rooted at [`.agents/skills/harness-adapters/SKILL.md`](../../.age
 
 | Field | Value |
 |---|---|
-| Version | `Muse Code 0.1.0 (0.1.0-R708.1)`, build sha `427a430436` |
-| Verified | 2026-08-05, extended 2026-08-06 with the credentialed multi-step smoke |
-| Artifact | `muse-aarch64-macos`, sha256 `4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c` |
+| Versions | Core adapter: `Muse Code 0.1.0 (0.1.0-R708.1)`, build sha `427a430436`; effort surface: `Muse Code 1.3.0 (1.3.0-R3401.1)` |
+| Verified | Core adapter 2026-08-05, credentialed multi-step smoke 2026-08-06, effort compatibility 2026-09-20 |
+| Baseline artifact | `muse-aarch64-macos`, sha256 `4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c` |
 | Platform | macOS arm64 (Darwin 25.5.0) |
 
 ### Effort compatibility refresh
