@@ -1096,7 +1096,6 @@ CONFIG_INHERIT_LOCK_HELD=0
 SPAWN_MUSE_BIN=
 SPAWN_MUSE_BIN_NAME=
 SPAWN_MUSE_BIN_COMMITTED=0
-RELAUNCH_PRIOR_MUSE_BIN=
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1644,18 +1643,6 @@ if [ "$RELAUNCH" -eq 1 ]; then
       ;;
   esac
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
-  RELAUNCH_PRIOR_MUSE_BIN_NAME=$(fm_meta_get "$RELAUNCH_META" muse_bin)
-  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN_NAME" ]; then
-    RELAUNCH_PRIOR_MUSE_BIN=$(fm_muse_task_binary_path \
-      "$STATE" "$ID" "$RELAUNCH_PRIOR_MUSE_BIN_NAME") || {
-      echo "error: task $ID has an invalid pinned Muse executable identity in its record" >&2
-      exit 1
-    }
-  elif [ -e "$STATE/muse-bin-$ID" ] || [ -L "$STATE/muse-bin-$ID" ]; then
-    RELAUNCH_PRIOR_MUSE_BIN="$STATE/muse-bin-$ID"
-  elif [ -e "$STATE/$ID.muse-bin" ] || [ -L "$STATE/$ID.muse-bin" ]; then
-    RELAUNCH_PRIOR_MUSE_BIN="$STATE/$ID.muse-bin"
-  fi
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
   # A secondmate whose endpoint is gone already has ONE owner for that
@@ -4015,13 +4002,16 @@ agy_spawn_fail() {  # <detail>
   rovo_endpoint_cleanup
 }
 
-SPAWN_LAUNCH_PREPARE_MODE="wait"
-[ "$RELAUNCH" -eq 0 ] || SPAWN_LAUNCH_PREPARE_MODE=clear
-if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
-  echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
-  exit 1
+SPAWN_LAUNCH_PREPARE_MODE=
+if [ "$HARNESS" = muse ]; then
+  SPAWN_LAUNCH_PREPARE_MODE="wait"
+  [ "$RELAUNCH" -eq 0 ] || SPAWN_LAUNCH_PREPARE_MODE=clear
+  if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
+    echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
+    exit 1
+  fi
 fi
-SPAWN_LAUNCH_PREPARE_MODE="wait"
+[ -z "$SPAWN_LAUNCH_PREPARE_MODE" ] || SPAWN_LAUNCH_PREPARE_MODE="wait"
 if [ "$RELAUNCH" -eq 1 ]; then
   # No worktree is acquired: the recorded one is reused as-is. What must be
   # proven instead is that the adopted endpoint's shell is actually sitting in
@@ -5051,7 +5041,8 @@ if ! (umask 077 && printf '%s\n' "$LAUNCH" >"$LAUNCH_STAGE" &&
   echo "error: could not stage the launch command at $LAUNCH_FILE" >&2
   exit 1
 fi
-if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
+if [ -n "$SPAWN_LAUNCH_PREPARE_MODE" ] &&
+  ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
   echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
   exit 1
 fi

@@ -112,6 +112,7 @@ case "${1:-}" in
     for shell_line in "$@"; do
       case "$shell_line" in
         *".launch-ready."*)
+          [ "${FM_FAKE_READINESS_PROBE_FAIL:-}" != 1 ] || exit 1
           if [ "${FM_FAKE_DELAYED_EXPORTS:-}" = 1 ] && [ -s "$FM_FAKE_PENDING_EXPORTS" ]; then
             cat "$FM_FAKE_PENDING_EXPORTS" >>"$FM_FAKE_APPLIED_EXPORTS"
             : >"$FM_FAKE_PENDING_EXPORTS"
@@ -366,6 +367,7 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_SHELL_UMASK_FILE="${FM_FAKE_SHELL_UMASK_FILE:-}" \
     FM_FAKE_SHELL_START_DELAY="${FM_FAKE_SHELL_START_DELAY:-}" \
     FM_FAKE_STARTUP_INTERRUPTED="${FM_FAKE_STARTUP_INTERRUPTED:-}" \
+    FM_FAKE_READINESS_PROBE_FAIL="${FM_FAKE_READINESS_PROBE_FAIL:-}" \
     FM_FAKE_DELAYED_EXPORTS="${FM_FAKE_DELAYED_EXPORTS:-}" \
     FM_FAKE_PENDING_EXPORTS="${FM_FAKE_PENDING_EXPORTS:-}" \
     FM_FAKE_APPLIED_EXPORTS="${FM_FAKE_APPLIED_EXPORTS:-}" \
@@ -970,6 +972,23 @@ EOF
   observed=$(cat "$umask_file")
   [ "$observed" = 0022 ] || fail "Muse spawn readiness changed the shell umask to $observed"
   pass "Muse launch readiness preserves the shell umask"
+}
+
+test_non_muse_spawn_skips_muse_shell_readiness() {
+  local rec case_dir home proj wt fakebin id out status
+  rec=$(make_spawn_case non-muse-shell-readiness)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  fm_fake_exit0 "$fakebin" codex
+  out=$(FM_FAKE_READINESS_PROBE_FAIL=1 \
+    run_muse_command "$home" "$proj" "$wt" "$fakebin" "$id" \
+      "$id" "$proj" codex --mode no-mistakes --yolo off)
+  status=$?
+  expect_code 0 "$status" "a Codex spawn should not depend on Muse shell readiness: $out"
+  assert_contains "$out" "spawned $id harness=codex" \
+    "the non-Muse spawn did not reach its public success result"
+  pass "non-Muse spawn skips Muse-specific shell readiness"
 }
 
 test_main_teardown_retains_pin_owner_when_unlink_fails() {
@@ -2025,6 +2044,7 @@ test_fresh_signal_with_retained_record_preserves_owner
 test_launch_retry_clears_failed_enter_input
 test_fresh_launch_waits_without_interrupting_startup
 test_launch_readiness_preserves_shell_umask
+test_non_muse_spawn_skips_muse_shell_readiness
 test_main_teardown_retains_pin_owner_when_unlink_fails
 test_relaunch_retries_failed_prior_pin_retirement
 test_abort_retry_cleans_failed_pin_unlink
