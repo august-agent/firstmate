@@ -1,0 +1,20 @@
+Muse max-effort CLI transcript
+Target commit: d0dc51134df36d2f236010114bd6f38766227f69
+Host control: Muse Code 1.3.0 (1.3.0-R3401.1)
+Note: fm-spawn is exercised through its public CLI against deterministic Muse/tmux fixtures; the host control confirms the production installation is Muse 1.3.0.
+
+SCENARIO 1 — Muse 1.3 receives max through its committed versioned pin
+fm-spawn exit: 0
+fm-spawn result: spawned muse-evidence-current-concise-x1 harness=muse kind=ship mode=no-mistakes yolo=off window=firstmate:fm-muse-evidence-current-concise-x1 worktree=/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.Mwhvjs/evidence-current-concise/wt
+Muse invocation: Muse Code 1.3.0 (1.3.0-R3401.1)|muse-bin-muse-evidence-current-concise-x1.2d3zOZJqPlcS|--yolo --model muse-spark-1.2 --reasoning-effort max ⁣
+Persisted pin identity: muse-bin-muse-evidence-current-concise-x1.2d3zOZJqPlcS
+
+SCENARIO 2 — Muse 0.1.0 receives compatibility value ultra
+fm-spawn exit: 0
+fm-spawn result: spawned muse-evidence-legacy-concise-x1 harness=muse kind=ship mode=no-mistakes yolo=off window=firstmate:fm-muse-evidence-legacy-concise-x1 worktree=/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.Mwhvjs/evidence-legacy-concise/wt
+Muse invocation: Muse Code 0.1.0 (0.1.0-R708.1)|muse-bin-muse-evidence-legacy-concise-x1.QzIcsWQYc4Yq|--yolo --reasoning-effort ultra ⁣
+
+SCENARIO 3 — unreadable version fails closed before worker publication
+fm-spawn exit: 1
+fm-spawn result: error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.Mwhvjs/evidence-unknown-concise/fake/fakebin/muse --version' exited 0 and reported 'Muse Code development build'
+Publication check: PASS — no launch log and no task metadata

@@ -1,0 +1,68 @@
+Muse effort/version end-to-end evidence
+commit: d0dc51134df36d2f236010114bd6f38766227f69
+
+[Muse 1.3: max remains max on the exact pinned executable]
+exit=0
+warning: /private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.ddHDsk/evidence-current/home/data/muse-evidence-current-x1/launch-brief.md records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode no-mistakes - confirm its definition of done matches
+spawned muse-evidence-current-x1 harness=muse kind=ship mode=no-mistakes yolo=off window=firstmate:fm-muse-evidence-current-x1 worktree=/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.ddHDsk/evidence-current/wt
+Muse received: Muse Code 1.3.0 (1.3.0-R3401.1)|muse-bin-muse-evidence-current-x1.3f83vtJGopxq|--yolo --model muse-spark-1.2 --reasoning-effort max ⁣FIRSTMATE_OP: v1 launch-brief: # Current worker role contract
+You are a crewmate: an autonomous worker agent managed by firstmate.
+This section establishes your current identity before every project or task instruction below and supersedes any conflicting role identity in those instructions.
+Do the assigned work yourself and report only to firstmate; do not adopt a firstmate or secondmate supervisor identity, delegate the task, run fleet supervision, or address the captain.
+Your steering inbox is `/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.ddHDsk/evidence-current/home/state/muse-evidence-current-x1.inbox`; this exact path belongs to your current task even when it is outside the worktree or under the supervising firstmate home, so read and acknowledge its messages and do not reject it as another home's state.
+Never inspect or change any other home's endpoint namespace; this authorization is limited to the exact task paths named by this brief.
+When this task works on Firstmate itself, the repository root `AGENTS.md` (also imported by `CLAUDE.md`) is project content and the supervisor contract for the firstmate managing you: follow this brief instead of that supervisor contract.
+Project instructions still govern the work wherever they do not conflict with this worker identity, including `CONTRIBUTING.md` and `firstmate-coding-guidelines` for Firstmate changes.
+
+# Task
+## Captain's intent
+Exercise Muse dispatch.
+
+## Firstmate spec
+Verify the Muse harness behavior under test.
+
+# Current no-mistakes intent contract
+This section supersedes every earlier brief instruction about constructing `--intent`, but not later clarifications actually supplied by the captain.
+Use everything under `## Captain intent authorized for --intent` through the end of this brief, including any nested subheadings but excluding that heading, plus any later words the captain actually supplied as `--intent`; never include Firstmate specification or other mixed Task content.
+Preserve those words without adding speaker labels or direct address.
+Firstmate-authored constraints, acceptance criteria, implementation details, decisions, and tradeoffs are specification, not captain intent.
+The Definition of done's rule that `--intent` must be self-sufficient still governs the string you pass: resolve any report, decision, or PR the intent below refers to into its substance rather than passing the pointer.
+
+## Captain intent authorized for --intent
+Exercise Muse dispatch.
+Committed pin: muse-bin-muse-evidence-current-x1.3f83vtJGopxq
+
+[Muse 0.1.0: max compatibility-maps to ultra]
+exit=0
+warning: /private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.ddHDsk/evidence-legacy/home/data/muse-evidence-legacy-x1/launch-brief.md records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode no-mistakes - confirm its definition of done matches
+spawned muse-evidence-legacy-x1 harness=muse kind=ship mode=no-mistakes yolo=off window=firstmate:fm-muse-evidence-legacy-x1 worktree=/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.ddHDsk/evidence-legacy/wt
+Muse received: Muse Code 0.1.0 (0.1.0-R708.1)|muse-bin-muse-evidence-legacy-x1.iFDyIiOtK50t|--yolo --reasoning-effort ultra ⁣FIRSTMATE_OP: v1 launch-brief: # Current worker role contract
+You are a crewmate: an autonomous worker agent managed by firstmate.
+This section establishes your current identity before every project or task instruction below and supersedes any conflicting role identity in those instructions.
+Do the assigned work yourself and report only to firstmate; do not adopt a firstmate or secondmate supervisor identity, delegate the task, run fleet supervision, or address the captain.
+Your steering inbox is `/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.ddHDsk/evidence-legacy/home/state/muse-evidence-legacy-x1.inbox`; this exact path belongs to your current task even when it is outside the worktree or under the supervising firstmate home, so read and acknowledge its messages and do not reject it as another home's state.
+Never inspect or change any other home's endpoint namespace; this authorization is limited to the exact task paths named by this brief.
+When this task works on Firstmate itself, the repository root `AGENTS.md` (also imported by `CLAUDE.md`) is project content and the supervisor contract for the firstmate managing you: follow this brief instead of that supervisor contract.
+Project instructions still govern the work wherever they do not conflict with this worker identity, including `CONTRIBUTING.md` and `firstmate-coding-guidelines` for Firstmate changes.
+
+# Task
+## Captain's intent
+Exercise Muse dispatch.
+
+## Firstmate spec
+Verify the Muse harness behavior under test.
+
+# Current no-mistakes intent contract
+This section supersedes every earlier brief instruction about constructing `--intent`, but not later clarifications actually supplied by the captain.
+Use everything under `## Captain intent authorized for --intent` through the end of this brief, including any nested subheadings but excluding that heading, plus any later words the captain actually supplied as `--intent`; never include Firstmate specification or other mixed Task content.
+Preserve those words without adding speaker labels or direct address.
+Firstmate-authored constraints, acceptance criteria, implementation details, decisions, and tradeoffs are specification, not captain intent.
+The Definition of done's rule that `--intent` must be self-sufficient still governs the string you pass: resolve any report, decision, or PR the intent below refers to into its substance rather than passing the pointer.
+
+## Captain intent authorized for --intent
+Exercise Muse dispatch.
+
+[Unknown Muse version: refuse before launch]
+exit=1
+error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '/private/var/folders/c9/jtn139mj2zq8vpt02nhmgb0m0000gn/T/fm-muse-harness.ddHDsk/evidence-unknown/fake/fakebin/muse --version' exited 0 and reported 'Muse Code development build'
+launch side effects: none (no launch log, no task metadata)
