@@ -65,8 +65,9 @@
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
 #   from that harness's launch rather than guessed. Ultra is the explicit
-#   exception: bin/fm-harness.sh validate-native-effort owns its model scope;
-#   supported Pi launches receive --codex-effort ultra, never --thinking ultra.
+#   exception: bin/fm-harness.sh validate-native-effort owns its harness/model
+#   scope; Muse receives --reasoning-effort ultra, while supported Pi launches
+#   receive --codex-effort ultra and never --thinking ultra.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -2179,12 +2180,12 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
     fi
   fi
 fi
-# Ultra is an explicit native capability, never a Pi thinking-level alias.
+# Ultra is an explicit native capability, never a generic thinking-level alias.
 # Validate the fully resolved profile before worktree or endpoint provisioning.
 if [ "$EFFORT" = ultra ]; then
   "$SCRIPT_DIR/fm-harness.sh" validate-native-effort "$HARNESS" "$MODEL" "$EFFORT" || exit 1
   [ "$RAW_LAUNCH" = 0 ] || {
-    echo "error: --effort ultra requires the canonical --harness pi or pi-signed launch so its native flag cannot be omitted" >&2
+    echo "error: --effort ultra requires the canonical --harness pi or pi-signed launch, or canonical --harness muse launch, so its native flag cannot be omitted" >&2
     exit 1
   }
 fi
@@ -2377,17 +2378,13 @@ effort_flag_for_harness() {
     esac
     ;;
   muse)
-    # muse 0.1.0-R708.1 --reasoning-effort accepts none|minimal|low|medium|
-    # high|xhigh|ultra and defaults to high, so low..xhigh map straight across.
-    # ultra is muse's max-CLASS level, so firstmate's max maps onto it - but
-    # only ever as an EXPLICIT captain choice, never as a fallback, because
-    # AGENTS.md section 4 forbids selecting max without captain preference and
-    # the omitted effort here leaves muse on its own high default. muse's extra
-    # none/minimal levels sit below firstmate's shared vocabulary and are
-    # deliberately unreachable rather than remapped onto low.
+    # Muse 1.3.0-R3401.1 --reasoning-effort accepts none|minimal|low|medium|
+    # high|xhigh|max|ultra and defaults to high. Every shared effort maps
+    # straight across, including the now-distinct max and ultra levels. The
+    # omitted effort leaves Muse on its own default, and Muse's extra
+    # none/minimal levels stay outside Firstmate's shared vocabulary.
     case "$effort" in
-    low | medium | high | xhigh) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
-    max) printf -- '--reasoning-effort %s ' "$(shell_quote ultra)" ;;
+    low | medium | high | xhigh | max | ultra) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
     esac
     ;;
     # rovo has no --effort flag on `run`; its effort mapping rides

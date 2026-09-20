@@ -12,6 +12,23 @@ The skill tree rooted at [`.agents/skills/harness-adapters/SKILL.md`](../../.age
 | Artifact | `muse-aarch64-macos`, sha256 `4290bfafa5bbb81a6fd493aaea12f848c789b1d22edfa0c4b849151deba3e70c` |
 | Platform | macOS arm64 (Darwin 25.5.0) |
 
+### Effort compatibility refresh
+
+The interactive effort surface was reverified 2026-09-20 on the installed Muse Code 1.3.0 build on macOS arm64.
+
+```
+$ muse --version
+Muse Code 1.3.0 (1.3.0-R3401.1)
+
+$ muse exec --help
+      --reasoning-effort <EFFORT>
+          Meta reasoning effort: none|minimal|low|medium|high|xhigh|max|ultra
+          (default: high)
+```
+
+Muse 1.3 exposes distinct `max` and `ultra` values.
+The spawn regression in `tests/fm-muse-harness.test.sh` exercises every shared input from `low` through `ultra`, asserts that each value reaches `--reasoning-effort` unchanged, and separately proves that omitting the axis leaves Muse on its default.
+
 The binary was fetched from the published channel and its checksum matched the published manifest before any run:
 
 ```
