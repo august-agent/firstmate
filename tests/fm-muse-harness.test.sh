@@ -74,6 +74,7 @@ make_spawn_fakebin() {
 set -u
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_command}"*) printf 'zsh\n'; exit 0 ;;
 esac
 case "${1:-}" in
   show-environment)
@@ -82,7 +83,10 @@ case "${1:-}" in
     exit 0
     ;;
   display-message) printf 'firstmate\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  list-windows)
+    [ -z "${FM_FAKE_RELAUNCH_WINDOW:-}" ] || printf '%s\n' "$FM_FAKE_RELAUNCH_WINDOW"
+    exit 0
+    ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
   send-keys)
     prev=
@@ -249,7 +253,7 @@ C
   "$cc_bin" -o "$target" "$source" || fail "could not build the fake Muse process"
 }
 
-run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
+run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
   local home=$1 proj=$2 wt=$3 fakebin=$4 id=$5
   shift 5
   FM_ROOT_OVERRIDE='' FM_HOME="$home" \
@@ -268,12 +272,28 @@ run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
     FM_FAKE_MUSE_TRANSITION="${FM_FAKE_MUSE_TRANSITION:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
+    FM_FAKE_RELAUNCH_WINDOW="${FM_FAKE_RELAUNCH_WINDOW:-}" \
     FM_FAKE_WORKER_META_KEY="${FM_TEST_MUSE_WORKER_KEY-present}" \
     META_API_KEY="${FM_TEST_MUSE_KEY-test-key}" \
     XDG_CONFIG_HOME="${FM_TEST_MUSE_CONFIG_HOME-$home/xdgconfig}" \
     XDG_DATA_HOME="${FM_TEST_MUSE_DATA_HOME-$home/xdgdata}" \
     PATH="$fakebin:$PATH" \
-    "$SPAWN" "$id" "$proj" muse "$@" 2>&1
+    "$SPAWN" "$@" 2>&1
+}
+
+run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
+  local home=$1 proj=$2 wt=$3 fakebin=$4 id=$5
+  shift 5
+  run_muse_command "$home" "$proj" "$wt" "$fakebin" "$id" \
+    "$id" "$proj" muse "$@"
+}
+
+run_muse_relaunch() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
+  local home=$1 proj=$2 wt=$3 fakebin=$4 id=$5
+  shift 5
+  FM_FAKE_RELAUNCH_WINDOW="fm-$id" \
+    run_muse_command "$home" "$proj" "$wt" "$fakebin" "$id" \
+      "$id" --relaunch "$@"
 }
 
 # --- detection --------------------------------------------------------------
@@ -534,6 +554,72 @@ EOF
   assert_present "$result" "Muse pinned executable did not run the harness probe"
   [ "$(cat "$result")" = muse ] || fail "fm-harness.sh beneath the pinned executable did not report muse"
   pass "muse pins an efficient executable with detectable process ancestry"
+}
+
+test_failed_max_relaunch_removes_replacement_binary() {
+  local rec case_dir home proj wt fakebin id pinned out status
+  rec=$(make_spawn_case relaunch-max-failure)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  pinned="$home/state/muse-bin-$id"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  assert_present "$pinned" "initial Muse max spawn did not publish its pinned executable"
+
+  out=$(FM_TEST_MUSE_KEY='' FM_TEST_MUSE_WORKER_KEY='' \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "Muse max relaunch without credentials unexpectedly succeeded"
+  assert_contains "$out" "no worker-reachable credential" \
+    "failed Muse max relaunch did not reach the post-pin credential refusal"
+  assert_present "$home/state/$id.meta" "failed Muse max relaunch removed the prior task record"
+  assert_absent "$pinned" "failed Muse max relaunch retained its replacement executable"
+  pass "failed Muse max relaunch removes its uncommitted pinned executable"
+}
+
+test_nonmax_relaunch_retires_prior_binary() {
+  local rec case_dir home proj wt fakebin id pinned out status
+  rec=$(make_spawn_case relaunch-nonmax)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  pinned="$home/state/muse-bin-$id"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  assert_present "$pinned" "initial Muse max spawn did not publish its pinned executable"
+
+  out=$(run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort high)
+  status=$?
+  expect_code 0 "$status" "Muse non-max relaunch should succeed: $out"
+  assert_absent "$pinned" "successful Muse non-max relaunch retained the prior pinned executable"
+  pass "successful Muse non-max relaunch retires its prior pinned executable"
+}
+
+test_max_relaunch_preserves_replacement_binary() {
+  local rec case_dir home proj wt fakebin id pinned current legacy out status
+  rec=$(make_spawn_case relaunch-max-replacement)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  pinned="$home/state/muse-bin-$id"
+  current="$fakebin/muse-bin-1.3.0-R3401.1"
+  legacy="$fakebin/muse-bin-0.1.0-R708.1"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  [ "$pinned" -ef "$current" ] || fail "initial Muse max spawn pinned the wrong executable"
+
+  out=$(FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse max-to-max relaunch should succeed: $out"
+  assert_present "$pinned" "successful Muse max-to-max relaunch removed its replacement executable"
+  [ "$pinned" -ef "$legacy" ] || fail "Muse max-to-max relaunch did not retain the newly verified replacement executable"
+  [ ! "$pinned" -ef "$current" ] || fail "Muse max-to-max relaunch retained the superseded executable"
+  pass "successful Muse max-to-max relaunch preserves its replacement executable"
 }
 
 # An unauthenticated muse pane does not exit: it sits on an OAuth device-code
@@ -1191,6 +1277,9 @@ test_spawn_maps_legacy_max_and_refuses_unknown_versions
 test_spawn_pins_updated_binary_for_max
 test_spawn_survives_an_inflight_update_for_max
 test_spawn_pinned_binary_preserves_muse_ancestry
+test_failed_max_relaunch_removes_replacement_binary
+test_nonmax_relaunch_retires_prior_binary
+test_max_relaunch_preserves_replacement_binary
 test_spawn_refuses_without_credential
 test_spawn_refuses_caller_only_environment_credential
 test_spawn_accepts_stored_credential

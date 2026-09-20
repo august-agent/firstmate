@@ -1092,6 +1092,7 @@ RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
 SPAWN_MUSE_BIN=
+SPAWN_MUSE_BIN_COMMITTED=0
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1246,8 +1247,7 @@ spawn_abort_cleanup() {
     fm_lock_release "$SPAWN_CONTROL_LOCK" || true
   fi
   [ -z "$SPAWN_META_TMP" ] || rm -f "$SPAWN_META_TMP" 2>/dev/null || true
-  if [ -n "$SPAWN_MUSE_BIN" ] &&
-    [ ! -e "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ]; then
+  if [ -n "$SPAWN_MUSE_BIN" ] && [ "$SPAWN_MUSE_BIN_COMMITTED" != 1 ]; then
     rm -f "$SPAWN_MUSE_BIN" 2>/dev/null || true
   fi
   if [ "$CONFIG_INHERIT_LOCK_HELD" = 1 ]; then
@@ -5104,6 +5104,16 @@ fi
 trap - HUP INT TERM
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
+fi
+if [ -n "$SPAWN_MUSE_BIN" ]; then
+  SPAWN_MUSE_BIN_COMMITTED=1
+  if ! rm -f "$STATE/$ID.muse-bin"; then
+    echo "warning: could not retire legacy pinned Muse executable for task $ID" >&2
+  fi
+elif [ "$RELAUNCH" -eq 1 ]; then
+  if ! rm -f "$STATE/muse-bin-$ID" "$STATE/$ID.muse-bin"; then
+    echo "warning: could not retire pinned Muse executable for relaunched task $ID" >&2
+  fi
 fi
 if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
   case "$SPAWN_DEFERRED_SIGNAL" in
