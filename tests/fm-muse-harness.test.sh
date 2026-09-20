@@ -118,6 +118,10 @@ SH
   cat > "$fakebin/muse" <<'SH'
 #!/usr/bin/env bash
 set -u
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' "${FM_FAKE_MUSE_VERSION_OUTPUT:-Muse Code 1.3.0 (1.3.0-R3401.1)}"
+  exit "${FM_FAKE_MUSE_VERSION_STATUS:-0}"
+fi
 [ -n "${FM_FAKE_HARNESS_RESULT:-}" ] || exit 0
 exec "$FM_FAKE_MUSE_VERSIONED" -c 'result=$($FM_FAKE_HARNESS_PROBE); printf "%s" "$result" > "$FM_FAKE_HARNESS_RESULT"'
 SH
@@ -162,6 +166,8 @@ run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
     FM_FAKE_HARNESS_PROBE="$HARNESS" \
     FM_FAKE_EXECUTE_MUSE_LAUNCH="${FM_FAKE_EXECUTE_MUSE_LAUNCH:-}" \
     FM_FAKE_HARNESS_RESULT="${FM_FAKE_HARNESS_RESULT:-}" \
+    FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
+    FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
     FM_FAKE_WORKER_META_KEY="${FM_TEST_MUSE_WORKER_KEY-present}" \
     META_API_KEY="${FM_TEST_MUSE_KEY-test-key}" \
     XDG_CONFIG_HOME="${FM_TEST_MUSE_CONFIG_HOME-$home/xdgconfig}" \
@@ -308,6 +314,45 @@ EOF
   launch=$(cat "$home/launch.log")
   assert_not_contains "$launch" '--reasoning-effort' "muse spawn invented an effort when none was chosen"
   pass "muse forwards every shared effort level unchanged and preserves its default"
+}
+
+test_spawn_maps_legacy_max_and_refuses_unknown_versions() {
+  local rec case_dir home proj wt fakebin id out status launch setting found
+  rec=$(make_spawn_case effort-legacy-max)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "Muse 0.1.0 spawn with max effort failed"
+  launch=$(cat "$home/launch.log")
+  assert_contains "$launch" "--reasoning-effort 'ultra'" "Muse 0.1.0 max effort did not map to ultra"
+  assert_not_contains "$launch" "--reasoning-effort 'max'" "Muse 0.1.0 received its unsupported max value"
+
+  for setting in unparseable unreadable; do
+    rec=$(make_spawn_case "effort-max-$setting")
+    IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+    if [ "$setting" = unparseable ]; then
+      found='Muse Code development build'
+      out=$(FM_FAKE_MUSE_VERSION_OUTPUT="$found" \
+        run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+          --mode no-mistakes --yolo off --effort max)
+    else
+      found='version unavailable'
+      out=$(FM_FAKE_MUSE_VERSION_OUTPUT="$found" FM_FAKE_MUSE_VERSION_STATUS=2 \
+        run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+          --mode no-mistakes --yolo off --effort max)
+    fi
+    status=$?
+    expect_code 1 "$status" "Muse $setting version must refuse max effort"
+    assert_contains "$out" 'requires Muse Code 0.1.0 or 1.3.0 or later' "Muse $setting version refusal omitted the required versions"
+    assert_contains "$out" "$found" "Muse $setting version refusal omitted the observed output"
+    assert_absent "$home/launch.log" "Muse $setting version still launched a worker"
+  done
+  pass "muse version-gates max across legacy, current, and unreadable installations"
 }
 
 # An unauthenticated muse pane does not exit: it sits on an OAuth device-code
@@ -956,6 +1001,7 @@ test_detection_is_anchored
 test_spawn_clears_inherited_foreign_harness_markers
 test_spawn_launch_shape
 test_spawn_maps_effort_and_model
+test_spawn_maps_legacy_max_and_refuses_unknown_versions
 test_spawn_refuses_without_credential
 test_spawn_refuses_caller_only_environment_credential
 test_spawn_accepts_stored_credential

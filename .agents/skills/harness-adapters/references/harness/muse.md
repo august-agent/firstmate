@@ -19,7 +19,7 @@ The router owns Muse's task-kind boundary.
 | Trust | Dialog `Do you trust this workspace?`, choice `1 Trust and continue` preselected for Enter; `--yolo` suppresses it, which fresh task paths require. |
 | Marker | None; identity comes from anchored `muse-bin-*` ancestry, which `../../../bin/fm-harness.sh` keeps a retained foreign marker from overriding, while `MUSE_CURRENT_SESSION_LOG` is a path rather than identity and its export to tools is unverified. |
 | Composer | Bordered `⟩`, truecolor `38;2;90;160;255`, luminance about 149.9 and narrowly above ghost threshold 128; typed text is `38;2;204;211;219`, about 209.8, with no observed placeholder or ghost. |
-| Effort | `--reasoning-effort`, default `high`, accepts `none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra` on Muse Code 1.3.0-R3401.1; every shared value from low through ultra is forwarded unchanged, while `none` and `minimal` remain outside Firstmate's shared vocabulary. |
+| Effort | `--reasoning-effort`, default `high`; Muse Code 0.1.0 maps Firstmate `max` to legacy `ultra`, Muse Code 1.3.0+ receives each shared value unchanged, and an unverified version refuses `max` before launch. |
 
 ## Credential preflight
 

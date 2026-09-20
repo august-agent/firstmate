@@ -27,7 +27,10 @@ $ muse --help
 ```
 
 Muse 1.3 exposes distinct `max` and `ultra` values.
-The spawn regression in `tests/fm-muse-harness.test.sh` exercises every shared input from `low` through `ultra`, asserts that each value reaches `--reasoning-effort` unchanged, and separately proves that omitting the axis leaves Muse on its default.
+For `max`, the spawn queries the resolved absolute launcher with `muse --version` because that launcher executes the selected version-suffixed binary before reporting, so the result identifies the binary that the worker would actually run without starting the TUI or searching mutable installation state.
+Muse 0.1.0 maps Firstmate `max` to its highest supported value, `ultra`, while Muse 1.3.0 and later receive the distinct `max` value unchanged.
+An unparseable version, an unreadable version command, or the unverified range between 0.1.0 and 1.3.0 is refused before launch.
+The spawn regression in `tests/fm-muse-harness.test.sh` exercises the Muse 1.3 shared ladder from `low` through `ultra`, proves the legacy mapping and fail-closed version boundary, and separately proves that omitting the axis leaves Muse on its default.
 
 The binary was fetched from the published channel and its checksum matched the published manifest before any run:
 

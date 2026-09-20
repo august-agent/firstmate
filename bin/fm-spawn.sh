@@ -2249,6 +2249,34 @@ resolve_muse_binary() {
   return 1
 }
 
+muse_max_effort_for_binary() {
+  local binary=$1 output status version major remainder minor
+  if output=$("$binary" --version 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  version=$(printf '%s\n' "$output" | sed -nE 's/^Muse Code ((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))( \([^)]*\))?$/\1/p')
+  if [ "$status" -ne 0 ] || [ -z "$version" ] || [ "$(printf '%s\n' "$version" | wc -l | tr -d ' ')" -ne 1 ]; then
+    [ -n "$output" ] || output='<no output>'
+    echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$binary --version' exited $status and reported '$output'" >&2
+    return 1
+  fi
+  if [ "$version" = 0.1.0 ]; then
+    printf '%s\n' ultra
+    return 0
+  fi
+  major=${version%%.*}
+  remainder=${version#*.}
+  minor=${remainder%%.*}
+  if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 3 ]; }; then
+    printf '%s\n' max
+    return 0
+  fi
+  echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$binary --version' reported '$output'" >&2
+  return 1
+}
+
 resolve_rovo_binary() {
   local candidate dir fallback
   candidate=$(command -v rovo 2>/dev/null || true)
@@ -2378,13 +2406,12 @@ effort_flag_for_harness() {
     esac
     ;;
   muse)
-    # Muse 1.3.0-R3401.1 --reasoning-effort accepts none|minimal|low|medium|
-    # high|xhigh|max|ultra and defaults to high. Every shared effort maps
-    # straight across, including the now-distinct max and ultra levels. The
-    # omitted effort leaves Muse on its own default, and Muse's extra
-    # none/minimal levels stay outside Firstmate's shared vocabulary.
     case "$effort" in
-    low | medium | high | xhigh | max | ultra) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
+    low | medium | high | xhigh | ultra) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
+    max)
+      [ -n "${MUSE_MAX_EFFORT:-}" ] || return 1
+      printf -- '--reasoning-effort %s ' "$(shell_quote "$MUSE_MAX_EFFORT")"
+      ;;
     esac
     ;;
     # rovo has no --effort flag on `run`; its effort mapping rides
@@ -2405,6 +2432,10 @@ effort_flag_for_harness() {
 case "$LAUNCH" in
 *__MUSEBIN__*)
   MUSE_BIN=$(resolve_muse_binary) || exit 1
+  MUSE_MAX_EFFORT=
+  if [ "$EFFORT" = max ]; then
+    MUSE_MAX_EFFORT=$(muse_max_effort_for_binary "$MUSE_BIN") || exit 1
+  fi
   MUSE_CONFIG_HOME=$(resolve_directory_input XDG_CONFIG_HOME "${XDG_CONFIG_HOME:-${HOME:-}/.config}") || exit 1
   MUSE_DATA_HOME=$(resolve_directory_input XDG_DATA_HOME "${XDG_DATA_HOME:-${HOME:-}/.local/share}") || exit 1
   MUSE_AUTH_FILE="$MUSE_CONFIG_HOME/muse/auth.json"
