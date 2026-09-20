@@ -4015,13 +4015,13 @@ agy_spawn_fail() {  # <detail>
   rovo_endpoint_cleanup
 }
 
-SPAWN_LAUNCH_PREPARE_MODE=wait
+SPAWN_LAUNCH_PREPARE_MODE="wait"
 [ "$RELAUNCH" -eq 0 ] || SPAWN_LAUNCH_PREPARE_MODE=clear
 if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
   echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
   exit 1
 fi
-SPAWN_LAUNCH_PREPARE_MODE=wait
+SPAWN_LAUNCH_PREPARE_MODE="wait"
 if [ "$RELAUNCH" -eq 1 ]; then
   # No worktree is acquired: the recorded one is reused as-is. What must be
   # proven instead is that the adopted endpoint's shell is actually sitting in
