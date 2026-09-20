@@ -109,12 +109,31 @@ case "${1:-}" in
     ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
   send-keys)
+    for shell_line in "$@"; do
+      case "$shell_line" in
+        *".launch-ready."*) bash -c "$shell_line"; exit $? ;;
+      esac
+    done
+    if [ "${*: -1}" = C-c ]; then
+      : > "${FM_FAKE_COMPOSER_FILE:?}"
+      exit 0
+    fi
+    if [ "${*: -1}" = Enter ] && [ -s "${FM_FAKE_COMPOSER_FILE:?}" ]; then
+      if [ "${FM_FAKE_MUSE_ENTER_FAILURE:-}" = 1 ]; then
+        exit 1
+      fi
+      [ -z "${FM_FAKE_SUBMITTED_LOG:-}" ] ||
+        printf '%s\0' "$(< "$FM_FAKE_COMPOSER_FILE")" >> "$FM_FAKE_SUBMITTED_LOG"
+      : > "$FM_FAKE_COMPOSER_FILE"
+      exit 0
+    fi
     prev=
     for arg in "$@"; do
       if [ "$prev" = -l ]; then
         if [ "${FM_FAKE_MUSE_TRANSPORT_FAILURE:-}" = 1 ] && [[ "$arg" == ". "*"/launch."* ]]; then
           exit 1
         fi
+        printf '%s\n' "$arg" > "${FM_FAKE_COMPOSER_FILE:?}"
         case "$arg" in
           ". '"*"'")
             staged=${arg#". '"}
@@ -294,6 +313,9 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_MUSE_INVOCATION_LOG="${FM_FAKE_MUSE_INVOCATION_LOG:-}" \
     FM_FAKE_MUSE_TRANSITION="${FM_FAKE_MUSE_TRANSITION:-}" \
     FM_FAKE_MUSE_TRANSPORT_FAILURE="${FM_FAKE_MUSE_TRANSPORT_FAILURE:-}" \
+    FM_FAKE_MUSE_ENTER_FAILURE="${FM_FAKE_MUSE_ENTER_FAILURE:-}" \
+    FM_FAKE_COMPOSER_FILE="${FM_FAKE_COMPOSER_FILE-$home/composer}" \
+    FM_FAKE_SUBMITTED_LOG="${FM_FAKE_SUBMITTED_LOG:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
     FM_FAKE_RELAUNCH_WINDOW="${FM_FAKE_RELAUNCH_WINDOW:-}" \
@@ -302,6 +324,7 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_BLOCK_MUSE_RM_OBSERVED="${FM_FAKE_BLOCK_MUSE_RM_OBSERVED:-}" \
     FM_FAKE_BLOCK_MUSE_RM_RELEASE="${FM_FAKE_BLOCK_MUSE_RM_RELEASE:-}" \
     FM_FAKE_REAL_RM="${FM_FAKE_REAL_RM:-}" \
+    FM_FAKE_FAIL_MUSE_RM_PREFIX="${FM_FAKE_FAIL_MUSE_RM_PREFIX:-}" \
     FM_FAKE_WORKER_META_KEY="${FM_TEST_MUSE_WORKER_KEY-present}" \
     META_API_KEY="${FM_TEST_MUSE_KEY-test-key}" \
     XDG_CONFIG_HOME="${FM_TEST_MUSE_CONFIG_HOME-$home/xdgconfig}" \
@@ -700,6 +723,154 @@ EOF
   [ "$replacement" -ef "$legacy" ] || fail "failed Muse relaunch retained an executable that did not match published metadata"
   assert_only_muse_binary "$home" "$id" "$replacement"
   pass "Muse relaunch transport failure preserves its published executable"
+}
+
+install_muse_rm_failure() {
+  local fakebin=$1
+  cat >"$fakebin/rm" <<'SH'
+#!/usr/bin/env bash
+set -u
+for arg in "$@"; do
+  if [ -n "${FM_FAKE_FAIL_MUSE_RM_PREFIX:-}" ]; then
+    case "$arg" in
+      "$FM_FAKE_FAIL_MUSE_RM_PREFIX"*) exit 1 ;;
+    esac
+  fi
+done
+exec "${FM_FAKE_REAL_RM:-/bin/rm}" "$@"
+SH
+  chmod +x "$fakebin/rm"
+}
+
+test_launch_retry_clears_failed_enter_input() {
+  local rec case_dir home proj wt fakebin id composer submitted out status records submitted_command
+  rec=$(make_spawn_case launch-enter-retry)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  composer="$case_dir/composer"
+  submitted="$case_dir/submitted"
+  : > "$composer"
+  : > "$submitted"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+
+  out=$(FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
+    FM_FAKE_MUSE_ENTER_FAILURE=1 FM_FAKE_COMPOSER_FILE="$composer" \
+    FM_FAKE_SUBMITTED_LOG="$submitted" \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "Muse relaunch with a failed Enter unexpectedly succeeded"
+  [ -s "$composer" ] || fail "failed Enter fixture did not retain the staged launch command"
+
+  out=$(FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
+    FM_FAKE_COMPOSER_FILE="$composer" FM_FAKE_SUBMITTED_LOG="$submitted" \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse relaunch retry should succeed after clearing stale input: $out"
+  [ ! -s "$composer" ] || fail "Muse relaunch retry left stale launch input in the composer"
+  records=$(tr -cd '\000' < "$submitted" | wc -c | tr -d ' ')
+  [ "$records" -eq 1 ] || fail "Muse relaunch retry submitted $records launch commands instead of one clean command"
+  submitted_command=$(tr -d '\000' < "$submitted")
+  case "$submitted_command" in
+    $'. '*$'\n'*) fail "Muse relaunch retry submitted concatenated launch commands" ;;
+    ". '"*"/launch."*".sh'") ;;
+    *) fail "Muse relaunch retry submitted an unexpected command: $submitted_command" ;;
+  esac
+  pass "Muse relaunch clears failed Enter input before retry"
+}
+
+test_main_teardown_retains_pin_owner_when_unlink_fails() {
+  local rec case_dir home proj wt fakebin id pinned out status
+  rec=$(make_spawn_case main-pin-unlink-failure)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
+  install_muse_rm_failure "$fakebin"
+  out=$(FM_FAKE_FAIL_MUSE_RM_PREFIX="$pinned" FM_FAKE_REAL_RM="$(command -v rm)" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    PATH="$fakebin:$PATH" "$TEARDOWN" "$id" --force 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "main Muse pin unlink failure unexpectedly completed teardown"
+  assert_present "$pinned" "main Muse pin unlink failure removed the retryable executable"
+  assert_present "$home/state/$id.meta" "main Muse pin unlink failure removed the metadata owner"
+
+  FM_FAKE_REAL_RM="$(command -v rm)" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" PATH="$fakebin:$PATH" \
+    "$TEARDOWN" "$id" --force >/dev/null 2>&1 \
+    || fail "main Muse teardown retry did not complete"
+  assert_absent "$pinned" "main Muse teardown retry retained the executable"
+  assert_absent "$home/state/$id.meta" "main Muse teardown retry retained metadata"
+  pass "main Muse pin unlink failure retains retryable ownership"
+}
+
+test_relaunch_retries_failed_prior_pin_retirement() {
+  local rec case_dir home proj wt fakebin id pinned replacement current out status
+  rec=$(make_spawn_case relaunch-prior-unlink-failure)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  current="$fakebin/muse-bin-1.3.0-R3401.1"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
+  install_muse_rm_failure "$fakebin"
+
+  out=$(FM_FAKE_FAIL_MUSE_RM_PREFIX="$pinned" FM_FAKE_REAL_RM="$(command -v rm)" \
+    FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "Muse relaunch ignored a prior-pin retirement failure"
+  replacement=$(muse_committed_binary "$home" "$id") \
+    || fail "Muse relaunch retirement failure lost replacement metadata"
+  assert_present "$pinned" "Muse relaunch retirement failure lost the prior executable identity"
+  assert_present "$replacement" "Muse relaunch retirement failure lost the replacement executable"
+
+  out=$(FM_FAKE_REAL_RM="$(command -v rm)" \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse relaunch retirement retry should succeed: $out"
+  replacement=$(muse_committed_binary "$home" "$id") \
+    || fail "Muse relaunch retirement retry lost replacement metadata"
+  assert_absent "$pinned" "Muse relaunch retirement retry retained the original executable"
+  assert_only_muse_binary "$home" "$id" "$replacement"
+  [ "$replacement" -ef "$current" ] || fail "Muse relaunch retirement retry pinned the wrong executable"
+  pass "Muse relaunch retries failed prior-pin retirement"
+}
+
+test_abort_retry_cleans_failed_pin_unlink() {
+  local rec case_dir home proj wt fakebin id leaked pinned out status
+  rec=$(make_spawn_case abort-unlink-failure)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  install_muse_rm_failure "$fakebin"
+  out=$(FM_TEST_MUSE_KEY='' FM_TEST_MUSE_WORKER_KEY='' \
+    FM_FAKE_FAIL_MUSE_RM_PREFIX="$home/state/muse-bin-$id." \
+    FM_FAKE_REAL_RM="$(command -v rm)" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "credentialless Muse spawn unexpectedly succeeded"
+  leaked=$(printf '%s\n' "$home/state/muse-bin-$id".*)
+  assert_present "$leaked" "aborted Muse spawn did not retain its failed-unlink executable"
+  assert_absent "$home/state/$id.meta" "aborted Muse spawn retained task metadata"
+
+  out=$(FM_FAKE_REAL_RM="$(command -v rm)" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse retry should clean the aborted executable and succeed: $out"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "Muse retry did not record its pinned executable"
+  assert_absent "$leaked" "Muse retry retained the aborted executable"
+  assert_only_muse_binary "$home" "$id" "$pinned"
+  pass "Muse retry cleans a failed abort unlink"
 }
 
 test_child_teardown_retains_pin_owner_when_unlink_fails() {
@@ -1534,6 +1705,10 @@ test_failed_max_relaunch_removes_replacement_binary
 test_nonmax_relaunch_retires_prior_binary
 test_max_relaunch_preserves_replacement_binary
 test_max_relaunch_transport_failure_preserves_published_binary
+test_launch_retry_clears_failed_enter_input
+test_main_teardown_retains_pin_owner_when_unlink_fails
+test_relaunch_retries_failed_prior_pin_retirement
+test_abort_retry_cleans_failed_pin_unlink
 test_child_teardown_retains_pin_owner_when_unlink_fails
 test_duplicate_max_spawn_preserves_live_binary
 test_aborting_attempt_cannot_remove_retry_binary

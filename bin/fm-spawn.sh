@@ -1252,7 +1252,10 @@ spawn_abort_cleanup() {
   fi
   [ -z "$SPAWN_META_TMP" ] || rm -f "$SPAWN_META_TMP" 2>/dev/null || true
   if [ -n "$SPAWN_MUSE_BIN" ] && [ "$SPAWN_MUSE_BIN_COMMITTED" != 1 ]; then
-    rm -f "$SPAWN_MUSE_BIN" 2>/dev/null || true
+    if ! rm -f "$SPAWN_MUSE_BIN" 2>/dev/null; then
+      echo "warning: could not retire aborted Muse executable for task $ID; retry will clean $SPAWN_MUSE_BIN" >&2
+      status=1
+    fi
   fi
   if [ "$CONFIG_INHERIT_LOCK_HELD" = 1 ]; then
     CONFIG_INHERIT_LOCK_HELD=0
@@ -3686,6 +3689,28 @@ spawn_send_key() { # <target> <key>
   cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
   esac
 }
+spawn_prepare_launch_composer() {
+  local marker="$STATE/.$ID.launch-ready.${BASHPID:-$$}.$RANDOM" i=0
+  SPAWN_LAUNCH_COMPOSER_ERROR=
+  rm -f -- "$marker" || { SPAWN_LAUNCH_COMPOSER_ERROR="could not clear the prior readiness marker"; return 1; }
+  fm_control_backend_supports_key "$BACKEND" C-c \
+    || { SPAWN_LAUNCH_COMPOSER_ERROR="backend $BACKEND cannot clear shell input"; return 1; }
+  spawn_send_key "$T" C-c \
+    || { SPAWN_LAUNCH_COMPOSER_ERROR="the shell-input clear key was not delivered"; return 1; }
+  spawn_send_text_line "$T" "umask 077; : > $(shell_quote "$marker")" \
+    || { SPAWN_LAUNCH_COMPOSER_ERROR="the readiness probe was not delivered"; return 1; }
+  while [ "$i" -lt 40 ]; do
+    if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+      rm -f -- "$marker" || return 1
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.05
+  done
+  rm -f -- "$marker" 2>/dev/null || true
+  SPAWN_LAUNCH_COMPOSER_ERROR="the cleared shell did not execute its readiness probe"
+  return 1
+}
 
 kimi_capture() {
   fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true
@@ -3981,6 +4006,10 @@ agy_spawn_fail() {  # <detail>
   rovo_endpoint_cleanup
 }
 
+if ! spawn_prepare_launch_composer; then
+  echo "error: task $ID launch composer could not be cleared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
+  exit 1
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   # No worktree is acquired: the recorded one is reused as-is. What must be
   # proven instead is that the adopted endpoint's shell is actually sitting in
@@ -4751,10 +4780,9 @@ if [ "$RELAUNCH" -eq 1 ]; then
   if [ -n "$SPAWN_MUSE_BIN" ]; then
     SPAWN_MUSE_BIN_COMMITTED=1
   fi
-  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN" ] && [ "$RELAUNCH_PRIOR_MUSE_BIN" != "$SPAWN_MUSE_BIN" ]; then
-    if ! rm -f -- "$RELAUNCH_PRIOR_MUSE_BIN"; then
-      echo "warning: could not retire prior pinned Muse executable for task $ID" >&2
-    fi
+  if ! fm_muse_cleanup_task_binaries "$STATE" "$ID" "$SPAWN_MUSE_BIN_NAME"; then
+    echo "error: could not retire stale pinned Muse executables for task $ID; the replacement record preserves the current identity and a retry will clean the remaining task-owned files" >&2
+    exit 1
   fi
   RELAUNCH_REPLACEMENT_PENDING=0
   SPAWN_META_PUBLISH_STARTED=0
@@ -5011,6 +5039,10 @@ if ! (umask 077 && printf '%s\n' "$LAUNCH" >"$LAUNCH_STAGE" &&
   echo "error: could not stage the launch command at $LAUNCH_FILE" >&2
   exit 1
 fi
+if ! spawn_prepare_launch_composer; then
+  echo "error: task $ID launch composer could not be cleared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
+  exit 1
+fi
 sleep 0.3
 if ! spawn_send_literal "$T" ". $(shell_quote "$LAUNCH_FILE")"; then
   echo "error: staged launch for task $ID could not be delivered to endpoint $T" >&2
@@ -5144,23 +5176,12 @@ if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
 fi
 if [ -n "$SPAWN_MUSE_BIN" ]; then
   SPAWN_MUSE_BIN_COMMITTED=1
-  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN" ] && [ "$RELAUNCH_PRIOR_MUSE_BIN" != "$SPAWN_MUSE_BIN" ]; then
-    if ! rm -f -- "$RELAUNCH_PRIOR_MUSE_BIN"; then
-      echo "warning: could not retire prior pinned Muse executable for task $ID" >&2
-    fi
-  fi
-  if [ "$STATE/muse-bin-$ID" != "$SPAWN_MUSE_BIN" ]; then
-    rm -f -- "$STATE/muse-bin-$ID" || true
-  fi
-  if ! rm -f "$STATE/$ID.muse-bin"; then
-    echo "warning: could not retire legacy pinned Muse executable for task $ID" >&2
+  if ! fm_muse_cleanup_task_binaries "$STATE" "$ID" "$SPAWN_MUSE_BIN_NAME"; then
+    echo "warning: could not retire stale pinned Muse executables for task $ID; task metadata preserves the current identity for retry" >&2
   fi
 elif [ "$RELAUNCH" -eq 1 ]; then
-  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN" ]; then
-    rm -f -- "$RELAUNCH_PRIOR_MUSE_BIN" || true
-  fi
-  if ! rm -f "$STATE/muse-bin-$ID" "$STATE/$ID.muse-bin"; then
-    echo "warning: could not retire pinned Muse executable for relaunched task $ID" >&2
+  if ! fm_muse_cleanup_task_binaries "$STATE" "$ID"; then
+    echo "warning: could not retire stale pinned Muse executables for relaunched task $ID; their task-owned names remain discoverable for retry" >&2
   fi
 fi
 if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
