@@ -32,11 +32,14 @@ The settled launcher report is the cheapest reliable source of the release selec
 It verifies the version-suffixed executable named by the settled result, publishes a unique task-attempt-owned `state/muse-bin-<id>+<token>` image, records that basename in task metadata, verifies the image, and places its exact path in the worker command.
 Publication prefers a same-filesystem hard link, then a platform copy-on-write clone where supported, and uses an ordinary copy only as the portability fallback.
 The task image remains executable with detectable Muse ancestry even when a later vendor update removes its source.
-Attempt-specific ownership keeps an abort from removing a live or successor image; a committed replacement retires the prior image, and task teardown removes the committed image.
+The `+` separator gives each task a namespace that cannot overlap a dotted task identifier, and spawn and teardown share the task lifecycle lock so teardown cannot remove an uncommitted image while spawn still owns it.
+Attempt-specific ownership keeps an abort or delayed signal from removing an image already named by durable metadata or a successor image.
+A successful replacement retires prior images, and successful task teardown removes every task-owned image before its metadata owner; an unlink failure refuses without discarding the discoverable identity so a relaunch, fresh retry, or teardown retry can finish cleanup.
 An inherited `MUSE_NO_AUTO_UPDATE=1` remains authoritative for a deliberately pinned installation.
 Muse 0.1.0 maps Firstmate `max` to its highest supported value, `ultra`, while Muse 1.3.0 and later receive the distinct `max` value unchanged.
 An unparseable version, an unreadable version command, or the unverified range between 0.1.0 and 1.3.0 is refused before launch.
-The spawn regression in `tests/fm-muse-harness.test.sh` exercises the Muse 1.3 shared ladder from `low` through `ultra`, proves the legacy mapping and fail-closed version boundary, reproduces a legacy-to-1.3 shim transition and an already-in-flight update that deletes the old binary, and proves process ancestry, relaunch cleanup, duplicate-spawn isolation, abort-versus-retry isolation, and teardown cleanup.
+The spawn regression in `tests/fm-muse-harness.test.sh` exercises the Muse 1.3 shared ladder from `low` through `ultra`, proves the legacy mapping and fail-closed version boundary, and reproduces both a legacy-to-1.3 shim transition and an already-in-flight update that deletes the old binary.
+It also proves process ancestry, dotted-task isolation, duplicate-spawn and abort-versus-retry isolation, spawn-versus-teardown serialization, signal-safe publication, retryable unlink failures, and relaunch composer cleanup and readiness probing without interrupting fresh shell startup, dropping relaunch environment exports, or changing the shell umask.
 
 The binary was fetched from the published channel and its checksum matched the published manifest before any run:
 
