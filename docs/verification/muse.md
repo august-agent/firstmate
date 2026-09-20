@@ -20,7 +20,7 @@ The interactive effort surface was reverified 2026-09-20 on the installed Muse C
 $ muse --version
 Muse Code 1.3.0 (1.3.0-R3401.1)
 
-$ muse exec --help
+$ muse --help
       --reasoning-effort <EFFORT>
           Meta reasoning effort: none|minimal|low|medium|high|xhigh|max|ultra
           (default: high)
