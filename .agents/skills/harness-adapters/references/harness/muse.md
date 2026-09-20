@@ -7,7 +7,7 @@ The router owns Muse's task-kind boundary.
 
 | Fact | Value |
 |---|---|
-| Binary | Absolute `muse` from `PATH`, refused if absent; ordinary launches use that mutable shim, while `max` synchronously resolves and launches its verified `muse-bin-<version>` executable so version selection and effort mapping cannot diverge. |
+| Binary | Absolute `muse` from `PATH`, refused if absent; ordinary launches use that mutable shim, while `max` waits through vendor updates and launches a verified task-owned copy so later binary retirement cannot separate version selection from execution. |
 | Launch | Positional instructions, like Grok or Pi. |
 | Models | `--model <model>`; only provider `meta`. |
 | Busy | Durable session event log folded by `../../../bin/fm-busy-lib.sh`; no hook or plugin writer, arming, or seeded busy record. |

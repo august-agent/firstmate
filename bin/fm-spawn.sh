@@ -1091,6 +1091,7 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+SPAWN_MUSE_BIN=
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1245,6 +1246,10 @@ spawn_abort_cleanup() {
     fm_lock_release "$SPAWN_CONTROL_LOCK" || true
   fi
   [ -z "$SPAWN_META_TMP" ] || rm -f "$SPAWN_META_TMP" 2>/dev/null || true
+  if [ -n "$SPAWN_MUSE_BIN" ] &&
+    [ ! -e "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ]; then
+    rm -f "$SPAWN_MUSE_BIN" 2>/dev/null || true
+  fi
   if [ "$CONFIG_INHERIT_LOCK_HELD" = 1 ]; then
     CONFIG_INHERIT_LOCK_HELD=0
     fm_lock_release "$CONFIG_INHERIT_LOCK" || true
@@ -2274,62 +2279,129 @@ muse_install_dir_for_launcher() {
 resolve_muse_max_launch() {
   local launcher=$1 output status version release line_count
   local mapped_effort install_dir stable stable_output stable_status major remainder minor
-  if output=$(MUSE_SYNC_UPDATE=1 "$launcher" --version 2>&1); then
-    status=0
-  else
-    status=$?
-  fi
-  line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
-  if [ "$status" -ne 0 ] || [ "$line_count" -ne 1 ] || ! printf '%s\n' "$output" | grep -Eq '^Muse Code (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*) \((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-R[0-9]+(\.[0-9]+)?\)$'; then
-    [ -n "$output" ] || output='<no output>'
-    echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' exited $status and reported '$output'" >&2
-    return 1
-  fi
-  version=${output#Muse Code }
-  version=${version%% *}
-  release=${output##*\(}
-  release=${release%\)}
-  case "$release" in
-  "$version"-R*) ;;
-  *)
-    echo "error: Muse max effort requires one stable executable version, but '$launcher --version' reported mismatched version '$output'" >&2
-    return 1
-    ;;
-  esac
-  if [ "$version" = 0.1.0 ]; then
-    mapped_effort=ultra
-  else
-    major=${version%%.*}
-    remainder=${version#*.}
-    minor=${remainder%%.*}
-    if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 3 ]; }; then
-      mapped_effort=max
-    else
-      echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' reported '$output'" >&2
-      return 1
-    fi
-  fi
+  local lock attempts wait_attempts resolve_attempts task_binary task_stage task_output task_status
   install_dir=$(muse_install_dir_for_launcher "$launcher") || {
     echo "error: Muse max effort could not resolve the install directory for launcher '$launcher'" >&2
     return 1
   }
-  stable="$install_dir/muse-bin-$release"
-  [ -x "$stable" ] || {
-    echo "error: Muse max effort resolved '$output' but its stable executable '$stable' is missing or not executable" >&2
+  lock="$install_dir/.muse-update-lock"
+  wait_attempts=${FM_MUSE_UPDATE_LOCK_WAIT_ATTEMPTS:-300}
+  case "$wait_attempts" in
+  '' | *[!0-9]* | 0)
+    echo "error: FM_MUSE_UPDATE_LOCK_WAIT_ATTEMPTS must be a positive integer" >&2
     return 1
-  }
-  if stable_output=$("$stable" --version 2>&1); then
-    stable_status=0
-  else
-    stable_status=$?
-  fi
-  if [ "$stable_status" -ne 0 ] || [ "$stable_output" != "$output" ]; then
-    [ -n "$stable_output" ] || stable_output='<no output>'
-    echo "error: Muse max effort resolved '$output' but stable executable '$stable' exited $stable_status and reported '$stable_output'" >&2
-    return 1
-  fi
-  MUSE_MAX_EFFORT=$mapped_effort
-  MUSE_BIN=$stable
+    ;;
+  esac
+  attempts=0
+  resolve_attempts=0
+  while :; do
+    if output=$(MUSE_SYNC_UPDATE=1 "$launcher" --version 2>&1); then
+      status=0
+    else
+      status=$?
+    fi
+    if [ -e "$lock" ] || [ -L "$lock" ]; then
+      while [ -e "$lock" ] || [ -L "$lock" ]; do
+        if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -d "$lock" ]; }; then
+          echo "error: Muse max effort found an unsafe update lock at '$lock'" >&2
+          return 1
+        fi
+        [ -d "$lock" ] || break
+        attempts=$((attempts + 1))
+        if [ "$attempts" -gt "$wait_attempts" ]; then
+          echo "error: Muse max effort could not establish a stable version because update lock '$lock' did not clear" >&2
+          return 1
+        fi
+        sleep 0.1
+      done
+      continue
+    fi
+    line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+    if [ "$status" -ne 0 ] || [ "$line_count" -ne 1 ] || ! printf '%s\n' "$output" | grep -Eq '^Muse Code (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*) \((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-R[0-9]+(\.[0-9]+)?\)$'; then
+      [ -n "$output" ] || output='<no output>'
+      echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' exited $status and reported '$output'" >&2
+      return 1
+    fi
+    version=${output#Muse Code }
+    version=${version%% *}
+    release=${output##*\(}
+    release=${release%\)}
+    case "$release" in
+    "$version"-R*) ;;
+    *)
+      echo "error: Muse max effort requires one stable executable version, but '$launcher --version' reported mismatched version '$output'" >&2
+      return 1
+      ;;
+    esac
+    if [ "$version" = 0.1.0 ]; then
+      mapped_effort=ultra
+    else
+      major=${version%%.*}
+      remainder=${version#*.}
+      minor=${remainder%%.*}
+      if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 3 ]; }; then
+        mapped_effort=max
+      else
+        echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' reported '$output'" >&2
+        return 1
+      fi
+    fi
+    stable="$install_dir/muse-bin-$release"
+    if [ ! -x "$stable" ]; then
+      resolve_attempts=$((resolve_attempts + 1))
+      if [ "$resolve_attempts" -lt 3 ]; then
+        sleep 0.1
+        continue
+      fi
+      echo "error: Muse max effort resolved '$output' but its stable executable '$stable' is missing or not executable" >&2
+      return 1
+    fi
+    if stable_output=$("$stable" --version 2>&1); then
+      stable_status=0
+    else
+      stable_status=$?
+    fi
+    if [ "$stable_status" -ne 0 ] || [ "$stable_output" != "$output" ]; then
+      [ -n "$stable_output" ] || stable_output='<no output>'
+      echo "error: Muse max effort resolved '$output' but stable executable '$stable' exited $stable_status and reported '$stable_output'" >&2
+      return 1
+    fi
+    task_binary="$STATE/$ID.muse-bin"
+    task_stage="$STATE/.$ID.muse-bin.${BASHPID:-$$}.$RANDOM"
+    rm -f "$task_stage"
+    if ! cp -p "$stable" "$task_stage"; then
+      rm -f "$task_stage"
+      if { [ ! -e "$stable" ] && [ ! -L "$stable" ]; } || [ -e "$lock" ] || [ -L "$lock" ]; then
+        resolve_attempts=$((resolve_attempts + 1))
+        if [ "$resolve_attempts" -lt 3 ]; then
+          sleep 0.1
+          continue
+        fi
+      fi
+      echo "error: Muse max effort could not preserve verified executable '$stable' as task-owned '$task_binary'" >&2
+      return 1
+    fi
+    if ! chmod 0700 "$task_stage" || ! mv -f "$task_stage" "$task_binary"; then
+      rm -f "$task_stage"
+      echo "error: Muse max effort could not preserve verified executable '$stable' as task-owned '$task_binary'" >&2
+      return 1
+    fi
+    if task_output=$("$task_binary" --version 2>&1); then
+      task_status=0
+    else
+      task_status=$?
+    fi
+    if [ "$task_status" -ne 0 ] || [ "$task_output" != "$output" ]; then
+      [ -n "$task_output" ] || task_output='<no output>'
+      rm -f "$task_binary"
+      echo "error: Muse max effort preserved '$output' but task-owned executable '$task_binary' exited $task_status and reported '$task_output'" >&2
+      return 1
+    fi
+    MUSE_MAX_EFFORT=$mapped_effort
+    MUSE_BIN=$task_binary
+    SPAWN_MUSE_BIN=$task_binary
+    return 0
+  done
 }
 
 resolve_rovo_binary() {

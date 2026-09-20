@@ -98,7 +98,7 @@ case "${1:-}" in
         printf '%s\n' "$arg" >> "$FM_FAKE_LAUNCH_LOG"
         if [ "${FM_FAKE_EXECUTE_MUSE_LAUNCH:-}" = 1 ]; then
           case "$arg" in
-            *"$FM_FAKE_MUSE_EXECUTABLE"* | *"$FM_FAKE_MUSE_STABLE_PREFIX"*)
+            *"$FM_FAKE_MUSE_EXECUTABLE"* | *"$FM_FAKE_MUSE_TASK_BINARY"*)
               (cd "$FM_FAKE_PANE_PATH" && bash -c "$arg")
               ;;
           esac
@@ -117,33 +117,41 @@ SH
   # Apple's signed /bin/bash is killed before startup on current macOS, while
   # the symlink preserves the process name this ancestry fixture exercises.
   ln -s "$(command -v bash)" "$fakebin/muse-bin-test-version"
-  cat > "$fakebin/muse-versioned-fake" <<'SH'
-#!/usr/bin/env bash
-set -u
-self=${0##*/}
-case "$self" in
-  muse-bin-0.1.0-R708.1) version='Muse Code 0.1.0 (0.1.0-R708.1)' ;;
-  muse-bin-1.3.0-R3401.1) version='Muse Code 1.3.0 (1.3.0-R3401.1)' ;;
-  *) exit 2 ;;
-esac
+  for entry in \
+    '0.1.0-R708.1|Muse Code 0.1.0 (0.1.0-R708.1)' \
+    '1.3.0-R3401.1|Muse Code 1.3.0 (1.3.0-R3401.1)'; do
+    release=${entry%%|*}
+    version=${entry#*|}
+    {
+      printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+      printf "version='%s'\n" "$version"
+      cat <<'SH'
 if [ "${1:-}" = --version ]; then
   printf '%s\n' "$version"
   exit 0
 fi
 if [ -n "${FM_FAKE_MUSE_INVOCATION_LOG:-}" ]; then
-  printf '%s|%s\n' "$self" "$*" > "$FM_FAKE_MUSE_INVOCATION_LOG"
+  printf '%s|%s|%s\n' "$version" "${0##*/}" "$*" > "$FM_FAKE_MUSE_INVOCATION_LOG"
 fi
 [ -n "${FM_FAKE_HARNESS_RESULT:-}" ] || exit 0
 exec "$FM_FAKE_MUSE_VERSIONED" -c 'result=$($FM_FAKE_HARNESS_PROBE); printf "%s" "$result" > "$FM_FAKE_HARNESS_RESULT"'
 SH
-  chmod +x "$fakebin/muse-versioned-fake"
-  ln -s muse-versioned-fake "$fakebin/muse-bin-0.1.0-R708.1"
-  ln -s muse-versioned-fake "$fakebin/muse-bin-1.3.0-R3401.1"
+    } > "$fakebin/muse-bin-$release"
+    chmod +x "$fakebin/muse-bin-$release"
+  done
   cat > "$fakebin/muse" <<'SH'
 #!/usr/bin/env bash
 set -u
 if [ "${1:-}" = --version ]; then
-  if [ "${FM_FAKE_MUSE_TRANSITION:-}" = 1 ] && [ "${MUSE_SYNC_UPDATE:-}" != 1 ]; then
+  if [ "${FM_FAKE_MUSE_INFLIGHT_UPDATE:-}" = 1 ] && [ -d "$(dirname "$0")/.muse-update-lock" ]; then
+    : > "$(dirname "$0")/.muse-update-observed"
+    i=0
+    while [ -d "$(dirname "$0")/.muse-update-lock" ] && [ "$i" -lt 500 ]; do
+      sleep 0.01
+      i=$((i + 1))
+    done
+    printf '%s\n' 'Muse Code 0.1.0 (0.1.0-R708.1)'
+  elif [ "${FM_FAKE_MUSE_TRANSITION:-}" = 1 ] && [ "${MUSE_SYNC_UPDATE:-}" != 1 ]; then
     printf '%s\n' 'Muse Code 0.1.0 (0.1.0-R708.1)'
   else
     printf '%s\n' "${FM_FAKE_MUSE_VERSION_OUTPUT:-Muse Code 1.3.0 (1.3.0-R3401.1)}"
@@ -193,11 +201,12 @@ run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$home/launch.log" \
     FM_FAKE_MUSE_EXECUTABLE="$fakebin/muse" \
-    FM_FAKE_MUSE_STABLE_PREFIX="$fakebin/muse-bin-" \
+    FM_FAKE_MUSE_TASK_BINARY="$home/state/$id.muse-bin" \
     FM_FAKE_MUSE_VERSIONED="$fakebin/muse-bin-test-version" \
     FM_FAKE_HARNESS_PROBE="$HARNESS" \
     FM_FAKE_EXECUTE_MUSE_LAUNCH="${FM_FAKE_EXECUTE_MUSE_LAUNCH:-}" \
     FM_FAKE_HARNESS_RESULT="${FM_FAKE_HARNESS_RESULT:-}" \
+    FM_FAKE_MUSE_INFLIGHT_UPDATE="${FM_FAKE_MUSE_INFLIGHT_UPDATE:-}" \
     FM_FAKE_MUSE_INVOCATION_LOG="${FM_FAKE_MUSE_INVOCATION_LOG:-}" \
     FM_FAKE_MUSE_TRANSITION="${FM_FAKE_MUSE_TRANSITION:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
@@ -404,10 +413,48 @@ EOF
   expect_code 0 "$status" "Muse transition spawn should succeed: $out"
   assert_present "$invocation" "Muse transition never invoked the resolved worker binary"
   invocation=$(cat "$invocation")
-  assert_contains "$invocation" 'muse-bin-1.3.0-R3401.1|' "Muse transition launched a binary other than the resolved 1.3 executable"
+  assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse transition launched a binary other than the resolved 1.3 executable"
+  assert_contains "$invocation" "$id.muse-bin|" "Muse transition bypassed its task-owned executable"
   assert_contains "$invocation" "--reasoning-effort max" "Muse 1.3 transition launch did not preserve max"
   assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse 1.3 transition launch retained the legacy mapping"
   pass "muse binds max mapping and launch to the same updated executable"
+}
+
+test_spawn_survives_an_inflight_update_for_max() {
+  local rec case_dir home proj wt fakebin id invocation observed updater out status i
+  rec=$(make_spawn_case effort-inflight-update)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  invocation="$case_dir/invocation.log"
+  observed="$fakebin/.muse-update-observed"
+  mkdir "$fakebin/.muse-update-lock"
+  (
+    i=0
+    while [ ! -e "$observed" ] && [ "$i" -lt 100 ]; do
+      sleep 0.05
+      i=$((i + 1))
+    done
+    rm -f "$fakebin/muse-bin-0.1.0-R708.1"
+    rmdir "$fakebin/.muse-update-lock"
+  ) &
+  updater=$!
+  out=$(FM_FAKE_MUSE_INFLIGHT_UPDATE=1 FM_FAKE_EXECUTE_MUSE_LAUNCH=1 \
+    FM_FAKE_MUSE_INVOCATION_LOG="$invocation" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  wait "$updater" || fail "fake Muse updater did not complete"
+  expect_code 0 "$status" "Muse in-flight update spawn should succeed: $out"
+  assert_present "$observed" "Muse resolver never encountered the in-flight update"
+  assert_absent "$fakebin/muse-bin-0.1.0-R708.1" "fake Muse updater did not retire the old binary"
+  assert_present "$invocation" "Muse in-flight update never invoked the preserved worker binary"
+  invocation=$(cat "$invocation")
+  assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse in-flight update invoked the wrong preserved version"
+  assert_contains "$invocation" "$id.muse-bin|" "Muse in-flight update bypassed its task-owned executable"
+  assert_contains "$invocation" "--reasoning-effort max" "Muse in-flight update did not preserve max"
+  assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse in-flight update retained the legacy mapping"
+  pass "muse waits through an in-flight update before preserving its worker binary"
 }
 
 # An unauthenticated muse pane does not exit: it sits on an OAuth device-code
@@ -421,11 +468,12 @@ $rec
 EOF
   mkdir -p "$home/xdgconfig/muse"
   out=$(FM_TEST_MUSE_KEY='' FM_TEST_MUSE_WORKER_KEY='' run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
-    --mode no-mistakes --yolo off)
+    --mode no-mistakes --yolo off --effort max)
   status=$?
   [ "$status" -ne 0 ] || fail "muse spawn succeeded with no credential available"
   assert_contains "$out" "no worker-reachable credential" "muse spawn did not name the missing credential"
   assert_absent "$home/state/$id.meta" "refused muse spawn still published task metadata"
+  assert_absent "$home/state/$id.muse-bin" "refused muse spawn retained its task-owned executable"
   pass "muse spawn refuses when no credential can reach the provider"
 }
 
@@ -521,7 +569,7 @@ EOF
   prior=$(write_session_log "$case_dir/xdgdata/muse/sessions" 2026 08 05 prior "$wt" </dev/null)
   prior=$(printf '%s\n' "$prior" | sed 's://*:/:g')
   FM_TEST_MUSE_DATA_HOME="$case_dir/xdgdata" \
-    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" --mode no-mistakes --yolo off >/dev/null \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" --mode no-mistakes --yolo off --effort max >/dev/null \
     || fail "muse spawn failed"
 
   binding="$home/state/$id.muse-session"
@@ -534,6 +582,7 @@ EOF
   # No busy record is armed for muse: the source is pull-only with no writer, so
   # a seeded busy record could never be settled.
   assert_absent "$home/state/$id.busy-gen" "muse spawn armed a busy record it can never clear"
+  assert_present "$home/state/$id.muse-bin" "Muse max spawn did not preserve its task-owned executable"
   printf 'binding_id=retired\nsession_log=%s\n' "$prior" > "$home/state/$id.muse-session-current"
 
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
@@ -541,6 +590,7 @@ EOF
     || fail "muse teardown failed"
   assert_absent "$binding" "muse session binding survived teardown"
   assert_absent "$home/state/$id.muse-session-current" "muse session cache survived teardown"
+  assert_absent "$home/state/$id.muse-bin" "Muse task-owned executable survived teardown"
   pass "muse spawn writes a session binding that teardown removes"
 }
 
@@ -1058,6 +1108,7 @@ test_spawn_launch_shape
 test_spawn_maps_effort_and_model
 test_spawn_maps_legacy_max_and_refuses_unknown_versions
 test_spawn_pins_updated_binary_for_max
+test_spawn_survives_an_inflight_update_for_max
 test_spawn_refuses_without_credential
 test_spawn_refuses_caller_only_environment_credential
 test_spawn_accepts_stored_credential
