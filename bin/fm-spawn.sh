@@ -2276,6 +2276,25 @@ muse_install_dir_for_launcher() {
   printf '%s\n' "$dir"
 }
 
+muse_preserve_executable() {
+  local source=$1 target=$2 system
+  rm -f "$target"
+  if ln "$source" "$target" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$target"
+  system=$(uname -s 2>/dev/null || true)
+  if [ "$system" = Darwin ]; then
+    if cp -c -p "$source" "$target" 2>/dev/null; then
+      return 0
+    fi
+  elif cp --reflink=auto -p "$source" "$target" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$target"
+  cp -p "$source" "$target"
+}
+
 resolve_muse_max_launch() {
   local launcher=$1 output status version release line_count
   local mapped_effort install_dir stable stable_output stable_status major remainder minor
@@ -2347,7 +2366,7 @@ resolve_muse_max_launch() {
       fi
     fi
     stable="$install_dir/muse-bin-$release"
-    if [ ! -x "$stable" ]; then
+    if [ ! -f "$stable" ] || [ -L "$stable" ] || [ ! -x "$stable" ]; then
       resolve_attempts=$((resolve_attempts + 1))
       if [ "$resolve_attempts" -lt 3 ]; then
         sleep 0.1
@@ -2366,10 +2385,10 @@ resolve_muse_max_launch() {
       echo "error: Muse max effort resolved '$output' but stable executable '$stable' exited $stable_status and reported '$stable_output'" >&2
       return 1
     fi
-    task_binary="$STATE/$ID.muse-bin"
-    task_stage="$STATE/.$ID.muse-bin.${BASHPID:-$$}.$RANDOM"
+    task_binary="$STATE/muse-bin-$ID"
+    task_stage="$STATE/.muse-bin-$ID.${BASHPID:-$$}.$RANDOM"
     rm -f "$task_stage"
-    if ! cp -p "$stable" "$task_stage"; then
+    if ! muse_preserve_executable "$stable" "$task_stage"; then
       rm -f "$task_stage"
       if { [ ! -e "$stable" ] && [ ! -L "$stable" ]; } || [ -e "$lock" ] || [ -L "$lock" ]; then
         resolve_attempts=$((resolve_attempts + 1))
@@ -2381,11 +2400,13 @@ resolve_muse_max_launch() {
       echo "error: Muse max effort could not preserve verified executable '$stable' as task-owned '$task_binary'" >&2
       return 1
     fi
-    if ! chmod 0700 "$task_stage" || ! mv -f "$task_stage" "$task_binary"; then
+    if [ ! -f "$task_stage" ] || [ -L "$task_stage" ] || [ ! -x "$task_stage" ] ||
+      ! mv -f "$task_stage" "$task_binary"; then
       rm -f "$task_stage"
       echo "error: Muse max effort could not preserve verified executable '$stable' as task-owned '$task_binary'" >&2
       return 1
     fi
+    SPAWN_MUSE_BIN=$task_binary
     if task_output=$("$task_binary" --version 2>&1); then
       task_status=0
     else
@@ -2399,7 +2420,6 @@ resolve_muse_max_launch() {
     fi
     MUSE_MAX_EFFORT=$mapped_effort
     MUSE_BIN=$task_binary
-    SPAWN_MUSE_BIN=$task_binary
     return 0
   done
 }

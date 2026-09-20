@@ -28,8 +28,9 @@ $ muse --help
 
 Muse 1.3 exposes distinct `max` and `ultra` values.
 For `max`, the spawn queries the resolved absolute launcher with `MUSE_SYNC_UPDATE=1 muse --version`, waits through any already-held `.muse-update-lock`, and repeats resolution after that updater finishes.
-It verifies the version-suffixed executable named by the settled result, atomically copies it to the task-owned `state/<id>.muse-bin`, verifies that copy, and places the task-owned path in the worker command.
-The task copy remains executable even when a later vendor update removes its source, and spawn-abort or task teardown removes the copy under the existing task lifecycle.
+It verifies the version-suffixed executable named by the settled result, atomically publishes it as task-owned `state/muse-bin-<id>`, verifies that image, and places the task-owned path in the worker command.
+Publication prefers a same-filesystem hard link, then a platform copy-on-write clone where supported, and uses an ordinary copy only as the portability fallback.
+The task image remains executable with detectable Muse ancestry even when a later vendor update removes its source, and spawn-abort or task teardown removes it under the existing task lifecycle.
 An inherited `MUSE_NO_AUTO_UPDATE=1` remains authoritative for a deliberately pinned installation.
 Muse 0.1.0 maps Firstmate `max` to its highest supported value, `ultra`, while Muse 1.3.0 and later receive the distinct `max` value unchanged.
 An unparseable version, an unreadable version command, or the unverified range between 0.1.0 and 1.3.0 is refused before launch.

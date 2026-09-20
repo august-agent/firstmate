@@ -192,6 +192,63 @@ EOF
   printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$id"
 }
 
+build_native_muse_fixture() {
+  local target=$1 source cc_bin
+  source="$target.c"
+  cc_bin=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
+  [ -n "$cc_bin" ] || fail "a C compiler is required to build the fake Muse process"
+  cat > "$source" <<'C'
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+  const char *version = "Muse Code 1.3.0 (1.3.0-R3401.1)";
+  const char *log_path;
+  const char *result_path;
+  const char *base;
+  FILE *log;
+  pid_t child;
+  int i;
+  int status;
+
+  if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    puts(version);
+    return 0;
+  }
+  base = strrchr(argv[0], '/');
+  base = base == NULL ? argv[0] : base + 1;
+  log_path = getenv("FM_FAKE_MUSE_INVOCATION_LOG");
+  if (log_path != NULL && *log_path != '\0') {
+    log = fopen(log_path, "w");
+    if (log == NULL) return 73;
+    fprintf(log, "%s|%s|", version, base);
+    for (i = 1; i < argc; i++) fprintf(log, "%s%s", i == 1 ? "" : " ", argv[i]);
+    fputc('\n', log);
+    if (fclose(log) != 0) return 74;
+  }
+  result_path = getenv("FM_FAKE_HARNESS_RESULT");
+  if (result_path == NULL || *result_path == '\0') return 0;
+  child = fork();
+  if (child < 0) return 70;
+  if (child == 0) {
+    execl("/bin/bash", "bash", "-c", "result=$($FM_FAKE_HARNESS_PROBE); printf \"%s\" \"$result\" > \"$FM_FAKE_HARNESS_RESULT\"", (char *)0);
+    _exit(127);
+  }
+  while (waitpid(child, &status, 0) < 0) {
+    if (errno != EINTR) return 71;
+  }
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return 72;
+}
+C
+  "$cc_bin" -o "$target" "$source" || fail "could not build the fake Muse process"
+}
+
 run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
   local home=$1 proj=$2 wt=$3 fakebin=$4 id=$5
   shift 5
@@ -201,7 +258,7 @@ run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$home/launch.log" \
     FM_FAKE_MUSE_EXECUTABLE="$fakebin/muse" \
-    FM_FAKE_MUSE_TASK_BINARY="$home/state/$id.muse-bin" \
+    FM_FAKE_MUSE_TASK_BINARY="$home/state/muse-bin-$id" \
     FM_FAKE_MUSE_VERSIONED="$fakebin/muse-bin-test-version" \
     FM_FAKE_HARNESS_PROBE="$HARNESS" \
     FM_FAKE_EXECUTE_MUSE_LAUNCH="${FM_FAKE_EXECUTE_MUSE_LAUNCH:-}" \
@@ -414,7 +471,7 @@ EOF
   assert_present "$invocation" "Muse transition never invoked the resolved worker binary"
   invocation=$(cat "$invocation")
   assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse transition launched a binary other than the resolved 1.3 executable"
-  assert_contains "$invocation" "$id.muse-bin|" "Muse transition bypassed its task-owned executable"
+  assert_contains "$invocation" "muse-bin-$id|" "Muse transition bypassed its task-owned executable"
   assert_contains "$invocation" "--reasoning-effort max" "Muse 1.3 transition launch did not preserve max"
   assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse 1.3 transition launch retained the legacy mapping"
   pass "muse binds max mapping and launch to the same updated executable"
@@ -451,10 +508,32 @@ EOF
   assert_present "$invocation" "Muse in-flight update never invoked the preserved worker binary"
   invocation=$(cat "$invocation")
   assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse in-flight update invoked the wrong preserved version"
-  assert_contains "$invocation" "$id.muse-bin|" "Muse in-flight update bypassed its task-owned executable"
+  assert_contains "$invocation" "muse-bin-$id|" "Muse in-flight update bypassed its task-owned executable"
   assert_contains "$invocation" "--reasoning-effort max" "Muse in-flight update did not preserve max"
   assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse in-flight update retained the legacy mapping"
   pass "muse waits through an in-flight update before preserving its worker binary"
+}
+
+test_spawn_pinned_binary_preserves_muse_ancestry() {
+  local rec case_dir home proj wt fakebin id source task result out status
+  rec=$(make_spawn_case effort-pinned-ancestry)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  source="$fakebin/muse-bin-1.3.0-R3401.1"
+  task="$home/state/muse-bin-$id"
+  result="$case_dir/harness-result"
+  build_native_muse_fixture "$source"
+  out=$(FM_FAKE_EXECUTE_MUSE_LAUNCH=1 FM_FAKE_HARNESS_RESULT="$result" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse pinned-ancestry spawn should succeed: $out"
+  assert_present "$task" "Muse spawn did not publish its task-owned executable"
+  [ "$source" -ef "$task" ] || fail "Muse spawn did not prefer a same-filesystem hard link"
+  assert_present "$result" "Muse pinned executable did not run the harness probe"
+  [ "$(cat "$result")" = muse ] || fail "fm-harness.sh beneath the pinned executable did not report muse"
+  pass "muse pins an efficient executable with detectable process ancestry"
 }
 
 # An unauthenticated muse pane does not exit: it sits on an OAuth device-code
@@ -473,7 +552,7 @@ EOF
   [ "$status" -ne 0 ] || fail "muse spawn succeeded with no credential available"
   assert_contains "$out" "no worker-reachable credential" "muse spawn did not name the missing credential"
   assert_absent "$home/state/$id.meta" "refused muse spawn still published task metadata"
-  assert_absent "$home/state/$id.muse-bin" "refused muse spawn retained its task-owned executable"
+  assert_absent "$home/state/muse-bin-$id" "refused muse spawn retained its task-owned executable"
   pass "muse spawn refuses when no credential can reach the provider"
 }
 
@@ -582,7 +661,8 @@ EOF
   # No busy record is armed for muse: the source is pull-only with no writer, so
   # a seeded busy record could never be settled.
   assert_absent "$home/state/$id.busy-gen" "muse spawn armed a busy record it can never clear"
-  assert_present "$home/state/$id.muse-bin" "Muse max spawn did not preserve its task-owned executable"
+  assert_present "$home/state/muse-bin-$id" "Muse max spawn did not preserve its task-owned executable"
+  : > "$home/state/$id.muse-bin"
   printf 'binding_id=retired\nsession_log=%s\n' "$prior" > "$home/state/$id.muse-session-current"
 
   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
@@ -590,7 +670,8 @@ EOF
     || fail "muse teardown failed"
   assert_absent "$binding" "muse session binding survived teardown"
   assert_absent "$home/state/$id.muse-session-current" "muse session cache survived teardown"
-  assert_absent "$home/state/$id.muse-bin" "Muse task-owned executable survived teardown"
+  assert_absent "$home/state/muse-bin-$id" "Muse task-owned executable survived teardown"
+  assert_absent "$home/state/$id.muse-bin" "legacy Muse task-owned executable survived teardown"
   pass "muse spawn writes a session binding that teardown removes"
 }
 
@@ -1109,6 +1190,7 @@ test_spawn_maps_effort_and_model
 test_spawn_maps_legacy_max_and_refuses_unknown_versions
 test_spawn_pins_updated_binary_for_max
 test_spawn_survives_an_inflight_update_for_max
+test_spawn_pinned_binary_preserves_muse_ancestry
 test_spawn_refuses_without_credential
 test_spawn_refuses_caller_only_environment_credential
 test_spawn_accepts_stored_credential
