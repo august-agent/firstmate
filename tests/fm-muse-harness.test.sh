@@ -35,7 +35,10 @@ muse_log_metadata() {
 }
 
 muse_log_permission_frame() {
-  printf '%s\n' '{"retained_frame":"session_permission_transaction","frame_schema_version":1,"outer_log_ordinal":1,"transaction_id":"permission-1","children":[{"child_index":0,"record_json":"{\"schema_version\":1,\"payload_type\":\"runtime.session.permission_format_declared\",\"payload\":{\"schema_version\":1,\"format\":\"profile_v1\"}}"}]}'
+  local padding=${1:-0}
+  printf '%s' '{"retained_frame":"session_permission_transaction","frame_schema_version":1,"outer_log_ordinal":1,"transaction_id":"permission-1","children":[{"child_index":0,"record_json":"{\"schema_version\":1,\"payload_type\":\"runtime.session.permission_format_declared\",\"payload\":{\"schema_version\":1,\"format\":\"profile_v1\"}}"}],"retained_payload":"'
+  awk -v count="$padding" 'BEGIN { for (i = 0; i < count; i++) printf "x" }'
+  printf '%s\n' '"}'
 }
 
 muse_log_run_started() {  # <run-id>
@@ -71,11 +74,11 @@ write_session_log() {
 
 # write_muse_13_session_log has Muse 1.3's permission frame before metadata.
 write_muse_13_session_log() {
-  local root=$1 y=$2 m=$3 d=$4 uuid=$5 ws=$6 dir path
+  local root=$1 y=$2 m=$3 d=$4 uuid=$5 ws=$6 padding=${7:-0} dir path
   dir="$root/$y/$m/$d/$uuid"
   mkdir -p "$dir"
   path="$dir/session.jsonl"
-  muse_log_permission_frame > "$path"
+  muse_log_permission_frame "$padding" > "$path"
   muse_log_metadata "$ws" >> "$path"
   cat >> "$path"
   printf '%s\n' "$path"
@@ -1122,7 +1125,10 @@ test_muse_13_permission_frame_does_not_hide_workspace_metadata() {
 $(muse_log_run_started unrelated-a)
 $(muse_log_run_terminal unrelated-a completed)
 EOF
-  target=$(write_muse_13_session_log "$root" "$year" "$month" "$day" target "$dir/ws" <<EOF
+  # A retained permission transaction is one logical opening record and may be
+  # larger than the resolver's read chunk. The metadata record after it still
+  # owns the workspace binding.
+  target=$(write_muse_13_session_log "$root" "$year" "$month" "$day" target "$dir/ws" 70000 <<EOF
 $(muse_log_run_started target-run)
 $(muse_log_run_terminal target-run completed)
 EOF

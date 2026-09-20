@@ -360,20 +360,38 @@ function metadataWorkspace(file) {
   try {
     descriptor = fs.openSync(file, "r");
     const buffer = Buffer.alloc(65536);
-    const length = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
-    const lines = buffer.subarray(0, length).toString("utf8").split("\n");
-    if (length === buffer.length && buffer[length - 1] !== 10) lines.pop();
-    for (const line of lines) {
-      if (!line) continue;
-      let record;
-      try {
-        record = JSON.parse(line);
-      } catch {
-        continue;
+    const maxPreludeBytes = 1024 * 1024;
+    const maxPreludeRecords = 8;
+    let offset = 0;
+    let pending = Buffer.alloc(0);
+    let records = 0;
+    while (offset < maxPreludeBytes && records < maxPreludeRecords) {
+      const length = fs.readSync(
+        descriptor,
+        buffer,
+        0,
+        Math.min(buffer.length, maxPreludeBytes - offset),
+        offset,
+      );
+      if (length === 0) break;
+      offset += length;
+      pending = Buffer.concat([pending, buffer.subarray(0, length)]);
+      let newline;
+      while (records < maxPreludeRecords && (newline = pending.indexOf(10)) >= 0) {
+        const line = pending.subarray(0, newline).toString("utf8");
+        pending = pending.subarray(newline + 1);
+        records += 1;
+        if (!line) continue;
+        let record;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (record?.payload_type !== "runtime.session.metadata") continue;
+        const workspace = record?.payload?.record?.workspace_root;
+        if (typeof workspace === "string" && workspace.length > 0) return workspace;
       }
-      if (record?.payload_type !== "runtime.session.metadata") continue;
-      const workspace = record?.payload?.record?.workspace_root;
-      if (typeof workspace === "string" && workspace.length > 0) return workspace;
     }
     return null;
   } catch {
