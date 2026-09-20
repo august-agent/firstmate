@@ -185,6 +185,18 @@ SH
       printf "version='%s'\n" "$version"
       cat <<'SH'
 if [ "${1:-}" = --version ]; then
+  case "${0##*/}" in
+    muse-bin-*+*)
+      if [ -n "${FM_FAKE_MUSE_TASK_VERSION_OBSERVED:-}" ]; then
+        : >"$FM_FAKE_MUSE_TASK_VERSION_OBSERVED"
+        i=0
+        while [ ! -e "$FM_FAKE_MUSE_TASK_VERSION_RELEASE" ] && [ "$i" -lt 3000 ]; do
+          sleep 0.01
+          i=$((i + 1))
+        done
+      fi
+      ;;
+  esac
   printf '%s\n' "$version"
   exit 0
 fi
@@ -333,6 +345,8 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_STARTUP_INTERRUPTED="${FM_FAKE_STARTUP_INTERRUPTED:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
+    FM_FAKE_MUSE_TASK_VERSION_OBSERVED="${FM_FAKE_MUSE_TASK_VERSION_OBSERVED:-}" \
+    FM_FAKE_MUSE_TASK_VERSION_RELEASE="${FM_FAKE_MUSE_TASK_VERSION_RELEASE:-}" \
     FM_FAKE_RELAUNCH_WINDOW="${FM_FAKE_RELAUNCH_WINDOW:-}" \
     FM_FAKE_PANE_COMMAND="${FM_FAKE_PANE_COMMAND:-}" \
     FM_FAKE_BLOCK_MUSE_RM_PREFIX="${FM_FAKE_BLOCK_MUSE_RM_PREFIX:-}" \
@@ -1041,6 +1055,76 @@ EOF
     || fail "duplicate Muse max spawn changed the live task's committed executable identity"
   assert_only_muse_binary "$home" "$id" "$pinned"
   pass "duplicate Muse max spawn preserves the live task executable"
+}
+
+test_teardown_waits_for_inflight_max_spawn_pin() {
+  local rec case_dir home proj wt fakebin id pinned inflight observed release
+  local spawn_pid teardown_pid spawn_status teardown_status status_path i path
+  rec=$(make_spawn_case teardown-spawn-pin-race)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  observed="$case_dir/task-version-observed"
+  release="$case_dir/task-version-release"
+  spawn_status="$case_dir/spawn.status"
+  teardown_status="$case_dir/teardown.status"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") \
+    || fail "initial Muse max spawn did not record its pinned executable"
+
+  (
+    FM_FAKE_RELAUNCH_WINDOW="fm-$id" FM_FAKE_PANE_COMMAND=muse \
+      FM_FAKE_MUSE_TASK_VERSION_OBSERVED="$observed" \
+      FM_FAKE_MUSE_TASK_VERSION_RELEASE="$release" \
+      run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+        --mode no-mistakes --yolo off --effort max >"$case_dir/spawn.out" 2>&1
+    printf '%s\n' "$?" >"$spawn_status"
+  ) &
+  spawn_pid=$!
+  i=0
+  while [ ! -e "$observed" ] && [ "$i" -lt 1000 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  assert_present "$observed" "in-flight Muse spawn never reached task-owned executable verification"
+  inflight=
+  for path in "$home/state/muse-bin-$id"+*; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    [ "$path" = "$pinned" ] || inflight=$path
+  done
+  [ -n "$inflight" ] || fail "in-flight Muse spawn did not publish its attempt-owned executable"
+
+  (
+    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+      PATH="$fakebin:$PATH" "$TEARDOWN" "$id" --force >"$case_dir/teardown.out" 2>&1
+    printf '%s\n' "$?" >"$teardown_status"
+  ) &
+  teardown_pid=$!
+  i=0
+  while [ ! -e "$home/state/.control-$id.lock" ] && [ ! -e "$teardown_status" ] \
+    && [ "$i" -lt 1000 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  assert_present "$home/state/.control-$id.lock" "teardown did not reach the task lifecycle boundary"
+  assert_absent "$teardown_status" "teardown completed while a Muse spawn owned an uncommitted pin"
+  assert_present "$home/state/$id.meta" "teardown removed metadata while a Muse spawn was in flight"
+  assert_present "$pinned" "teardown removed the committed Muse executable while a spawn was in flight"
+  assert_present "$inflight" "teardown removed the in-flight Muse executable"
+
+  : >"$release"
+  wait "$spawn_pid"
+  status_path=$(cat "$spawn_status")
+  [ "$status_path" -ne 0 ] || fail "duplicate in-flight Muse spawn unexpectedly succeeded"
+  wait "$teardown_pid"
+  status_path=$(cat "$teardown_status")
+  expect_code 0 "$status_path" "Muse teardown should complete after the in-flight spawn releases its lifecycle lock"
+  assert_absent "$home/state/$id.meta" "serialized Muse teardown retained task metadata"
+  assert_absent "$pinned" "serialized Muse teardown retained the committed executable"
+  assert_absent "$inflight" "serialized Muse teardown retained the aborted attempt executable"
+  pass "Muse teardown waits for in-flight spawn pin ownership"
 }
 
 test_aborting_attempt_cannot_remove_retry_binary() {
@@ -1816,6 +1900,7 @@ test_nonmax_retry_cleans_failed_pin_unlink
 test_dotted_task_pin_cleanup_is_isolated
 test_child_teardown_retains_pin_owner_when_unlink_fails
 test_duplicate_max_spawn_preserves_live_binary
+test_teardown_waits_for_inflight_max_spawn_pin
 test_aborting_attempt_cannot_remove_retry_binary
 test_spawn_refuses_without_credential
 test_spawn_refuses_caller_only_environment_credential

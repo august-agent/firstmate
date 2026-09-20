@@ -29,7 +29,7 @@ $ muse --help
 Muse 1.3 exposes distinct `max` and `ultra` values.
 For `max`, the spawn queries the resolved absolute launcher with `MUSE_SYNC_UPDATE=1 muse --version`, waits through any already-held `.muse-update-lock`, and repeats resolution after that updater finishes.
 The settled launcher report is the cheapest reliable source of the release selected after update handling, and requiring the named versioned executable to return the same report binds that release to the exact image preserved for launch.
-It verifies the version-suffixed executable named by the settled result, publishes a unique task-attempt-owned `state/muse-bin-<id>.<token>` image, records that basename in task metadata, verifies the image, and places its exact path in the worker command.
+It verifies the version-suffixed executable named by the settled result, publishes a unique task-attempt-owned `state/muse-bin-<id>+<token>` image, records that basename in task metadata, verifies the image, and places its exact path in the worker command.
 Publication prefers a same-filesystem hard link, then a platform copy-on-write clone where supported, and uses an ordinary copy only as the portability fallback.
 The task image remains executable with detectable Muse ancestry even when a later vendor update removes its source.
 Attempt-specific ownership keeps an abort from removing a live or successor image; a committed replacement retires the prior image, and task teardown removes the committed image.
@@ -72,7 +72,7 @@ $ grep -nE 'muse-bin|exec ' launcher.sh
 1135:  exec "$binary" "$@"
 ```
 
-`ps -o comm= -p <pid>` returns the full executable path, whose basename is `muse-bin-<version>` for an ordinary launch and `muse-bin-<id>.<token>` for a pinned `max` launch.
+`ps -o comm= -p <pid>` returns the full executable path, whose basename is `muse-bin-<version>` for an ordinary launch and `muse-bin-<id>+<token>` for a pinned `max` launch.
 That is why both `bin/fm-harness.sh` and `bin/backends/tmux.sh` match the anchored prefix `muse-bin-*` rather than an exact name, and why neither can rely on an install-path component.
 The Muse launch clears `CLAUDECODE`, `PI_CODING_AGENT`, `GROK_AGENT`, `FM_PI_HARNESS`, `CURSOR_AGENT`, and `CURSOR_INVOKED_AS` before the worker starts, which is the verified launch behavior rather than what detection depends on.
 [Harness detection precedence](runtime-backends.md#harness-detection-precedence) owns why a retained foreign marker cannot override the versioned ancestry.
