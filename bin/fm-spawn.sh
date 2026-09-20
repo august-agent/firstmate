@@ -4748,6 +4748,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: replacement task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
     exit 1
   fi
+  if [ -n "$SPAWN_MUSE_BIN" ]; then
+    SPAWN_MUSE_BIN_COMMITTED=1
+  fi
+  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN" ] && [ "$RELAUNCH_PRIOR_MUSE_BIN" != "$SPAWN_MUSE_BIN" ]; then
+    if ! rm -f -- "$RELAUNCH_PRIOR_MUSE_BIN"; then
+      echo "warning: could not retire prior pinned Muse executable for task $ID" >&2
+    fi
+  fi
   RELAUNCH_REPLACEMENT_PENDING=0
   SPAWN_META_PUBLISH_STARTED=0
   SPAWN_META_TMP=
@@ -5004,13 +5012,19 @@ if ! (umask 077 && printf '%s\n' "$LAUNCH" >"$LAUNCH_STAGE" &&
   exit 1
 fi
 sleep 0.3
-spawn_send_literal "$T" ". $(shell_quote "$LAUNCH_FILE")"
+if ! spawn_send_literal "$T" ". $(shell_quote "$LAUNCH_FILE")"; then
+  echo "error: staged launch for task $ID could not be delivered to endpoint $T" >&2
+  exit 1
+fi
 sleep 0.3
 if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   HERDR_PROJECTION_ABORT_CLEANUP=0
   spawn_herdr_presentation_order_lock_release
 fi
-spawn_send_key "$T" Enter
+if ! spawn_send_key "$T" Enter; then
+  echo "error: staged launch for task $ID could not be submitted to endpoint $T" >&2
+  exit 1
+fi
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
     kimi_spawn_fail "$KIMI_READY_FAILURE_DETAIL"

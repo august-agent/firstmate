@@ -112,6 +112,9 @@ case "${1:-}" in
     prev=
     for arg in "$@"; do
       if [ "$prev" = -l ]; then
+        if [ "${FM_FAKE_MUSE_TRANSPORT_FAILURE:-}" = 1 ] && [[ "$arg" == ". "*"/launch."* ]]; then
+          exit 1
+        fi
         case "$arg" in
           ". '"*"'")
             staged=${arg#". '"}
@@ -290,6 +293,7 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_MUSE_INFLIGHT_UPDATE="${FM_FAKE_MUSE_INFLIGHT_UPDATE:-}" \
     FM_FAKE_MUSE_INVOCATION_LOG="${FM_FAKE_MUSE_INVOCATION_LOG:-}" \
     FM_FAKE_MUSE_TRANSITION="${FM_FAKE_MUSE_TRANSITION:-}" \
+    FM_FAKE_MUSE_TRANSPORT_FAILURE="${FM_FAKE_MUSE_TRANSPORT_FAILURE:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
     FM_FAKE_RELAUNCH_WINDOW="${FM_FAKE_RELAUNCH_WINDOW:-}" \
@@ -667,6 +671,78 @@ EOF
   [ "$replacement" -ef "$legacy" ] || fail "Muse max-to-max relaunch did not retain the newly verified replacement executable"
   [ ! "$replacement" -ef "$current" ] || fail "Muse max-to-max relaunch retained the superseded executable"
   pass "successful Muse max-to-max relaunch preserves its replacement executable"
+}
+
+test_max_relaunch_transport_failure_preserves_published_binary() {
+  local rec case_dir home proj wt fakebin id pinned replacement legacy out status
+  rec=$(make_spawn_case relaunch-max-transport-failure)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  legacy="$fakebin/muse-bin-0.1.0-R708.1"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
+
+  out=$(FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
+    FM_FAKE_MUSE_TRANSPORT_FAILURE=1 \
+    run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "Muse max relaunch transport failure unexpectedly succeeded"
+  assert_contains "$out" "could not be delivered" \
+    "Muse max relaunch did not report its transport failure"
+  replacement=$(muse_committed_binary "$home" "$id") \
+    || fail "failed Muse relaunch did not retain the published executable identity"
+  [ "$replacement" != "$pinned" ] || fail "failed Muse relaunch retained its superseded executable identity"
+  assert_present "$replacement" "failed Muse relaunch deleted its published executable"
+  assert_absent "$pinned" "failed Muse relaunch retained its unowned prior executable"
+  [ "$replacement" -ef "$legacy" ] || fail "failed Muse relaunch retained an executable that did not match published metadata"
+  assert_only_muse_binary "$home" "$id" "$replacement"
+  pass "Muse relaunch transport failure preserves its published executable"
+}
+
+test_child_teardown_retains_pin_owner_when_unlink_fails() {
+  local rec case_dir home proj wt fakebin id pinned parent mate out status real_rm
+  rec=$(make_spawn_case child-pin-unlink-failure)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
+  parent="$case_dir/parent"
+  mate=muse-pin-owner-mate
+  mkdir -p "$parent/state" "$parent/data" "$parent/config" "$parent/projects"
+  touch "$parent/state/.last-watcher-beat"
+  printf '%s\n' "$mate" > "$home/.fm-secondmate-home"
+  fm_write_meta "$parent/state/$mate.meta" \
+    "window=firstmate:fm-$mate" "endpoint_task_id=$mate" \
+    "worktree=$home" "project=$home" "home=$home" \
+    "kind=secondmate" "mode=secondmate" "harness=echo" "projects=fixture"
+  real_rm=$(command -v rm)
+  cat >"$fakebin/rm" <<'SH'
+#!/usr/bin/env bash
+set -u
+for arg in "$@"; do
+  [ "$arg" != "$FM_FAKE_FAIL_RM_PATH" ] || exit 1
+done
+exec "$FM_FAKE_REAL_RM" "$@"
+SH
+  chmod +x "$fakebin/rm"
+
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$parent" \
+    FM_STATE_OVERRIDE="$parent/state" FM_DATA_OVERRIDE="$parent/data" \
+    FM_CONFIG_OVERRIDE="$parent/config" FM_FAKE_FAIL_RM_PATH="$pinned" \
+    FM_FAKE_REAL_RM="$real_rm" PATH="$fakebin:$PATH" \
+    "$TEARDOWN" "$mate" --force 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "child Muse pin unlink failure unexpectedly completed teardown"
+  assert_present "$pinned" "child Muse pin unlink failure removed the retryable executable"
+  assert_present "$home/state/$id.meta" "child Muse pin unlink failure removed the metadata that owns the executable"
+  assert_present "$parent/state/$mate.meta" "child Muse pin unlink failure removed the parent task record"
+  pass "child Muse pin unlink failure retains its metadata owner"
 }
 
 test_duplicate_max_spawn_preserves_live_binary() {
@@ -1457,6 +1533,8 @@ test_spawn_pinned_binary_preserves_muse_ancestry
 test_failed_max_relaunch_removes_replacement_binary
 test_nonmax_relaunch_retires_prior_binary
 test_max_relaunch_preserves_replacement_binary
+test_max_relaunch_transport_failure_preserves_published_binary
+test_child_teardown_retains_pin_owner_when_unlink_fails
 test_duplicate_max_spawn_preserves_live_binary
 test_aborting_attempt_cannot_remove_retry_binary
 test_spawn_refuses_without_credential
