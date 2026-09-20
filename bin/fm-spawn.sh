@@ -2404,7 +2404,7 @@ resolve_muse_max_launch() {
       echo "error: Muse max effort resolved '$output' but stable executable '$stable' exited $stable_status and reported '$stable_output'" >&2
       return 1
     fi
-    task_stage=$(mktemp "$STATE/.muse-bin-$ID.XXXXXXXXXXXX") || {
+    task_stage=$(mktemp "$STATE/.muse-bin-$ID+XXXXXXXXXXXX") || {
       echo "error: Muse max effort could not allocate a task-owned executable in '$STATE'" >&2
       return 1
     }
@@ -3690,14 +3690,16 @@ spawn_send_key() { # <target> <key>
   esac
 }
 spawn_prepare_launch_composer() {
-  local marker="$STATE/.$ID.launch-ready.${BASHPID:-$$}.$RANDOM" i=0
+  local mode=$1 marker="$STATE/.$ID.launch-ready.${BASHPID:-$$}.$RANDOM" i=0
   SPAWN_LAUNCH_COMPOSER_ERROR=
   rm -f -- "$marker" || { SPAWN_LAUNCH_COMPOSER_ERROR="could not clear the prior readiness marker"; return 1; }
-  fm_control_backend_supports_key "$BACKEND" C-c \
-    || { SPAWN_LAUNCH_COMPOSER_ERROR="backend $BACKEND cannot clear shell input"; return 1; }
-  spawn_send_key "$T" C-c \
-    || { SPAWN_LAUNCH_COMPOSER_ERROR="the shell-input clear key was not delivered"; return 1; }
-  spawn_send_text_line "$T" "umask 077; : > $(shell_quote "$marker")" \
+  if [ "$mode" = clear ]; then
+    fm_control_backend_supports_key "$BACKEND" C-c \
+      || { SPAWN_LAUNCH_COMPOSER_ERROR="backend $BACKEND cannot clear shell input"; return 1; }
+    spawn_send_key "$T" C-c \
+      || { SPAWN_LAUNCH_COMPOSER_ERROR="the shell-input clear key was not delivered"; return 1; }
+  fi
+  spawn_send_text_line "$T" "(umask 077; : > $(shell_quote "$marker"))" \
     || { SPAWN_LAUNCH_COMPOSER_ERROR="the readiness probe was not delivered"; return 1; }
   while [ "$i" -lt 40 ]; do
     if [ -f "$marker" ] && [ ! -L "$marker" ]; then
@@ -3708,7 +3710,7 @@ spawn_prepare_launch_composer() {
     sleep 0.05
   done
   rm -f -- "$marker" 2>/dev/null || true
-  SPAWN_LAUNCH_COMPOSER_ERROR="the cleared shell did not execute its readiness probe"
+  SPAWN_LAUNCH_COMPOSER_ERROR="the shell did not execute its readiness probe"
   return 1
 }
 
@@ -4006,8 +4008,10 @@ agy_spawn_fail() {  # <detail>
   rovo_endpoint_cleanup
 }
 
-if ! spawn_prepare_launch_composer; then
-  echo "error: task $ID launch composer could not be cleared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
+SPAWN_LAUNCH_PREPARE_MODE=wait
+[ "$RELAUNCH" -eq 0 ] || SPAWN_LAUNCH_PREPARE_MODE=clear
+if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
+  echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
   exit 1
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -5039,8 +5043,8 @@ if ! (umask 077 && printf '%s\n' "$LAUNCH" >"$LAUNCH_STAGE" &&
   echo "error: could not stage the launch command at $LAUNCH_FILE" >&2
   exit 1
 fi
-if ! spawn_prepare_launch_composer; then
-  echo "error: task $ID launch composer could not be cleared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
+if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
+  echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
   exit 1
 fi
 sleep 0.3
@@ -5179,9 +5183,9 @@ if [ -n "$SPAWN_MUSE_BIN" ]; then
   if ! fm_muse_cleanup_task_binaries "$STATE" "$ID" "$SPAWN_MUSE_BIN_NAME"; then
     echo "warning: could not retire stale pinned Muse executables for task $ID; task metadata preserves the current identity for retry" >&2
   fi
-elif [ "$RELAUNCH" -eq 1 ]; then
+else
   if ! fm_muse_cleanup_task_binaries "$STATE" "$ID"; then
-    echo "warning: could not retire stale pinned Muse executables for relaunched task $ID; their task-owned names remain discoverable for retry" >&2
+    echo "warning: could not retire stale pinned Muse executables for task $ID; their task-owned names remain discoverable for retry" >&2
   fi
 fi
 if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then

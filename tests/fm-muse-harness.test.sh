@@ -111,10 +111,22 @@ case "${1:-}" in
   send-keys)
     for shell_line in "$@"; do
       case "$shell_line" in
-        *".launch-ready."*) bash -c "$shell_line"; exit $? ;;
+        *".launch-ready."*)
+          if [ -n "${FM_FAKE_SHELL_UMASK_FILE:-}" ]; then
+            [ -e "$FM_FAKE_SHELL_UMASK_FILE" ] || printf '0022\n' >"$FM_FAKE_SHELL_UMASK_FILE"
+            case "$shell_line" in umask\ 077\;*) printf '0077\n' >"$FM_FAKE_SHELL_UMASK_FILE" ;; esac
+          fi
+          if [ -n "${FM_FAKE_SHELL_START_DELAY:-}" ]; then
+            (sleep "$FM_FAKE_SHELL_START_DELAY"; bash -c "$shell_line") </dev/null >/dev/null 2>&1 &
+            exit 0
+          fi
+          bash -c "$shell_line"
+          exit $?
+          ;;
       esac
     done
     if [ "${*: -1}" = C-c ]; then
+      [ -z "${FM_FAKE_STARTUP_INTERRUPTED:-}" ] || : >"$FM_FAKE_STARTUP_INTERRUPTED"
       : > "${FM_FAKE_COMPOSER_FILE:?}"
       exit 0
     fi
@@ -316,6 +328,9 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_MUSE_ENTER_FAILURE="${FM_FAKE_MUSE_ENTER_FAILURE:-}" \
     FM_FAKE_COMPOSER_FILE="${FM_FAKE_COMPOSER_FILE-$home/composer}" \
     FM_FAKE_SUBMITTED_LOG="${FM_FAKE_SUBMITTED_LOG:-}" \
+    FM_FAKE_SHELL_UMASK_FILE="${FM_FAKE_SHELL_UMASK_FILE:-}" \
+    FM_FAKE_SHELL_START_DELAY="${FM_FAKE_SHELL_START_DELAY:-}" \
+    FM_FAKE_STARTUP_INTERRUPTED="${FM_FAKE_STARTUP_INTERRUPTED:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
     FM_FAKE_RELAUNCH_WINDOW="${FM_FAKE_RELAUNCH_WINDOW:-}" \
@@ -358,7 +373,7 @@ muse_committed_binary() {
 
 assert_only_muse_binary() {
   local home=$1 id=$2 expected=$3 path count=0
-  for path in "$home/state/muse-bin-$id".*; do
+  for path in "$home/state/muse-bin-$id"+*; do
     [ -e "$path" ] || [ -L "$path" ] || continue
     count=$((count + 1))
     [ "$path" = "$expected" ] || fail "unexpected Muse task executable remained at $path"
@@ -561,7 +576,7 @@ EOF
   assert_present "$invocation" "Muse transition never invoked the resolved worker binary"
   invocation=$(cat "$invocation")
   assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse transition launched a binary other than the resolved 1.3 executable"
-  assert_contains "$invocation" "muse-bin-$id." "Muse transition bypassed its task-owned executable"
+  assert_contains "$invocation" "muse-bin-$id+" "Muse transition bypassed its task-owned executable"
   assert_contains "$invocation" "--reasoning-effort max" "Muse 1.3 transition launch did not preserve max"
   assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse 1.3 transition launch retained the legacy mapping"
   pass "muse binds max mapping and launch to the same updated executable"
@@ -598,7 +613,7 @@ EOF
   assert_present "$invocation" "Muse in-flight update never invoked the preserved worker binary"
   invocation=$(cat "$invocation")
   assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse in-flight update invoked the wrong preserved version"
-  assert_contains "$invocation" "muse-bin-$id." "Muse in-flight update bypassed its task-owned executable"
+  assert_contains "$invocation" "muse-bin-$id+" "Muse in-flight update bypassed its task-owned executable"
   assert_contains "$invocation" "--reasoning-effort max" "Muse in-flight update did not preserve max"
   assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse in-flight update retained the legacy mapping"
   pass "muse waits through an in-flight update before preserving its worker binary"
@@ -781,6 +796,39 @@ EOF
   pass "Muse relaunch clears failed Enter input before retry"
 }
 
+test_fresh_launch_waits_without_interrupting_startup() {
+  local rec case_dir home proj wt fakebin id interrupted out status
+  rec=$(make_spawn_case fresh-shell-startup)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  interrupted="$case_dir/startup-interrupted"
+  out=$(FM_FAKE_SHELL_START_DELAY=0.1 FM_FAKE_STARTUP_INTERRUPTED="$interrupted" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort high)
+  status=$?
+  expect_code 0 "$status" "Muse fresh spawn should wait for a slow shell startup: $out"
+  assert_absent "$interrupted" "Muse fresh spawn interrupted shell startup"
+  pass "Muse fresh spawn waits without interrupting shell startup"
+}
+
+test_launch_readiness_preserves_shell_umask() {
+  local rec case_dir home proj wt fakebin id umask_file out status observed
+  rec=$(make_spawn_case launch-shell-umask)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  umask_file="$case_dir/shell-umask"
+  out=$(FM_FAKE_SHELL_UMASK_FILE="$umask_file" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort high)
+  status=$?
+  expect_code 0 "$status" "Muse spawn readiness should preserve the shell umask: $out"
+  observed=$(cat "$umask_file")
+  [ "$observed" = 0022 ] || fail "Muse spawn readiness changed the shell umask to $observed"
+  pass "Muse launch readiness preserves the shell umask"
+}
+
 test_main_teardown_retains_pin_owner_when_unlink_fails() {
   local rec case_dir home proj wt fakebin id pinned out status
   rec=$(make_spawn_case main-pin-unlink-failure)
@@ -852,13 +900,13 @@ $rec
 EOF
   install_muse_rm_failure "$fakebin"
   out=$(FM_TEST_MUSE_KEY='' FM_TEST_MUSE_WORKER_KEY='' \
-    FM_FAKE_FAIL_MUSE_RM_PREFIX="$home/state/muse-bin-$id." \
+    FM_FAKE_FAIL_MUSE_RM_PREFIX="$home/state/muse-bin-$id+" \
     FM_FAKE_REAL_RM="$(command -v rm)" \
     run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
       --mode no-mistakes --yolo off --effort max)
   status=$?
   [ "$status" -ne 0 ] || fail "credentialless Muse spawn unexpectedly succeeded"
-  leaked=$(printf '%s\n' "$home/state/muse-bin-$id".*)
+  leaked=$(printf '%s\n' "$home/state/muse-bin-$id"+*)
   assert_present "$leaked" "aborted Muse spawn did not retain its failed-unlink executable"
   assert_absent "$home/state/$id.meta" "aborted Muse spawn retained task metadata"
 
@@ -871,6 +919,59 @@ EOF
   assert_absent "$leaked" "Muse retry retained the aborted executable"
   assert_only_muse_binary "$home" "$id" "$pinned"
   pass "Muse retry cleans a failed abort unlink"
+}
+
+test_nonmax_retry_cleans_failed_pin_unlink() {
+  local rec case_dir home proj wt fakebin id leaked out status
+  rec=$(make_spawn_case abort-unlink-nonmax-retry)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  install_muse_rm_failure "$fakebin"
+  out=$(FM_TEST_MUSE_KEY='' FM_TEST_MUSE_WORKER_KEY='' \
+    FM_FAKE_FAIL_MUSE_RM_PREFIX="$home/state/muse-bin-$id+" \
+    FM_FAKE_REAL_RM="$(command -v rm)" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "credentialless Muse spawn unexpectedly succeeded"
+  leaked=$(printf '%s\n' "$home/state/muse-bin-$id"+*)
+  assert_present "$leaked" "aborted Muse spawn did not retain its failed-unlink executable"
+
+  out=$(FM_FAKE_REAL_RM="$(command -v rm)" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort high)
+  status=$?
+  expect_code 0 "$status" "non-max Muse retry should clean the aborted executable: $out"
+  assert_absent "$leaked" "non-max Muse retry retained the aborted executable"
+  pass "non-max Muse retry cleans a failed abort unlink"
+}
+
+test_dotted_task_pin_cleanup_is_isolated() {
+  local rec case_dir home proj wt fakebin original_id id foreign pinned out status
+  rec=$(make_spawn_case dotted-pin-namespace)
+  IFS='|' read -r case_dir home proj wt fakebin original_id <<EOF
+$rec
+EOF
+  id=build
+  mkdir -p "$home/data/$id"
+  cp "$home/data/$original_id/brief.md" "$home/data/$id/brief.md"
+  foreign="$home/state/muse-bin-build.api"
+  ln "$fakebin/muse-bin-1.3.0-R3401.1" "$foreign"
+  fm_write_meta "$home/state/build.api.meta" \
+    "window=firstmate:fm-build.api" "endpoint_task_id=build.api" \
+    "worktree=$wt" "project=$proj" "harness=muse" \
+    "kind=ship" "mode=no-mistakes" "muse_bin=muse-bin-build.api"
+
+  out=$(run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max)
+  status=$?
+  expect_code 0 "$status" "dotted task namespace Muse spawn should succeed: $out"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "Muse spawn did not record its task-owned executable"
+  assert_present "$pinned" "Muse spawn did not preserve its own executable"
+  assert_present "$foreign" "Muse pin cleanup removed the dotted task's executable"
+  assert_present "$home/state/build.api.meta" "Muse pin cleanup removed the dotted task's owner"
+  pass "Muse pin cleanup isolates dotted task identifiers"
 }
 
 test_child_teardown_retains_pin_owner_when_unlink_fails() {
@@ -956,7 +1057,7 @@ set -u
 if [ -n "$FM_FAKE_BLOCK_MUSE_RM_PREFIX" ]; then
   for arg in "$@"; do
     case "$arg" in
-      "$FM_FAKE_BLOCK_MUSE_RM_PREFIX".*)
+      "$FM_FAKE_BLOCK_MUSE_RM_PREFIX"+*)
         : >"$FM_FAKE_BLOCK_MUSE_RM_OBSERVED"
         i=0
         while [ ! -e "$FM_FAKE_BLOCK_MUSE_RM_RELEASE" ] && [ "$i" -lt 3000 ]; do
@@ -1018,7 +1119,7 @@ EOF
   [ "$status" -ne 0 ] || fail "muse spawn succeeded with no credential available"
   assert_contains "$out" "no worker-reachable credential" "muse spawn did not name the missing credential"
   assert_absent "$home/state/$id.meta" "refused muse spawn still published task metadata"
-  for retained in "$home/state/muse-bin-$id".*; do
+  for retained in "$home/state/muse-bin-$id"+*; do
     [ ! -e "$retained" ] && [ ! -L "$retained" ] \
       || fail "refused muse spawn retained its task-owned executable at $retained"
   done
@@ -1706,9 +1807,13 @@ test_nonmax_relaunch_retires_prior_binary
 test_max_relaunch_preserves_replacement_binary
 test_max_relaunch_transport_failure_preserves_published_binary
 test_launch_retry_clears_failed_enter_input
+test_fresh_launch_waits_without_interrupting_startup
+test_launch_readiness_preserves_shell_umask
 test_main_teardown_retains_pin_owner_when_unlink_fails
 test_relaunch_retries_failed_prior_pin_retirement
 test_abort_retry_cleans_failed_pin_unlink
+test_nonmax_retry_cleans_failed_pin_unlink
+test_dotted_task_pin_cleanup_is_isolated
 test_child_teardown_retains_pin_owner_when_unlink_fails
 test_duplicate_max_spawn_preserves_live_binary
 test_aborting_attempt_cannot_remove_retry_binary
