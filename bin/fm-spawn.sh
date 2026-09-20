@@ -2249,32 +2249,87 @@ resolve_muse_binary() {
   return 1
 }
 
-muse_max_effort_for_binary() {
-  local binary=$1 output status version major remainder minor
-  if output=$("$binary" --version 2>&1); then
+muse_install_dir_for_launcher() {
+  local path=$1 dir base target hops=0
+  dir=$(CDPATH='' cd -- "$(dirname -- "$path")" 2>/dev/null && pwd -P) || return 1
+  base=$(basename -- "$path")
+  while [ -L "$dir/$base" ] && [ "$hops" -lt 16 ]; do
+    target=$(readlink -- "$dir/$base") || return 1
+    case "$target" in
+    /*)
+      dir=$(CDPATH='' cd -- "$(dirname -- "$target")" 2>/dev/null && pwd -P) || return 1
+      base=$(basename -- "$target")
+      ;;
+    *)
+      dir=$(CDPATH='' cd -- "$dir/$(dirname -- "$target")" 2>/dev/null && pwd -P) || return 1
+      base=$(basename -- "$target")
+      ;;
+    esac
+    hops=$((hops + 1))
+  done
+  [ ! -L "$dir/$base" ] || return 1
+  printf '%s\n' "$dir"
+}
+
+resolve_muse_max_launch() {
+  local launcher=$1 output status version release line_count
+  local mapped_effort install_dir stable stable_output stable_status major remainder minor
+  if output=$(MUSE_SYNC_UPDATE=1 "$launcher" --version 2>&1); then
     status=0
   else
     status=$?
   fi
-  version=$(printf '%s\n' "$output" | sed -nE 's/^Muse Code ((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))( \([^)]*\))?$/\1/p')
-  if [ "$status" -ne 0 ] || [ -z "$version" ] || [ "$(printf '%s\n' "$version" | wc -l | tr -d ' ')" -ne 1 ]; then
+  line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+  if [ "$status" -ne 0 ] || [ "$line_count" -ne 1 ] || ! printf '%s\n' "$output" | grep -Eq '^Muse Code (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*) \((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-R[0-9]+(\.[0-9]+)?\)$'; then
     [ -n "$output" ] || output='<no output>'
-    echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$binary --version' exited $status and reported '$output'" >&2
+    echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' exited $status and reported '$output'" >&2
     return 1
   fi
+  version=${output#Muse Code }
+  version=${version%% *}
+  release=${output##*\(}
+  release=${release%\)}
+  case "$release" in
+  "$version"-R*) ;;
+  *)
+    echo "error: Muse max effort requires one stable executable version, but '$launcher --version' reported mismatched version '$output'" >&2
+    return 1
+    ;;
+  esac
   if [ "$version" = 0.1.0 ]; then
-    printf '%s\n' ultra
-    return 0
+    mapped_effort=ultra
+  else
+    major=${version%%.*}
+    remainder=${version#*.}
+    minor=${remainder%%.*}
+    if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 3 ]; }; then
+      mapped_effort=max
+    else
+      echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' reported '$output'" >&2
+      return 1
+    fi
   fi
-  major=${version%%.*}
-  remainder=${version#*.}
-  minor=${remainder%%.*}
-  if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 3 ]; }; then
-    printf '%s\n' max
-    return 0
+  install_dir=$(muse_install_dir_for_launcher "$launcher") || {
+    echo "error: Muse max effort could not resolve the install directory for launcher '$launcher'" >&2
+    return 1
+  }
+  stable="$install_dir/muse-bin-$release"
+  [ -x "$stable" ] || {
+    echo "error: Muse max effort resolved '$output' but its stable executable '$stable' is missing or not executable" >&2
+    return 1
+  }
+  if stable_output=$("$stable" --version 2>&1); then
+    stable_status=0
+  else
+    stable_status=$?
   fi
-  echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$binary --version' reported '$output'" >&2
-  return 1
+  if [ "$stable_status" -ne 0 ] || [ "$stable_output" != "$output" ]; then
+    [ -n "$stable_output" ] || stable_output='<no output>'
+    echo "error: Muse max effort resolved '$output' but stable executable '$stable' exited $stable_status and reported '$stable_output'" >&2
+    return 1
+  fi
+  MUSE_MAX_EFFORT=$mapped_effort
+  MUSE_BIN=$stable
 }
 
 resolve_rovo_binary() {
@@ -2434,7 +2489,7 @@ case "$LAUNCH" in
   MUSE_BIN=$(resolve_muse_binary) || exit 1
   MUSE_MAX_EFFORT=
   if [ "$EFFORT" = max ]; then
-    MUSE_MAX_EFFORT=$(muse_max_effort_for_binary "$MUSE_BIN") || exit 1
+    resolve_muse_max_launch "$MUSE_BIN" || exit 1
   fi
   MUSE_CONFIG_HOME=$(resolve_directory_input XDG_CONFIG_HOME "${XDG_CONFIG_HOME:-${HOME:-}/.config}") || exit 1
   MUSE_DATA_HOME=$(resolve_directory_input XDG_DATA_HOME "${XDG_DATA_HOME:-${HOME:-}/.local/share}") || exit 1

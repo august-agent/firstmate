@@ -98,7 +98,9 @@ case "${1:-}" in
         printf '%s\n' "$arg" >> "$FM_FAKE_LAUNCH_LOG"
         if [ "${FM_FAKE_EXECUTE_MUSE_LAUNCH:-}" = 1 ]; then
           case "$arg" in
-            *"$FM_FAKE_MUSE_EXECUTABLE"*) (cd "$FM_FAKE_PANE_PATH" && bash -c "$arg") ;;
+            *"$FM_FAKE_MUSE_EXECUTABLE"* | *"$FM_FAKE_MUSE_STABLE_PREFIX"*)
+              (cd "$FM_FAKE_PANE_PATH" && bash -c "$arg")
+              ;;
           esac
         fi
         break
@@ -115,12 +117,41 @@ SH
   # Apple's signed /bin/bash is killed before startup on current macOS, while
   # the symlink preserves the process name this ancestry fixture exercises.
   ln -s "$(command -v bash)" "$fakebin/muse-bin-test-version"
+  cat > "$fakebin/muse-versioned-fake" <<'SH'
+#!/usr/bin/env bash
+set -u
+self=${0##*/}
+case "$self" in
+  muse-bin-0.1.0-R708.1) version='Muse Code 0.1.0 (0.1.0-R708.1)' ;;
+  muse-bin-1.3.0-R3401.1) version='Muse Code 1.3.0 (1.3.0-R3401.1)' ;;
+  *) exit 2 ;;
+esac
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' "$version"
+  exit 0
+fi
+if [ -n "${FM_FAKE_MUSE_INVOCATION_LOG:-}" ]; then
+  printf '%s|%s\n' "$self" "$*" > "$FM_FAKE_MUSE_INVOCATION_LOG"
+fi
+[ -n "${FM_FAKE_HARNESS_RESULT:-}" ] || exit 0
+exec "$FM_FAKE_MUSE_VERSIONED" -c 'result=$($FM_FAKE_HARNESS_PROBE); printf "%s" "$result" > "$FM_FAKE_HARNESS_RESULT"'
+SH
+  chmod +x "$fakebin/muse-versioned-fake"
+  ln -s muse-versioned-fake "$fakebin/muse-bin-0.1.0-R708.1"
+  ln -s muse-versioned-fake "$fakebin/muse-bin-1.3.0-R3401.1"
   cat > "$fakebin/muse" <<'SH'
 #!/usr/bin/env bash
 set -u
 if [ "${1:-}" = --version ]; then
-  printf '%s\n' "${FM_FAKE_MUSE_VERSION_OUTPUT:-Muse Code 1.3.0 (1.3.0-R3401.1)}"
+  if [ "${FM_FAKE_MUSE_TRANSITION:-}" = 1 ] && [ "${MUSE_SYNC_UPDATE:-}" != 1 ]; then
+    printf '%s\n' 'Muse Code 0.1.0 (0.1.0-R708.1)'
+  else
+    printf '%s\n' "${FM_FAKE_MUSE_VERSION_OUTPUT:-Muse Code 1.3.0 (1.3.0-R3401.1)}"
+  fi
   exit "${FM_FAKE_MUSE_VERSION_STATUS:-0}"
+fi
+if [ "${FM_FAKE_MUSE_TRANSITION:-}" = 1 ]; then
+  exec "$(dirname "$0")/muse-bin-1.3.0-R3401.1" "$@"
 fi
 [ -n "${FM_FAKE_HARNESS_RESULT:-}" ] || exit 0
 exec "$FM_FAKE_MUSE_VERSIONED" -c 'result=$($FM_FAKE_HARNESS_PROBE); printf "%s" "$result" > "$FM_FAKE_HARNESS_RESULT"'
@@ -162,10 +193,13 @@ run_muse_spawn() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$home/launch.log" \
     FM_FAKE_MUSE_EXECUTABLE="$fakebin/muse" \
+    FM_FAKE_MUSE_STABLE_PREFIX="$fakebin/muse-bin-" \
     FM_FAKE_MUSE_VERSIONED="$fakebin/muse-bin-test-version" \
     FM_FAKE_HARNESS_PROBE="$HARNESS" \
     FM_FAKE_EXECUTE_MUSE_LAUNCH="${FM_FAKE_EXECUTE_MUSE_LAUNCH:-}" \
     FM_FAKE_HARNESS_RESULT="${FM_FAKE_HARNESS_RESULT:-}" \
+    FM_FAKE_MUSE_INVOCATION_LOG="${FM_FAKE_MUSE_INVOCATION_LOG:-}" \
+    FM_FAKE_MUSE_TRANSITION="${FM_FAKE_MUSE_TRANSITION:-}" \
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
     FM_FAKE_WORKER_META_KEY="${FM_TEST_MUSE_WORKER_KEY-present}" \
@@ -353,6 +387,27 @@ EOF
     assert_absent "$home/launch.log" "Muse $setting version still launched a worker"
   done
   pass "muse version-gates max across legacy, current, and unreadable installations"
+}
+
+test_spawn_pins_updated_binary_for_max() {
+  local rec case_dir home proj wt fakebin id invocation out status
+  rec=$(make_spawn_case effort-update-race)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  invocation="$case_dir/invocation.log"
+  out=$(FM_FAKE_MUSE_TRANSITION=1 FM_FAKE_EXECUTE_MUSE_LAUNCH=1 \
+    FM_FAKE_MUSE_INVOCATION_LOG="$invocation" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse transition spawn should succeed: $out"
+  assert_present "$invocation" "Muse transition never invoked the resolved worker binary"
+  invocation=$(cat "$invocation")
+  assert_contains "$invocation" 'muse-bin-1.3.0-R3401.1|' "Muse transition launched a binary other than the resolved 1.3 executable"
+  assert_contains "$invocation" "--reasoning-effort max" "Muse 1.3 transition launch did not preserve max"
+  assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse 1.3 transition launch retained the legacy mapping"
+  pass "muse binds max mapping and launch to the same updated executable"
 }
 
 # An unauthenticated muse pane does not exit: it sits on an OAuth device-code
@@ -1002,6 +1057,7 @@ test_spawn_clears_inherited_foreign_harness_markers
 test_spawn_launch_shape
 test_spawn_maps_effort_and_model
 test_spawn_maps_legacy_max_and_refuses_unknown_versions
+test_spawn_pins_updated_binary_for_max
 test_spawn_refuses_without_credential
 test_spawn_refuses_caller_only_environment_credential
 test_spawn_accepts_stored_credential

@@ -27,10 +27,12 @@ $ muse --help
 ```
 
 Muse 1.3 exposes distinct `max` and `ultra` values.
-For `max`, the spawn queries the resolved absolute launcher with `muse --version` because that launcher executes the selected version-suffixed binary before reporting, so the result identifies the binary that the worker would actually run without starting the TUI or searching mutable installation state.
+For `max`, the spawn queries the resolved absolute launcher with `MUSE_SYNC_UPDATE=1 muse --version`, resolves the version-suffixed executable named by that result, verifies the same result directly against that executable, and places its exact path in the worker command.
+The synchronous launcher query completes an allowed update before capability selection, while an inherited `MUSE_NO_AUTO_UPDATE=1` remains authoritative for a deliberately pinned installation.
+Launching the verified versioned executable instead of invoking the mutable shim again keeps the selected effort dialect and the worker process on one stable boundary.
 Muse 0.1.0 maps Firstmate `max` to its highest supported value, `ultra`, while Muse 1.3.0 and later receive the distinct `max` value unchanged.
 An unparseable version, an unreadable version command, or the unverified range between 0.1.0 and 1.3.0 is refused before launch.
-The spawn regression in `tests/fm-muse-harness.test.sh` exercises the Muse 1.3 shared ladder from `low` through `ultra`, proves the legacy mapping and fail-closed version boundary, and separately proves that omitting the axis leaves Muse on its default.
+The spawn regression in `tests/fm-muse-harness.test.sh` exercises the Muse 1.3 shared ladder from `low` through `ultra`, proves the legacy mapping and fail-closed version boundary, reproduces a legacy-to-1.3 shim transition, and separately proves that omitting the axis leaves Muse on its default.
 
 The binary was fetched from the published channel and its checksum matched the published manifest before any run:
 
