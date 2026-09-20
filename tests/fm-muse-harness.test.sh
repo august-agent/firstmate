@@ -1130,7 +1130,6 @@ EOF
   # owns the workspace binding.
   target=$(write_muse_13_session_log "$root" "$year" "$month" "$day" target "$dir/ws" 70000 <<EOF
 $(muse_log_run_started target-run)
-$(muse_log_run_terminal target-run completed)
 EOF
 )
   write_muse_13_session_log "$root" "$year" "$month" "$day" unrelated-b "$dir/other-b" >/dev/null <<EOF
@@ -1140,13 +1139,13 @@ EOF
   printf 'sessions_root=%s\nworkspace_root=%s\nbinding_id=muse-13-incarnation\n' \
     "$root" "$dir/ws" > "$state/$id.muse-session"
   verdict=$(classify_muse "$state" "$id")
-  [ "$verdict" = "idle muse-session-log" ] \
-    || fail "Muse 1.3's leading permission frame hid the settled worker log: got '$verdict'"
+  [ "$verdict" = "busy muse-session-log" ] \
+    || fail "Muse 1.3's leading permission frame hid the working worker log: got '$verdict'"
   pin="$state/$id.muse-session-current"
   assert_present "$pin" "Muse 1.3 worker did not persist its resolved session pin"
   assert_grep "session_log=$target" "$pin" \
     "Muse 1.3 worker pinned a session from another same-day workspace"
-  pass "Muse 1.3 workspace metadata resolves after its leading permission frame"
+  pass "Muse 1.3 working sessions resolve after their leading permission frame"
 }
 
 test_workspace_binding_treats_glob_characters_literally() {
