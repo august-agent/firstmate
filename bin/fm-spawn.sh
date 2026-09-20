@@ -526,6 +526,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
+# shellcheck source=bin/fm-muse-lib.sh
+. "$SCRIPT_DIR/fm-muse-lib.sh"
 # shellcheck source=bin/fm-cursor-lib.sh
 . "$SCRIPT_DIR/fm-cursor-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
@@ -1092,7 +1094,9 @@ RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
 SPAWN_MUSE_BIN=
+SPAWN_MUSE_BIN_NAME=
 SPAWN_MUSE_BIN_COMMITTED=0
+RELAUNCH_PRIOR_MUSE_BIN=
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1630,6 +1634,18 @@ if [ "$RELAUNCH" -eq 1 ]; then
       ;;
   esac
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
+  RELAUNCH_PRIOR_MUSE_BIN_NAME=$(fm_meta_get "$RELAUNCH_META" muse_bin)
+  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN_NAME" ]; then
+    RELAUNCH_PRIOR_MUSE_BIN=$(fm_muse_task_binary_path \
+      "$STATE" "$ID" "$RELAUNCH_PRIOR_MUSE_BIN_NAME") || {
+      echo "error: task $ID has an invalid pinned Muse executable identity in its record" >&2
+      exit 1
+    }
+  elif [ -e "$STATE/muse-bin-$ID" ] || [ -L "$STATE/muse-bin-$ID" ]; then
+    RELAUNCH_PRIOR_MUSE_BIN="$STATE/muse-bin-$ID"
+  elif [ -e "$STATE/$ID.muse-bin" ] || [ -L "$STATE/$ID.muse-bin" ]; then
+    RELAUNCH_PRIOR_MUSE_BIN="$STATE/$ID.muse-bin"
+  fi
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
   # A secondmate whose endpoint is gone already has ONE owner for that
@@ -2298,7 +2314,7 @@ muse_preserve_executable() {
 resolve_muse_max_launch() {
   local launcher=$1 output status version release line_count
   local mapped_effort install_dir stable stable_output stable_status major remainder minor
-  local lock attempts wait_attempts resolve_attempts task_binary task_stage task_output task_status
+  local lock attempts wait_attempts resolve_attempts task_binary task_name task_stage task_output task_status
   install_dir=$(muse_install_dir_for_launcher "$launcher") || {
     echo "error: Muse max effort could not resolve the install directory for launcher '$launcher'" >&2
     return 1
@@ -2385,9 +2401,12 @@ resolve_muse_max_launch() {
       echo "error: Muse max effort resolved '$output' but stable executable '$stable' exited $stable_status and reported '$stable_output'" >&2
       return 1
     fi
-    task_binary="$STATE/muse-bin-$ID"
-    task_stage="$STATE/.muse-bin-$ID.${BASHPID:-$$}.$RANDOM"
-    rm -f "$task_stage"
+    task_stage=$(mktemp "$STATE/.muse-bin-$ID.XXXXXXXXXXXX") || {
+      echo "error: Muse max effort could not allocate a task-owned executable in '$STATE'" >&2
+      return 1
+    }
+    task_name=${task_stage##*/}
+    task_binary="$STATE/${task_name#.}"
     if ! muse_preserve_executable "$stable" "$task_stage"; then
       rm -f "$task_stage"
       if { [ ! -e "$stable" ] && [ ! -L "$stable" ]; } || [ -e "$lock" ] || [ -L "$lock" ]; then
@@ -2401,12 +2420,15 @@ resolve_muse_max_launch() {
       return 1
     fi
     if [ ! -f "$task_stage" ] || [ -L "$task_stage" ] || [ ! -x "$task_stage" ] ||
-      ! mv -f "$task_stage" "$task_binary"; then
+      [ -e "$task_binary" ] || [ -L "$task_binary" ] ||
+      ! ln "$task_stage" "$task_binary"; then
       rm -f "$task_stage"
       echo "error: Muse max effort could not preserve verified executable '$stable' as task-owned '$task_binary'" >&2
       return 1
     fi
+    rm -f "$task_stage"
     SPAWN_MUSE_BIN=$task_binary
+    SPAWN_MUSE_BIN_NAME=${task_binary##*/}
     if task_output=$("$task_binary" --version 2>&1); then
       task_status=0
     else
@@ -4605,7 +4627,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen muse_bin traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -4625,6 +4647,7 @@ preserve_relaunch_meta() {
   echo "effort=${EFFORT:-default}"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
+  [ -z "$SPAWN_MUSE_BIN_NAME" ] || echo "muse_bin=$SPAWN_MUSE_BIN_NAME"
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
@@ -5107,10 +5130,21 @@ if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
 fi
 if [ -n "$SPAWN_MUSE_BIN" ]; then
   SPAWN_MUSE_BIN_COMMITTED=1
+  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN" ] && [ "$RELAUNCH_PRIOR_MUSE_BIN" != "$SPAWN_MUSE_BIN" ]; then
+    if ! rm -f -- "$RELAUNCH_PRIOR_MUSE_BIN"; then
+      echo "warning: could not retire prior pinned Muse executable for task $ID" >&2
+    fi
+  fi
+  if [ "$STATE/muse-bin-$ID" != "$SPAWN_MUSE_BIN" ]; then
+    rm -f -- "$STATE/muse-bin-$ID" || true
+  fi
   if ! rm -f "$STATE/$ID.muse-bin"; then
     echo "warning: could not retire legacy pinned Muse executable for task $ID" >&2
   fi
 elif [ "$RELAUNCH" -eq 1 ]; then
+  if [ -n "$RELAUNCH_PRIOR_MUSE_BIN" ]; then
+    rm -f -- "$RELAUNCH_PRIOR_MUSE_BIN" || true
+  fi
   if ! rm -f "$STATE/muse-bin-$ID" "$STATE/$ID.muse-bin"; then
     echo "warning: could not retire pinned Muse executable for relaunched task $ID" >&2
   fi

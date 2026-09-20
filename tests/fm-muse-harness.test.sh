@@ -74,7 +74,7 @@ make_spawn_fakebin() {
 set -u
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
-  *"#{pane_current_command}"*) printf 'zsh\n'; exit 0 ;;
+  *"#{pane_current_command}"*) printf '%s\n' "${FM_FAKE_PANE_COMMAND:-zsh}"; exit 0 ;;
 esac
 case "${1:-}" in
   show-environment)
@@ -273,6 +273,11 @@ run_muse_command() {  # <home> <proj> <wt> <fakebin> <id> <spawn args...>
     FM_FAKE_MUSE_VERSION_OUTPUT="${FM_FAKE_MUSE_VERSION_OUTPUT:-}" \
     FM_FAKE_MUSE_VERSION_STATUS="${FM_FAKE_MUSE_VERSION_STATUS:-}" \
     FM_FAKE_RELAUNCH_WINDOW="${FM_FAKE_RELAUNCH_WINDOW:-}" \
+    FM_FAKE_PANE_COMMAND="${FM_FAKE_PANE_COMMAND:-}" \
+    FM_FAKE_BLOCK_MUSE_RM_PREFIX="${FM_FAKE_BLOCK_MUSE_RM_PREFIX:-}" \
+    FM_FAKE_BLOCK_MUSE_RM_OBSERVED="${FM_FAKE_BLOCK_MUSE_RM_OBSERVED:-}" \
+    FM_FAKE_BLOCK_MUSE_RM_RELEASE="${FM_FAKE_BLOCK_MUSE_RM_RELEASE:-}" \
+    FM_FAKE_REAL_RM="${FM_FAKE_REAL_RM:-}" \
     FM_FAKE_WORKER_META_KEY="${FM_TEST_MUSE_WORKER_KEY-present}" \
     META_API_KEY="${FM_TEST_MUSE_KEY-test-key}" \
     XDG_CONFIG_HOME="${FM_TEST_MUSE_CONFIG_HOME-$home/xdgconfig}" \
@@ -294,6 +299,24 @@ run_muse_relaunch() {  # <home> <proj> <wt> <fakebin> <id> [extra args...]
   FM_FAKE_RELAUNCH_WINDOW="fm-$id" \
     run_muse_command "$home" "$proj" "$wt" "$fakebin" "$id" \
       "$id" --relaunch "$@"
+}
+
+muse_committed_binary() {
+  local home=$1 id=$2 name
+  name=$(awk -F= '$1 == "muse_bin" { print substr($0, index($0, "=") + 1); exit }' \
+    "$home/state/$id.meta")
+  [ -n "$name" ] || return 1
+  printf '%s/state/%s\n' "$home" "$name"
+}
+
+assert_only_muse_binary() {
+  local home=$1 id=$2 expected=$3 path count=0
+  for path in "$home/state/muse-bin-$id".*; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    count=$((count + 1))
+    [ "$path" = "$expected" ] || fail "unexpected Muse task executable remained at $path"
+  done
+  [ "$count" -eq 1 ] || fail "expected exactly one Muse task executable for $id, found $count"
 }
 
 # --- detection --------------------------------------------------------------
@@ -491,7 +514,7 @@ EOF
   assert_present "$invocation" "Muse transition never invoked the resolved worker binary"
   invocation=$(cat "$invocation")
   assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse transition launched a binary other than the resolved 1.3 executable"
-  assert_contains "$invocation" "muse-bin-$id|" "Muse transition bypassed its task-owned executable"
+  assert_contains "$invocation" "muse-bin-$id." "Muse transition bypassed its task-owned executable"
   assert_contains "$invocation" "--reasoning-effort max" "Muse 1.3 transition launch did not preserve max"
   assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse 1.3 transition launch retained the legacy mapping"
   pass "muse binds max mapping and launch to the same updated executable"
@@ -528,7 +551,7 @@ EOF
   assert_present "$invocation" "Muse in-flight update never invoked the preserved worker binary"
   invocation=$(cat "$invocation")
   assert_contains "$invocation" 'Muse Code 1.3.0 (1.3.0-R3401.1)|' "Muse in-flight update invoked the wrong preserved version"
-  assert_contains "$invocation" "muse-bin-$id|" "Muse in-flight update bypassed its task-owned executable"
+  assert_contains "$invocation" "muse-bin-$id." "Muse in-flight update bypassed its task-owned executable"
   assert_contains "$invocation" "--reasoning-effort max" "Muse in-flight update did not preserve max"
   assert_not_contains "$invocation" "--reasoning-effort ultra" "Muse in-flight update retained the legacy mapping"
   pass "muse waits through an in-flight update before preserving its worker binary"
@@ -541,7 +564,6 @@ test_spawn_pinned_binary_preserves_muse_ancestry() {
 $rec
 EOF
   source="$fakebin/muse-bin-1.3.0-R3401.1"
-  task="$home/state/muse-bin-$id"
   result="$case_dir/harness-result"
   build_native_muse_fixture "$source"
   out=$(FM_FAKE_EXECUTE_MUSE_LAUNCH=1 FM_FAKE_HARNESS_RESULT="$result" \
@@ -549,6 +571,7 @@ EOF
       --mode no-mistakes --yolo off --effort max)
   status=$?
   expect_code 0 "$status" "Muse pinned-ancestry spawn should succeed: $out"
+  task=$(muse_committed_binary "$home" "$id") || fail "Muse spawn did not record its task-owned executable"
   assert_present "$task" "Muse spawn did not publish its task-owned executable"
   [ "$source" -ef "$task" ] || fail "Muse spawn did not prefer a same-filesystem hard link"
   assert_present "$result" "Muse pinned executable did not run the harness probe"
@@ -562,10 +585,10 @@ test_failed_max_relaunch_removes_replacement_binary() {
   IFS='|' read -r case_dir home proj wt fakebin id <<EOF
 $rec
 EOF
-  pinned="$home/state/muse-bin-$id"
   run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
     --mode no-mistakes --yolo off --effort max >/dev/null \
     || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
   assert_present "$pinned" "initial Muse max spawn did not publish its pinned executable"
 
   out=$(FM_TEST_MUSE_KEY='' FM_TEST_MUSE_WORKER_KEY='' \
@@ -575,8 +598,9 @@ EOF
   assert_contains "$out" "no worker-reachable credential" \
     "failed Muse max relaunch did not reach the post-pin credential refusal"
   assert_present "$home/state/$id.meta" "failed Muse max relaunch removed the prior task record"
-  assert_absent "$pinned" "failed Muse max relaunch retained its replacement executable"
-  pass "failed Muse max relaunch removes its uncommitted pinned executable"
+  assert_present "$pinned" "failed Muse max relaunch removed the prior committed executable"
+  assert_only_muse_binary "$home" "$id" "$pinned"
+  pass "failed Muse max relaunch removes only its uncommitted executable"
 }
 
 test_nonmax_relaunch_retires_prior_binary() {
@@ -585,10 +609,10 @@ test_nonmax_relaunch_retires_prior_binary() {
   IFS='|' read -r case_dir home proj wt fakebin id <<EOF
 $rec
 EOF
-  pinned="$home/state/muse-bin-$id"
   run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
     --mode no-mistakes --yolo off --effort max >/dev/null \
     || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
   assert_present "$pinned" "initial Muse max spawn did not publish its pinned executable"
 
   out=$(run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort high)
@@ -599,34 +623,123 @@ EOF
 }
 
 test_max_relaunch_preserves_replacement_binary() {
-  local rec case_dir home proj wt fakebin id pinned current legacy out status
+  local rec case_dir home proj wt fakebin id pinned replacement current legacy out status
   rec=$(make_spawn_case relaunch-max-replacement)
   IFS='|' read -r case_dir home proj wt fakebin id <<EOF
 $rec
 EOF
-  pinned="$home/state/muse-bin-$id"
   current="$fakebin/muse-bin-1.3.0-R3401.1"
   legacy="$fakebin/muse-bin-0.1.0-R708.1"
   run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
     --mode no-mistakes --yolo off --effort max >/dev/null \
     || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
   [ "$pinned" -ef "$current" ] || fail "initial Muse max spawn pinned the wrong executable"
 
   out=$(FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
     run_muse_relaunch "$home" "$proj" "$wt" "$fakebin" "$id" --effort max)
   status=$?
   expect_code 0 "$status" "Muse max-to-max relaunch should succeed: $out"
-  assert_present "$pinned" "successful Muse max-to-max relaunch removed its replacement executable"
-  [ "$pinned" -ef "$legacy" ] || fail "Muse max-to-max relaunch did not retain the newly verified replacement executable"
-  [ ! "$pinned" -ef "$current" ] || fail "Muse max-to-max relaunch retained the superseded executable"
+  replacement=$(muse_committed_binary "$home" "$id") || fail "Muse max-to-max relaunch did not record its replacement executable"
+  [ "$replacement" != "$pinned" ] || fail "Muse max-to-max relaunch reused its prior executable identity"
+  assert_absent "$pinned" "successful Muse max-to-max relaunch retained its prior executable"
+  assert_present "$replacement" "successful Muse max-to-max relaunch removed its replacement executable"
+  [ "$replacement" -ef "$legacy" ] || fail "Muse max-to-max relaunch did not retain the newly verified replacement executable"
+  [ ! "$replacement" -ef "$current" ] || fail "Muse max-to-max relaunch retained the superseded executable"
   pass "successful Muse max-to-max relaunch preserves its replacement executable"
+}
+
+test_duplicate_max_spawn_preserves_live_binary() {
+  local rec case_dir home proj wt fakebin id pinned current out status
+  rec=$(make_spawn_case duplicate-max)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  current="$fakebin/muse-bin-1.3.0-R3401.1"
+  run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max >/dev/null \
+    || fail "initial Muse max spawn failed"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "initial Muse max spawn did not record its pinned executable"
+
+  out=$(FM_FAKE_MUSE_VERSION_OUTPUT='Muse Code 0.1.0 (0.1.0-R708.1)' \
+    FM_FAKE_RELAUNCH_WINDOW="fm-$id" FM_FAKE_PANE_COMMAND=muse \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max)
+  status=$?
+  [ "$status" -ne 0 ] || fail "duplicate Muse max spawn unexpectedly succeeded"
+  assert_present "$pinned" "duplicate Muse max spawn removed the live task's executable"
+  [ "$pinned" -ef "$current" ] || fail "duplicate Muse max spawn replaced the live task's executable"
+  [ "$(muse_committed_binary "$home" "$id")" = "$pinned" ] \
+    || fail "duplicate Muse max spawn changed the live task's committed executable identity"
+  assert_only_muse_binary "$home" "$id" "$pinned"
+  pass "duplicate Muse max spawn preserves the live task executable"
+}
+
+test_aborting_attempt_cannot_remove_retry_binary() {
+  local rec case_dir home proj wt fakebin id observed release old_pid out status pinned i
+  rec=$(make_spawn_case abort-retry-race)
+  IFS='|' read -r case_dir home proj wt fakebin id <<EOF
+$rec
+EOF
+  observed="$case_dir/old-cleanup-observed"
+  release="$case_dir/release-old-cleanup"
+  cat >"$fakebin/rm" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ -n "$FM_FAKE_BLOCK_MUSE_RM_PREFIX" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      "$FM_FAKE_BLOCK_MUSE_RM_PREFIX".*)
+        : >"$FM_FAKE_BLOCK_MUSE_RM_OBSERVED"
+        i=0
+        while [ ! -e "$FM_FAKE_BLOCK_MUSE_RM_RELEASE" ] && [ "$i" -lt 3000 ]; do
+          sleep 0.01
+          i=$((i + 1))
+        done
+        ;;
+    esac
+  done
+fi
+exec "${FM_FAKE_REAL_RM:-/bin/rm}" "$@"
+SH
+  chmod +x "$fakebin/rm"
+
+  FM_TEST_MUSE_KEY='' FM_TEST_MUSE_WORKER_KEY='' \
+    FM_FAKE_BLOCK_MUSE_RM_PREFIX="$home/state/muse-bin-$id" \
+    FM_FAKE_BLOCK_MUSE_RM_OBSERVED="$observed" \
+    FM_FAKE_BLOCK_MUSE_RM_RELEASE="$release" \
+    FM_FAKE_REAL_RM="$(command -v rm)" \
+    run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+      --mode no-mistakes --yolo off --effort max >"$case_dir/old.out" 2>&1 &
+  old_pid=$!
+  i=0
+  while [ ! -e "$observed" ] && [ "$i" -lt 1000 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  assert_present "$observed" "older failed Muse spawn never reached pinned-executable cleanup"
+
+  out=$(run_muse_spawn "$home" "$proj" "$wt" "$fakebin" "$id" \
+    --mode no-mistakes --yolo off --effort max)
+  status=$?
+  expect_code 0 "$status" "Muse retry should succeed while older cleanup is delayed: $out"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "Muse retry did not record its pinned executable"
+  assert_present "$pinned" "Muse retry did not publish its pinned executable"
+
+  : >"$release"
+  if wait "$old_pid"; then
+    fail "older credentialless Muse spawn unexpectedly succeeded"
+  fi
+  assert_present "$pinned" "older abort cleanup removed the retry's committed executable"
+  assert_only_muse_binary "$home" "$id" "$pinned"
+  pass "older Muse abort cleanup cannot remove a retry executable"
 }
 
 # An unauthenticated muse pane does not exit: it sits on an OAuth device-code
 # prompt forever, which supervision would read as a wedged worker rather than a
 # missing credential. The spawn must refuse before an endpoint exists.
 test_spawn_refuses_without_credential() {
-  local rec case_dir home proj wt fakebin id out status
+  local rec case_dir home proj wt fakebin id out status retained
   rec=$(make_spawn_case no-cred)
   IFS='|' read -r case_dir home proj wt fakebin id <<EOF
 $rec
@@ -638,7 +751,10 @@ EOF
   [ "$status" -ne 0 ] || fail "muse spawn succeeded with no credential available"
   assert_contains "$out" "no worker-reachable credential" "muse spawn did not name the missing credential"
   assert_absent "$home/state/$id.meta" "refused muse spawn still published task metadata"
-  assert_absent "$home/state/muse-bin-$id" "refused muse spawn retained its task-owned executable"
+  for retained in "$home/state/muse-bin-$id".*; do
+    [ ! -e "$retained" ] && [ ! -L "$retained" ] \
+      || fail "refused muse spawn retained its task-owned executable at $retained"
+  done
   pass "muse spawn refuses when no credential can reach the provider"
 }
 
@@ -726,7 +842,7 @@ test_spawn_refuses_secondmate() {
 }
 
 test_spawn_writes_busy_binding_and_teardown_removes_it() {
-  local rec case_dir home proj wt fakebin id binding prior
+  local rec case_dir home proj wt fakebin id binding prior pinned
   rec=$(make_spawn_case binding)
   IFS='|' read -r case_dir home proj wt fakebin id <<EOF
 $rec
@@ -747,7 +863,8 @@ EOF
   # No busy record is armed for muse: the source is pull-only with no writer, so
   # a seeded busy record could never be settled.
   assert_absent "$home/state/$id.busy-gen" "muse spawn armed a busy record it can never clear"
-  assert_present "$home/state/muse-bin-$id" "Muse max spawn did not preserve its task-owned executable"
+  pinned=$(muse_committed_binary "$home" "$id") || fail "Muse max spawn did not record its task-owned executable"
+  assert_present "$pinned" "Muse max spawn did not preserve its task-owned executable"
   : > "$home/state/$id.muse-bin"
   printf 'binding_id=retired\nsession_log=%s\n' "$prior" > "$home/state/$id.muse-session-current"
 
@@ -756,7 +873,7 @@ EOF
     || fail "muse teardown failed"
   assert_absent "$binding" "muse session binding survived teardown"
   assert_absent "$home/state/$id.muse-session-current" "muse session cache survived teardown"
-  assert_absent "$home/state/muse-bin-$id" "Muse task-owned executable survived teardown"
+  assert_absent "$pinned" "Muse task-owned executable survived teardown"
   assert_absent "$home/state/$id.muse-bin" "legacy Muse task-owned executable survived teardown"
   pass "muse spawn writes a session binding that teardown removes"
 }
@@ -1280,6 +1397,8 @@ test_spawn_pinned_binary_preserves_muse_ancestry
 test_failed_max_relaunch_removes_replacement_binary
 test_nonmax_relaunch_retires_prior_binary
 test_max_relaunch_preserves_replacement_binary
+test_duplicate_max_spawn_preserves_live_binary
+test_aborting_attempt_cannot_remove_retry_binary
 test_spawn_refuses_without_credential
 test_spawn_refuses_caller_only_environment_credential
 test_spawn_accepts_stored_credential
