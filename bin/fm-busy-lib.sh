@@ -278,11 +278,13 @@ fm_busy_record_read() {  # <state-dir> <id>
 #
 # muse persists an append-only session event log per session at
 # <sessions-root>/YYYY/MM/DD/<session-uuid>/session.jsonl, and brackets every
-# submitted turn with one run lifecycle pair. Verified live on muse
-# 0.1.0-R708.1 across completed, interrupted, and killed-mid-turn turns:
-#   {"payload":{"kind":"run","run_id":"<uuid>","event":{"kind":"started",...
-#   {"payload":{"kind":"run","run_id":"<uuid>","event":{"kind":"terminal",
-#     "terminal":"completed"|"cancelled",...
+# submitted turn with one run lifecycle pair: a payload with top-level
+# kind "run" and event kind "started" opens the turn, and the same run_id with
+# event kind "terminal" (terminal "completed" or "cancelled") closes it.
+# Verified live on muse 0.1.0-R708.1 across completed, interrupted, and
+# killed-mid-turn turns, and again on muse 1.3.0, which reordered the payload
+# keys (event first) and opens the log with a retained_frame envelope ahead of
+# the metadata record without changing the lifecycle pair itself.
 # An Escape interrupt closes its run with terminal=cancelled, so unlike Claude's
 # Stop hook this source covers the interrupt path itself. Any later
 # run_retracted records follow the terminal rather than replacing it.
@@ -295,7 +297,7 @@ fm_busy_record_read() {  # <state-dir> <id>
 # Pi push sources. A version allowlist would be false precision and a maintenance
 # treadmill for an auto-updating vendor binary: busy classification receives
 # only the normalized muse harness identity, while session metadata records
-# semver 0.1.0 plus a build SHA that cannot be matched against it. Resolution
+# a semver plus a build SHA that cannot be matched against it. Resolution
 # failures - no sidecar, no matching log, an unreadable or run-free log - remain
 # unknown because those prove nothing about the turn either way. See
 # docs/verification/muse.md for the evidence.
