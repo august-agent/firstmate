@@ -1000,7 +1000,7 @@ fm_busy_rovo_tail_busy() {
 # fm_busy_agy_tail_busy: the AGY-only temporary rendered-tail fallback.
 # Consumes the tail on stdin; 0 when AGY's verified busy signature matches:
 # the `esc to cancel` token in the status row the TUI pins to the bottom of
-# the pane while a turn runs (verified live on agy 1.2.0; the idle status row
+# the pane while a turn runs (verified live on agy 1.2.7; the idle status row
 # shows `? for shortcuts` instead). The `Generating...` spinner word that
 # renders beside it is deliberately NOT matched: it is a free-floating output
 # line, so ordinary worker output echoing the word would classify an idle
@@ -1012,6 +1012,33 @@ fm_busy_agy_tail_busy() {
     | grep -qiE 'esc[[:space:]]+to[[:space:]]+cancel'
 }
 
+# fm_busy_agy_status_row: prints AGY's pinned idle status row from the tail on
+# stdin - the `? for shortcuts` shortcuts hint the TUI pins to the bottom of
+# the pane while it waits for input (verified live on agy 1.2.7). Empty output
+# when no such row is present. It reads the LAST matching non-blank line so a
+# `? for shortcuts` string echoed earlier in worker output cannot shadow the
+# real pinned row: the pinned row is always the bottom-most line that carries
+# the hint. This is POSITIVE evidence - unlike the free-floating busy spinner
+# word, the shortcuts hint lives on the row the TUI keeps at the bottom, so it
+# cannot scroll out of the capture the way output can, which is the only reason
+# an idle verdict is safe here at all.
+fm_busy_agy_status_row() {
+  grep -v '^[[:space:]]*$' | grep -iE '\?[[:space:]]+for[[:space:]]+shortcuts' | tail -1
+}
+
+# fm_busy_agy_bg_task: 0 when the AGY status row read on stdin advertises a
+# NON-ZERO background task count - the `N task(s)` field agy appends to the
+# pinned status row while a shell job the worker launched is still running
+# (verified live on agy 1.2.7: `... Gemini 3.8 Flash · high · 1 task(s) ·
+# /tasks`). Such a worker is legitimately waiting on its own job, so this is
+# read as busy, not a wedge. The count must be a non-zero integer, so `0
+# task(s)` and no field at all are not busy. It is applied ONLY to the status
+# row returned by fm_busy_agy_status_row, never the whole tail, so worker
+# output that happens to print "task(s)" cannot read as busy.
+fm_busy_agy_bg_task() {
+  grep -qiE '[1-9][0-9]*[[:space:]]+task\(s\)'
+}
+
 # fm_busy_classify: semantic classification for a task whose endpoint the
 # caller has already established as present. Prints "<verdict> <source>":
 # busy|idle|unknown plus the producing source (see header). Never probes
@@ -1020,7 +1047,7 @@ fm_busy_agy_tail_busy() {
 # fm_backend_capture if available, else reports unknown capture-failed.
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
-  local out rc r_state r_source native log
+  local out rc r_state r_source native log agy_row
   case "$harness" in
     kimi*)
       if ! fm_busy_kimi_verified; then
@@ -1152,10 +1179,25 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
           return 0
         fi
       fi
-      # Best-effort like rovo: a long turn can scroll the busy marker out of
-      # the captured tail, so its absence means "can't tell," never idle.
+      # Positive-evidence classification on the status row agy pins to the
+      # bottom of the pane. Absence of the busy marker never means idle on its
+      # own; the idle verdict rests on the pinned `? for shortcuts` row instead:
+      #  - `esc to cancel` present -> a turn is running (busy).
+      #  - the pinned `? for shortcuts` row carries a non-zero `N task(s)`
+      #    count -> a background shell job the worker launched is still running
+      #    and the worker is legitimately waiting on it (busy); this is the
+      #    case supervision must not escalate as a wedge.
+      #  - the pinned `? for shortcuts` row with no task count -> idle.
+      #  - neither token -> the pane is unreadable; fail closed to unknown.
       if printf '%s' "$tail40" | fm_busy_agy_tail_busy; then
         printf 'busy agy-regex'
+      elif agy_row=$(printf '%s' "$tail40" | fm_busy_agy_status_row) \
+        && [ -n "$agy_row" ]; then
+        if printf '%s' "$agy_row" | fm_busy_agy_bg_task; then
+          printf 'busy agy-regex'
+        else
+          printf 'idle agy-regex'
+        fi
       else
         printf 'unknown agy-regex'
       fi
