@@ -442,9 +442,8 @@ fm_backlog_record_present "$META" "task record" "$STATE" || {
   exit 1
 }
 MUSE_BIN_NAME=$(fm_meta_get "$META" muse_bin)
-MUSE_BIN_PATH=
 if [ -n "$MUSE_BIN_NAME" ]; then
-  MUSE_BIN_PATH=$(fm_muse_task_binary_path "$STATE" "$ID" "$MUSE_BIN_NAME") || {
+  fm_muse_task_binary_path "$STATE" "$ID" "$MUSE_BIN_NAME" >/dev/null || {
     echo "error: task $ID has an invalid pinned Muse executable identity in its record" >&2
     exit 1
   }
@@ -3056,7 +3055,7 @@ endpoint_close_refusal() {  # <subject> <backend> <target> <honors-force>
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_owner_rc child_muse_bin_name child_muse_bin_path
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_owner_rc child_muse_bin_name
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -3067,10 +3066,9 @@ cleanup_firstmate_home_children() {
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     child_muse_bin_name=$(meta_value "$child_meta" muse_bin)
-    child_muse_bin_path=
     if [ -n "$child_muse_bin_name" ]; then
-      child_muse_bin_path=$(fm_muse_task_binary_path \
-        "$sub_state" "$child_id" "$child_muse_bin_name") || {
+      fm_muse_task_binary_path \
+        "$sub_state" "$child_id" "$child_muse_bin_name" >/dev/null || {
         echo "error: child task $child_id has an invalid pinned Muse executable identity in its record" >&2
         return 1
       }
