@@ -560,35 +560,149 @@ EOF
   printf '%s' "$selected"
 }
 
+# fm_busy_muse_run_events: print "run_id<TAB>started|terminal<TAB>terminal?"
+# for every run lifecycle record in the log. The match reads the payload's
+# TOP-LEVEL kind, run_id, and event object, plus the event's top-level kind
+# and terminal value, with a string-aware walk that never looks inside nested
+# values. Key order therefore does not matter: 0.1.0 wrote
+# {"kind":"run","run_id":..,"event":..} while 1.3.0 writes
+# {"event":..,"kind":"run","run_id":..}, and both parse identically here, as
+# does a log holding both shapes after a mid-day vendor update. The top-level
+# kind gate is also what rejects the nested "record":{"kind":"terminal"}
+# decoys (cleanup effects on 0.1.0, tool batch effects on 1.3.0) and the
+# run_model records whose nested run_stream carries kind "run": none of them
+# is a top-level run. Prompt text cannot inject a lifecycle event either,
+# because it sits inside the event's prompt string, which the walk skips as
+# one opaque value. A line that fails to parse contributes nothing, so a
+# corrupt log folds to none (unknown), never to idle.
 fm_busy_muse_run_events() {  # <session-log>
   [ -f "$1" ] || return 1
   LC_ALL=C awk '
-    BEGIN { OFS = "\t"; pre = "\"payload\":{\"kind\":\"run\",\"run_id\":\"" }
-    {
-      p = index($0, pre)
-      if (p == 0) next
-      rest = substr($0, p + length(pre))
-      q = index(rest, "\"")
-      if (q == 0) next
-      rid = substr(rest, 1, q - 1)
-      rest = substr(rest, q)
-      head = "\",\"event\":{\"kind\":\""
-      if (substr(rest, 1, length(head)) != head) next
-      rest = substr(rest, length(head) + 1)
-      q = index(rest, "\"")
-      if (q == 0) next
-      ev = substr(rest, 1, q - 1)
-      terminal = ""
-      if (ev == "terminal") {
-        marker = "\"terminal\":\""
-        p = index(rest, marker)
-        if (p != 0) {
-          value = substr(rest, p + length(marker))
-          q = index(value, "\"")
-          if (q != 0) terminal = substr(value, 1, q - 1)
-        }
+    BEGIN { OFS = "\t" }
+    function is_ws(c) { return (c == " " || c == "\t" || c == "\r") }
+    function skip_ws(    c) {
+      while (p <= n) {
+        c = substr(line, p, 1)
+        if (!is_ws(c)) break
+        p++
       }
-      if (ev == "started" || ev == "terminal") print rid, ev, terminal
+    }
+    # parse_string consumes the JSON string at line[p] into sval (raw inner
+    # text, escapes intact) and advances past its closing quote. It records
+    # the span and slices once, so long prompt strings cost linear time.
+    function parse_string(    c, start) {
+      if (substr(line, p, 1) != "\"") return 0
+      p++
+      start = p
+      while (p <= n) {
+        c = substr(line, p, 1)
+        if (c == "\\") { p += 2; continue }
+        if (c == "\"") { sval = substr(line, start, p - start); p++; return 1 }
+        p++
+      }
+      return 0
+    }
+    # skip_value consumes one JSON value at line[p], past any whitespace.
+    function skip_value(    c, depth, instr, esc) {
+      skip_ws()
+      if (p > n) return 0
+      c = substr(line, p, 1)
+      if (c == "\"") return parse_string()
+      if (c == "{" || c == "[") {
+        depth = 0; instr = 0; esc = 0
+        while (p <= n) {
+          c = substr(line, p, 1)
+          if (instr) {
+            if (esc) esc = 0
+            else if (c == "\\") esc = 1
+            else if (c == "\"") instr = 0
+          } else if (c == "\"") instr = 1
+          else if (c == "{" || c == "[") depth++
+          else if (c == "}" || c == "]") {
+            depth--
+            if (depth == 0) { p++; return 1 }
+          }
+          p++
+        }
+        return 0
+      }
+      while (p <= n) {
+        c = substr(line, p, 1)
+        if (c == "," || c == "}" || c == "]" || is_ws(c)) break
+        p++
+      }
+      return 1
+    }
+    # scan_members walks the members of the object at obj_open in one pass,
+    # collecting top-level fields into the shared f_ slots (each with a
+    # found flag) and the nested object named by want_obj into found_open.
+    # A non-object or missing value leaves its slot unset rather than
+    # failing the line: a record whose kind is not a string is simply not a
+    # run lifecycle record. Later duplicate keys overwrite earlier ones.
+    function scan_members(obj_open, want_obj,    key, c) {
+      p = obj_open + 1
+      skip_ws()
+      if (substr(line, p, 1) == "}") return 1
+      while (p <= n) {
+        skip_ws()
+        if (!parse_string()) return 0
+        key = sval
+        skip_ws()
+        if (substr(line, p, 1) != ":") return 0
+        p++
+        skip_ws()
+        if (key == want_obj && substr(line, p, 1) == "{") {
+          found_open = p
+          if (!skip_value()) return 0
+        } else if (key == "kind" || key == "run_id" || key == "terminal") {
+          if (substr(line, p, 1) == "\"" && parse_string()) {
+            if (key == "kind") { f_kind = sval; f_kind_found = 1 }
+            else if (key == "run_id") { f_runid = sval; f_runid_found = 1 }
+            else { f_terminal = sval; f_terminal_found = 1 }
+          } else if (!skip_value()) return 0
+        } else if (!skip_value()) return 0
+        skip_ws()
+        c = substr(line, p, 1)
+        if (c == "}") return 1
+        if (c != ",") return 0
+        p++
+      }
+      return 0
+    }
+    function reset_slots() {
+      f_kind = ""; f_kind_found = 0
+      f_runid = ""; f_runid_found = 0
+      f_terminal = ""; f_terminal_found = 0
+      found_open = 0
+    }
+    {
+      # Fast path only: a lifecycle record always carries the "run_id" key,
+      # the exact "run" kind value, and a "started" or "terminal" event
+      # value, so a line missing any of the three can never match and skips
+      # the character walk. All three are plain index scans at C speed.
+      if (index($0, "\"run_id\"") == 0) next
+      if (index($0, "\"run\"") == 0) next
+      if (index($0, "\"started\"") == 0 && index($0, "\"terminal\"") == 0) next
+      line = $0; n = length(line); p = 1
+      skip_ws()
+      if (substr(line, p, 1) != "{") next
+      reset_slots()
+      if (!scan_members(p, "payload") || found_open == 0) next
+      payload_open = found_open
+      reset_slots()
+      if (!scan_members(payload_open, "event")) next
+      if (!f_kind_found || f_kind != "run") next
+      if (!f_runid_found || f_runid == "") next
+      if (found_open == 0) next
+      # Copy the identity out before the event scan resets the shared slots.
+      rid = f_runid
+      event_open = found_open
+      reset_slots()
+      if (!scan_members(event_open, "")) next
+      if (!f_kind_found) next
+      if (f_kind != "started" && f_kind != "terminal") next
+      terminal = (f_kind == "terminal" && f_terminal_found) ? f_terminal : ""
+      print rid, f_kind, terminal
     }
   ' "$1"
 }
@@ -597,10 +711,10 @@ fm_busy_muse_run_events() {  # <session-log>
 #   busy     at least one run started with no matching terminal
 #   settled  every started run reached a terminal
 #   none     the log holds no run lifecycle records at all
-# The match is anchored on the exact structural prefix rather than a bare
-# "kind":"terminal" search, because muse also emits nested "record":{"kind":
-# "terminal"} cleanup-effect payloads that are NOT run terminals and would
-# otherwise close a run that is still in flight.
+# The match reads top-level payload fields rather than searching for
+# "kind":"terminal", because muse also emits nested "record":{"kind":
+# "terminal"} payloads that are NOT run terminals and would otherwise close a
+# run that is still in flight.
 fm_busy_muse_run_state() {  # <session-log>
   [ -f "$1" ] || return 1
   fm_busy_muse_run_events "$1" | LC_ALL=C awk -F '\t' '
