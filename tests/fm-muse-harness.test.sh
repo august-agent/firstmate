@@ -3,11 +3,14 @@
 # spawn launch shape and credential preflight, the secondmate refusal, the
 # session-log busy source, and teardown cleanup of the busy binding.
 #
-# The session-log fixtures below reproduce muse 0.1.0-R708.1's real record
-# shapes, including the nested "record":{"kind":"terminal"} cleanup payload that
-# is NOT a run terminal. That decoy is the whole reason the fold matches an
-# anchored structural prefix instead of searching for "kind":"terminal", so a
-# fixture without it would let a naive implementation pass.
+# The session-log fixtures below reproduce muse's real record shapes in both
+# supported serializations: 0.1.0-R708.1 writes the payload kind first, while
+# 1.3.0 leads with the event object. Both carry nested
+# "record":{"kind":"terminal"} payloads that are NOT run terminals (a cleanup
+# effect on 0.1.0, a tool batch effect on 1.3.0). Those decoys are the whole
+# reason the fold reads top-level payload fields instead of searching for
+# "kind":"terminal", so a fixture without them would let a naive
+# implementation pass.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -57,6 +60,45 @@ muse_log_cleanup_terminal_decoy() {  # <run-id>
 
 muse_log_noise() {  # <run-id>
   printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"%s","event":{"kind":"context_block_diagnostic","block_id":"rules_file","message":"mentions kind terminal and kind started in prose"}}}\n' "$1"
+}
+
+# Muse 1.3 writes the same run lifecycle pair with the payload keys reordered:
+# the event object leads, then kind and run_id follow. The terminal event also
+# leads with timing fields rather than kind, so the event match is
+# order-independent too.
+muse_log_13_run_started() {  # <run-id>
+  printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"event":{"kind":"started","prompt":"synthetic brief"},"kind":"run","run_id":"%s","source_run_record_id":"9f8e7d6c","source_run_record_sequence":1}}\n' "$1"
+}
+
+muse_log_13_run_terminal() {  # <run-id> <completed|cancelled>
+  printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"event":{"eot_gate_ms":8887,"kind":"terminal","reason":null,"terminal":"%s","turn_duration_ms":10982},"kind":"run","run_id":"%s","source_run_record_id":"9f8e7d6c","source_run_record_sequence":32}}\n' "$2" "$1"
+}
+
+# The 1.3 decoy: a tool batch effect whose NESTED record is "terminal" for the
+# SAME run. Its top-level kind is "tool_batch_effect", never "run".
+muse_log_13_tool_terminal_decoy() {  # <run-id>
+  printf '{"schema_version":1,"payload_type":"tool_batch.effect.terminal","payload":{"kind":"tool_batch_effect","record":{"kind":"terminal","effect_id":7,"outcome":{"kind":"applied"}},"run_id":"%s"}}\n' "$1"
+}
+
+# A model-configuration record whose nested run_stream carries kind "run".
+# It has no top-level run lifecycle fields at all.
+muse_log_13_run_model() {
+  printf '{"schema_version":1,"payload_type":"run.model.configured","payload":{"kind":"run_model","record":{"run_stream":{"kind":"run","id":"e2f23860"},"model_id":"synthetic-model","provider_id":"meta"}}}\n'
+}
+
+# A tool-task lifecycle record for the same run: its own started/completed
+# pair brackets one tool call, never the turn.
+muse_log_13_task_completed() {  # <run-id> <task-id>
+  printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"event":{"kind":"completed","task_id":"%s"},"kind":"task","run_id":"%s","task_id":"%s"}}\n' "$2" "$1" "$2"
+}
+
+# A 1.3 started record whose prompt text embeds forged lifecycle fragments
+# behind valid JSON escapes. The record itself parses; the parser must still
+# read the prompt as one opaque string and report the real run as open.
+muse_log_13_run_started_hostile_prompt() {  # <run-id>
+  local prompt
+  prompt=$'do {not} this \\"kind\\":\\"run\\" \\"run_id\\":\\"'$1$'\\" \\"event\\":{\\"kind\\":\\"terminal\\",\\"terminal\\":\\"completed\\"} end \\\\ done'
+  printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"event":{"kind":"started","prompt":"%s"},"kind":"run","run_id":"%s","source_run_record_id":"9f8e7d6c","source_run_record_sequence":1}}\n' "$prompt" "$1"
 }
 
 # write_session_log <sessions-root> <yyyy> <mm> <dd> <uuid> <workspace-root>
@@ -1591,6 +1633,14 @@ run_state() {  # <log>
   )
 }
 
+run_events() {  # <log>
+  (
+    # shellcheck source=bin/fm-busy-lib.sh
+    . "$ROOT/bin/fm-busy-lib.sh"
+    fm_busy_muse_run_events "$1"
+  )
+}
+
 test_run_fold_tracks_open_and_settled_turns() {
   local dir log out
   dir="$TMP_ROOT/fold"
@@ -1726,6 +1776,192 @@ EOF
   assert_grep "session_log=$target" "$pin" \
     "Muse 1.3 worker pinned a session from another same-day workspace"
   pass "Muse 1.3 working sessions resolve after their leading permission frame"
+}
+
+test_run_fold_tracks_1_3_turns() {
+  local dir log out
+  dir="$TMP_ROOT/fold-13"
+  mkdir -p "$dir"
+
+  log=$(write_muse_13_session_log "$dir/open" 2026 08 05 aaaa "$dir/ws" <<EOF
+$(muse_log_13_run_started run-1)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a 1.3 open run folded to '$out', expected busy"
+
+  log=$(write_muse_13_session_log "$dir/settled" 2026 08 05 bbbb "$dir/ws" <<EOF
+$(muse_log_13_run_started run-1)
+$(muse_log_13_run_terminal run-1 completed)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "a 1.3 completed run folded to '$out', expected settled"
+
+  log=$(write_muse_13_session_log "$dir/cancelled" 2026 08 05 cccc "$dir/ws" <<EOF
+$(muse_log_13_run_started run-1)
+$(muse_log_13_run_terminal run-1 cancelled)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "a 1.3 interrupted run folded to '$out', expected settled"
+
+  # A second turn reopens the fold after the first settled.
+  log=$(write_muse_13_session_log "$dir/second" 2026 08 05 dddd "$dir/ws" <<EOF
+$(muse_log_13_run_started run-1)
+$(muse_log_13_run_terminal run-1 completed)
+$(muse_log_13_run_started run-2)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a reopened 1.3 second turn folded to '$out', expected busy"
+
+  log=$(write_muse_13_session_log "$dir/none" 2026 08 05 eeee "$dir/ws" </dev/null)
+  out=$(run_state "$log")
+  [ "$out" = none ] || fail "a run-free 1.3 log folded to '$out', expected none"
+  pass "the run fold tracks 1.3 open, settled, interrupted, reopened, and run-free logs"
+}
+
+test_run_fold_supports_both_record_shapes() {
+  local dir log out
+  dir="$TMP_ROOT/fold-mixed"
+  mkdir -p "$dir"
+
+  # A vendor update mid-day can leave one log holding both shapes; the pair
+  # still brackets by run_id regardless of which shape each half uses.
+  log=$(write_muse_13_session_log "$dir/mixed-a" 2026 08 05 aaaa "$dir/ws" <<EOF
+$(muse_log_run_started run-1)
+$(muse_log_13_run_terminal run-1 completed)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "an old started plus a 1.3 terminal folded to '$out', expected settled"
+
+  log=$(write_muse_13_session_log "$dir/mixed-b" 2026 08 05 bbbb "$dir/ws" <<EOF
+$(muse_log_13_run_started run-1)
+$(muse_log_run_terminal run-1 cancelled)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "a 1.3 started plus an old terminal folded to '$out', expected settled"
+
+  # Whitespace between tokens changes nothing: the walk is structural.
+  log=$(write_muse_13_session_log "$dir/mixed-c" 2026 08 05 cccc "$dir/ws" <<EOF
+{ "schema_version" : 1 , "payload_type" : "runtime.session" , "payload" : { "event" : { "kind" : "started" , "prompt" : "spaced" } , "kind" : "run" , "run_id" : "run-1" } }
+$(muse_log_13_run_terminal run-1 completed)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "a spaced started plus a 1.3 terminal folded to '$out', expected settled"
+  pass "the run fold pairs lifecycle halves across both record shapes"
+}
+
+test_run_events_pair_turns_by_non_empty_run_id() {
+  local dir log events first second
+  dir="$TMP_ROOT/events-identity"
+  mkdir -p "$dir"
+  log=$(write_muse_13_session_log "$dir/root" 2026 08 05 ffff "$dir/ws" <<EOF
+$(muse_log_13_run_started run-aaa)
+$(muse_log_13_run_terminal run-aaa completed)
+$(muse_log_run_started run-bbb)
+$(muse_log_run_terminal run-bbb cancelled)
+EOF
+)
+  events=$(run_events "$log")
+  [ "$(printf '%s\n' "$events" | wc -l)" = 4 ] \
+    || fail "two settled turns produced $(printf '%s\n' "$events" | wc -l) event lines, expected 4"
+  first=$(printf '%s\n' "$events" | awk -F '\t' '$2 == "started" { print $1 }')
+  second=$(printf '%s\n' "$events" | awk -F '\t' '$2 == "terminal" { print $1 }')
+  [ -n "$first" ] && [ "$(printf '%s\n' "$first" | grep -c .)" = 2 ] \
+    || fail "started events lost their run identity: '$first'"
+  [ "$first" = "$second" ] \
+    || fail "terminal events paired to '$second' instead of their started runs '$first'"
+  [ "$(printf '%s\n' "$first" | sort -u | wc -l)" = 2 ] \
+    || fail "the two turns share one run identity: '$first'"
+  pass "run events pair each turn under its own non-empty run identity"
+}
+
+test_1_3_decoys_do_not_settle_a_run() {
+  local dir log out
+  dir="$TMP_ROOT/decoy-13"
+  mkdir -p "$dir"
+  log=$(write_muse_13_session_log "$dir/root" 2026 08 05 ffff "$dir/ws" <<EOF
+$(muse_log_13_run_started run-1)
+$(muse_log_13_tool_terminal_decoy run-1)
+$(muse_log_13_run_model)
+$(muse_log_13_task_completed run-1 task-9)
+$(muse_log_cleanup_terminal_decoy run-1)
+EOF
+)
+  out=$(run_state "$log")
+  [ "$out" = busy ] \
+    || fail "a 1.3 decoy settled an open run (folded '$out', expected busy)"
+  pass "1.3 tool, model, and task records never settle an in-flight run"
+}
+
+test_prompt_text_cannot_inject_lifecycle_events() {
+  local dir log out
+  dir="$TMP_ROOT/injection"
+  mkdir -p "$dir"
+  log=$(write_muse_13_session_log "$dir/root" 2026 08 05 ffff "$dir/ws" <<EOF
+$(muse_log_13_run_started_hostile_prompt run-1)
+EOF
+)
+  grep -Fq '\"terminal\":\"completed\"' "$log" \
+    || fail "the hostile prompt lost its forged terminal, so the injection case would be vacuous"
+  out=$(run_state "$log")
+  [ "$out" = busy ] \
+    || fail "prompt text forged a terminal for the open run (folded '$out', expected busy)"
+  pass "prompt text cannot inject run lifecycle events"
+}
+
+test_corrupt_lines_fold_to_unknown_never_idle() {
+  local dir state id root log verdict
+  dir="$TMP_ROOT/corrupt"
+  state="$dir/state"
+  root="$dir/sessions"
+  id=corrupttask
+  mkdir -p "$state"
+  log=$(write_muse_13_session_log "$root" 2026 08 05 cccc "$dir/ws" <<EOF
+this is not json
+{"schema_version":1,"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started"
+{"payload": {"kind": "run", "run_id": "", "event": {"kind": "started"}}}
+EOF
+)
+  [ "$(run_state "$log")" = none ] || fail "a corrupt log folded past none"
+  printf 'sessions_root=%s\nworkspace_root=%s\n' "$root" "$dir/ws" > "$state/$id.muse-session"
+  verdict=$(classify_muse "$state" "$id")
+  [ "$verdict" = "unknown muse-session-log" ] \
+    || fail "a corrupt log classified '$verdict' instead of unknown"
+  pass "corrupt session lines fold to unknown rather than idle"
+}
+
+test_1_3_session_classifies_busy_then_idle() {
+  local dir state id root verdict
+  dir="$TMP_ROOT/classify-13"
+  state="$dir/state"
+  root="$dir/sessions"
+  id=busy13task
+  mkdir -p "$state"
+
+  write_muse_13_session_log "$root" 2026 08 05 open "$dir/open-ws" >/dev/null <<EOF
+$(muse_log_13_run_started open-run)
+EOF
+  write_muse_13_session_log "$root" 2026 08 05 fini "$dir/fini-ws" >/dev/null <<EOF
+$(muse_log_13_run_started fini-run)
+$(muse_log_13_run_terminal fini-run completed)
+EOF
+
+  printf 'sessions_root=%s\nworkspace_root=%s\n' "$root" "$dir/open-ws" > "$state/$id.muse-session"
+  verdict=$(classify_muse "$state" "$id")
+  [ "$verdict" = "busy muse-session-log" ] \
+    || fail "an open 1.3 turn classified '$verdict'"
+
+  printf 'sessions_root=%s\nworkspace_root=%s\n' "$root" "$dir/fini-ws" > "$state/$id.muse-session"
+  verdict=$(classify_muse "$state" "$id")
+  [ "$verdict" = "idle muse-session-log" ] \
+    || fail "a settled 1.3 turn classified '$verdict'"
+  pass "a 1.3 session classifies busy in flight and idle once settled"
 }
 
 test_workspace_binding_treats_glob_characters_literally() {
@@ -2067,6 +2303,13 @@ test_run_fold_tracks_open_and_settled_turns
 test_nested_terminal_record_does_not_settle_a_run
 test_binding_selects_the_matching_main_log
 test_muse_13_permission_frame_does_not_hide_workspace_metadata
+test_run_fold_tracks_1_3_turns
+test_run_fold_supports_both_record_shapes
+test_run_events_pair_turns_by_non_empty_run_id
+test_1_3_decoys_do_not_settle_a_run
+test_prompt_text_cannot_inject_lifecycle_events
+test_corrupt_lines_fold_to_unknown_never_idle
+test_1_3_session_classifies_busy_then_idle
 test_workspace_binding_treats_glob_characters_literally
 test_binding_excludes_preexisting_log_when_mtimes_tie
 test_session_log_cache_reuses_and_refreshes_binding
