@@ -544,6 +544,30 @@ SH
   pass "a competing reaper cannot remove the successor's steal mutex"
 }
 
+test_lock_steals_zombie_pid_lock() {
+  local dir state lockdir fakeproc owner rc newpid
+  dir=$(make_case lock-zombie-steal)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  fakeproc="$dir/proc"
+  sleep 300 &
+  owner=$!
+  mkdir -p "$fakeproc/$owner" "$lockdir"
+  printf '%s (zombie fixture) Z 1\n' "$owner" > "$fakeproc/$owner/stat"
+  printf '%s\n' "$owner" > "$lockdir/pid"
+  rc=0
+  newpid=$(FM_PROC_ROOT_OVERRIDE="$fakeproc" FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then cat "$2/pid"; else exit 7; fi
+  ' _ "$LIB" "$lockdir") || rc=$?
+  kill "$owner" 2>/dev/null || true
+  wait "$owner" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "acquirer failed to steal a zombie-pid stale lock (rc=$rc)"
+  [ "$newpid" != "$owner" ] || fail "stale zombie-pid lock was not replaced (still $owner)"
+  [ -n "$newpid" ] || fail "reclaimed zombie lock has no pid recorded"
+  pass "zombie-pid stale lock is reclaimed by a single acquirer"
+}
+
 test_lock_stale_steal_single_winner_under_concurrency() {
   local dir state lockdir dead marker i pids pid wins
   dir=$(make_case lock-stale-concurrency)
@@ -1542,6 +1566,7 @@ test_live_stalled_watch_lock_is_replaced_past_hard_bound
 test_guard_warnings
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
+test_lock_steals_zombie_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_reclaims_dead_steal_owner_without_nested_markers
 test_lock_recovers_dead_nested_steal_chain
