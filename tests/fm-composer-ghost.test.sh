@@ -137,6 +137,45 @@ test_strip_ghost_keeps_colored_text_with_2_payloads() {
 
 # --- Dark truecolor foreground is ghost (grok placeholder), dropped ----------
 
+# --- Dark INDEXED foreground is ghost (muse 1.3 composer hint), dropped -------
+#
+# muse 1.3.0-R3401.1 draws "Ctrl+B sends the selected task to the background
+# queue" on the prompt row in 38;5;242. Read as typed input, that hint made every
+# steer to an IDLE muse worker defer forever and made fm-control refuse to exit or
+# relaunch it: the worker became unreachable by any route.
+#
+# Only indices 16-255 are scored. 0-15 ARE the configurable terminal palette and
+# carry no fixed luminance, so they stay untested - real text wins there, because
+# under-stripping merely defers while over-stripping would inject over real input.
+
+test_strip_ghost_indexed_foreground() {
+  local out
+  # The greyscale ramp: 242 -> 8 + 10*(242-232) = grey 108, below the 128 default.
+  out=$(printf '\033[38;5;242mCtrl+B sends the selected task to the background queue\033[39m\n' | fm_tmux_strip_ghost)
+  [ -z "${out//[[:space:]]/}" ] || fail "muse 1.3 hint (38;5;242) survived as real text: '$out'"
+  # Colon form of the same colour.
+  out=$(printf '\033[38:5:242mcolon indexed hint\033[39m\n' | fm_tmux_strip_ghost)
+  [ -z "${out//[[:space:]]/}" ] || fail "colon indexed ghost (38:5:242) survived: '$out'"
+  # The cube: 16 is pure black (0,0,0).
+  out=$(printf '\033[38;5;16mcube black hint\033[39m\n' | fm_tmux_strip_ghost)
+  [ -z "${out//[[:space:]]/}" ] || fail "dark cube index 16 survived as real text: '$out'"
+
+  # OVER-STRIPPING IS THE DANGEROUS DIRECTION: bright indexed text is real input.
+  out=$(printf '\033[38;5;231mindexed typed\033[0m\n' | fm_tmux_strip_ghost)
+  [ "$out" = "indexed typed" ] || fail "bright indexed text (38;5;231, white) was stripped as ghost: '$out'"
+  out=$(printf '\033[38;5;255mnear white typed\033[0m\n' | fm_tmux_strip_ghost)
+  [ "$out" = "near white typed" ] || fail "bright greyscale index 255 was stripped as ghost: '$out'"
+  # The configurable palette stays untested whatever it is nominally named.
+  out=$(printf '\033[38;5;8mpalette typed\033[0m\n' | fm_tmux_strip_ghost)
+  [ "$out" = "palette typed" ] || fail "configurable palette index 8 was luminance-tested: '$out'"
+  out=$(printf '\033[38;5;0mpalette black typed\033[0m\n' | fm_tmux_strip_ghost)
+  [ "$out" = "palette black typed" ] || fail "configurable palette index 0 was luminance-tested: '$out'"
+  # An out-of-range or malformed index is not a colour, so it cannot be ghost.
+  out=$(printf '\033[38;5;300mbad index typed\033[0m\n' | fm_tmux_strip_ghost)
+  [ "$out" = "bad index typed" ] || fail "out-of-range index 300 was treated as dark: '$out'"
+  pass "fm_tmux_strip_ghost scores indexed 16-255 and leaves the configurable palette alone"
+}
+
 test_strip_ghost_drops_dark_truecolor_ghost() {
   local out
   # grok renders its placeholder/hint text with a dark, muted truecolor
@@ -684,6 +723,7 @@ test_peek_output_is_escape_free() {
 test_strip_ghost_drops_dim_keeps_normal
 test_strip_ghost_handles_combined_and_boundary_codes
 test_strip_ghost_keeps_colored_text_with_2_payloads
+test_strip_ghost_indexed_foreground
 test_strip_ghost_drops_dark_truecolor_ghost
 test_strip_ghost_keeps_muse_composer_colors
 test_dim_ghost_only_composer_is_not_pending
