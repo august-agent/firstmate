@@ -568,6 +568,35 @@ test_lock_steals_zombie_pid_lock() {
   pass "zombie-pid stale lock is reclaimed by a single acquirer"
 }
 
+test_pid_liveness_verdicts_hold_from_exit_trap() {
+  local dir fakeproc target live_verdict zombie_verdict
+  dir=$(make_case lock-trap-verdicts)
+  fakeproc="$dir/proc"
+  sleep 300 &
+  target=$!
+  mkdir -p "$fakeproc/$target"
+  printf '%s (trap fixture) Z 1\n' "$target" > "$fakeproc/$target/stat"
+  # A bare `return` after the zombie state test yields 0 inside an EXIT trap
+  # on bash 5.2, which once made trap-context callers read every live pid as
+  # a zombie and steal locks out from under live holders. Both verdicts must
+  # hold when read from a trap.
+  FM_PID_ALIVE_TRAP_TARGET=$target bash -c '
+    . "$1"
+    trap "fm_pid_alive \"$FM_PID_ALIVE_TRAP_TARGET\" && echo TRAP-ALIVE || echo TRAP-DEAD" EXIT
+  ' _ "$LIB" > "$dir/live-verdict" 2>&1
+  FM_PROC_ROOT_OVERRIDE="$fakeproc" FM_PID_ALIVE_TRAP_TARGET=$target bash -c '
+    . "$1"
+    trap "fm_pid_alive \"$FM_PID_ALIVE_TRAP_TARGET\" && echo TRAP-ALIVE || echo TRAP-DEAD" EXIT
+  ' _ "$LIB" > "$dir/zombie-verdict" 2>&1
+  kill "$target" 2>/dev/null || true
+  wait "$target" 2>/dev/null || true
+  live_verdict=$(cat "$dir/live-verdict")
+  zombie_verdict=$(cat "$dir/zombie-verdict")
+  [ "$live_verdict" = TRAP-ALIVE ] || fail "a live pid read dead from an EXIT trap: '$live_verdict'"
+  [ "$zombie_verdict" = TRAP-DEAD ] || fail "a zombie pid read alive from an EXIT trap: '$zombie_verdict'"
+  pass "pid liveness verdicts hold when read from an EXIT trap"
+}
+
 test_lock_stale_steal_single_winner_under_concurrency() {
   local dir state lockdir dead marker i pids pid wins
   dir=$(make_case lock-stale-concurrency)
@@ -1567,6 +1596,7 @@ test_guard_warnings
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_steals_zombie_pid_lock
+test_pid_liveness_verdicts_hold_from_exit_trap
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_reclaims_dead_steal_owner_without_nested_markers
 test_lock_recovers_dead_nested_steal_chain

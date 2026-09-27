@@ -55,8 +55,14 @@ fm_pid_zombie() {  # <pid>
   if [ -r "$proc_root/$pid/stat" ]; then
     stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
     read -r -a stat_fields <<< "${stat_line##*)}"
-    [ "${stat_fields[0]:-}" = Z ]
-    return
+    # Explicit verdicts: a bare `return` after this test yields 0 inside an
+    # EXIT trap on bash 5.2, which made trap-context callers read every live
+    # pid as a zombie. Never collapse this back to a trailing bare return.
+    if [ "${stat_fields[0]:-}" = Z ]; then
+      return 0
+    else
+      return 1
+    fi
   fi
   state=$(ps -o stat= -p "$pid" 2>/dev/null) || return 1
   state=${state#"${state%%[![:space:]]*}"}
