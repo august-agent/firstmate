@@ -77,7 +77,7 @@ fm_codex_pool_parse() {  # <spec>
 
 # Prints the gateway base URL without a trailing slash.
 fm_codex_pool_base() {  # <config-dir>
-  local config=${1-} base= src=FLEET_LLM_BASE line
+  local config=${1-} base='' src=FLEET_LLM_BASE line
   if [ -n "${FLEET_LLM_BASE:-}" ]; then
     base=$FLEET_LLM_BASE
   elif [ -n "$config" ] && [ -e "$config/codex-pool-base" ]; then
