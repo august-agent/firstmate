@@ -1,0 +1,50 @@
+=== real Firstmate primary results ===
+
+=== pooled task metadata observed before teardown ===
+window=primary:fm-live-pool
+worktree=/Users/dylan/.treehouse/project-630fcc/1/project
+harness=codex
+model=pool:muse:gpt-5.6-luna
+effort=max
+
+=== pooled worker state observed before teardown ===
+  A `done:` is accepted when the named head is on this project's shared local branch, not only on a detached copy; the
+  check tests that head, not merely that a branch moved.
+  Keep your branch a clean fast-forward onto the current default branch - if `main` has advanced, rebase onto it so the
+  eventual merge stays a fast-forward.
+  When it is implemented and committed, append `done [at=<epoch>]: ready in branch fm/live-pool` to the status file and
+  stop.
+  The configured merge authority approves the ready branch, then firstmate merges it into local `main` through the
+  guarded fast-forward path.
+
+
+◦ Working (45s • esc to interrupt)
+  └ Tip: NEW: Prevent sleep while running is now available in /experimental.
+
+
+› Ask Codex to do anything
+
+  GPT-5.6-Luna max · ~/.treehouse/project-630fcc/1/project
+  ? for shortcuts                                                                              ⚠ 1 warning · f2 to view
+
+=== pooled worker launch flags observed before teardown ===
+38928 node /opt/homebrew/bin/codex --model gpt-5.6-luna -c features.apps=false -c model_provider=fleet-muse -c model_providers.fleet-muse.name=fleet-muse -c model_providers.fleet-muse.base_url="http://127.0.0.1:61502/llm/muse/v1" -c model_providers.fleet-muse.env_key=FLEET_LLM_KEY -c model_providers.fleet-muse.wire_api=responses -c model_providers.fleet-muse.stream_idle_timeout_ms=300000 -c model_reasoning_effort="max" <launch prompt omitted>
+
+=== live disposable gateway observations ===
+{"authorization": null, "body_bytes": 0, "content_type": null, "method": "GET", "path": "/llm/muse/status"}
+{"authorization": "Bearer fleet-pool", "body_bytes": 74462, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 34111, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 74462, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 34111, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 74018, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 34111, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 74018, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 34111, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 74018, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 34111, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 74018, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+{"authorization": "Bearer fleet-pool", "body_bytes": 34111, "content_type": "application/json", "input_items": 5, "method": "POST", "model": "gpt-5.6-luna", "path": "/llm/muse/v1/responses", "stream": true, "tool_count": 0}
+
+=== missing-base postcondition ===
+task record: absent
+worker window count: 0
