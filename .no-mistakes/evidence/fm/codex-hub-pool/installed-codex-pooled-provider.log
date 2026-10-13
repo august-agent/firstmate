@@ -1,0 +1,22 @@
+Reading additional input from stdin...
+OpenAI Codex v0.162.1
+--------
+workdir: /Users/dylan/.no-mistakes/worktrees/6f97f6dd4e8d/01M4TG6MEXCR9C623P9P0W0C2G
+model: gpt-5.6-luna
+provider: fleet-muse
+approval: never
+sandbox: danger-full-access
+reasoning effort: max
+reasoning summaries: none
+session id: 01a13550-9c66-73c3-bb19-bcd9cea757ce
+--------
+user
+Reply with exactly READY and do not use tools.
+2026-10-13T12:50:37.888418Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest("MCP HTTP headers helper exited with status exit status: 1")))
+2026-10-13T12:50:38.141225Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest("MCP HTTP headers helper exited with status exit status: 1")))
+2026-10-13T12:50:39.144518Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Client(HttpRequest(HttpRequest("MCP HTTP headers helper exited with status exit status: 1")))
+ERROR: {"error":{"message":"disposable lab gateway intentionally stops after proving request routing"}}
+ERROR: {"error":{"message":"disposable lab gateway intentionally stops after proving request routing"}}
+
+EXPECTED_FIXTURE_EXIT=1
+The disposable gateway deliberately returned HTTP 400 after recording the request; provider/model/effort and the routed request are the evidence.

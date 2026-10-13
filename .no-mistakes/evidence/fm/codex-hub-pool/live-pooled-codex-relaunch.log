@@ -1,0 +1,92 @@
+  /private/tmp/fm-lab.relaunch.uAWQnC/project                                                                                                                                                         
+
+  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code automatically, even without a model request. Continue only if you
+  trust these files. Your trust decision will be saved.
+
+› 1. Trust and continue                                                                                                                                                                                 
+  2. Quit
+
+  enter continue · esc quit
+
+
+                                                                                                     
+                                                                                                              
+                                                                                                                
+                                                                                                                 
+                                                                                                                  
+                                                                                                                  
+                                                                                                                   
+                                                                                                                    
+                                                                                                                    
+                                                                                                                     
+                                                                                                                    
+                                                                                                                    
+                                                                                                                   
+                                                                                                                 
+                                                                                                              
+                                                                                                             
+                                                                                                           
+
+
+
+
+
+
+
+
+
+
+
+
+
+                          
+
+
+                 
+accepting disposable trust
+                                                                                      ⣀⣶⣿⣿⣿⣿⡇ ⢸⣿⣿⡿⠛⠉⢀⣠⣴⣿⣿⣿⣷⣦⣀⠈⢻⣿⣿⡇
+                                                                                     ⣰⣿⣿⡿⢿⣿⣿⡇ ⢸⣿⣿⢀⣤⣶⣿⣿⣿⠟⠛⠻⣿⣿⣿⣿⣮⣿⣿⡷
+                                                                                    ⢰⣿⣿⡟⠁⢸⣿⣿⡇ ⢸⣿⣿⣿⣿⠿⠿⣿⣿⣿⣦⣄⡀⠈⠛⠿⣿⣿⣿⣧⡀
+                                                                                    ⣾⣿⣿⠃ ⢸⣿⣿⡇ ⢸⣿⣿⠋⠁  ⠈⠙⢻⣿⣿⣿⣶⣤⡀ ⠹⢿⣿⣷⡄
+                                                                                    ⢸⣿⣿⣇ ⠸⣿⣿⣷⣦⣼⣿⣿      ⢸⣿⣿⠻⢿⣿⣿⡇ ⠘⣿⣿⣿
+                                                                                    ⠈⢿⣿⣿⣦⡀⠈⠛⠿⣿⣿⣿⣿⣄⡀  ⢀⣠⣼⣿⣿  ⣿⣿⡇  ⣿⣿⣿⠇
+                                                                                      ⢻⣿⣿⣿⣷⣦⣀⠈⠙⠻⣿⣿⣿⣶⣶⣿⣿⣿⣿⣿  ⣿⣿⡇ ⣠⣿⣿⣿
+                                                                                      ⢸⣿⣿⡿⢿⣿⣿⣿⣦⣠⣴⣿⣿⣿⡿⠟⠋⢸⣿⣿  ⣿⣿⣷⣴⣿⣿⣿⠃
+                                                                                      ⠘⣿⣿⣷ ⠈⠛⢿⣿⣿⣿⠿⠋⠉ ⣠⣴⣿⣿⣿  ⣿⣿⣿⣿⣿⠟⠁
+                                                                                       ⠻⣿⣿⣿⣤⣀ ⠈⠉ ⢀⣤⣶⣿⣿⣿⠿⠟⠁ ⣰⣿⣿⡟⠋⠁
+                                                                                        ⠈⠿⣿⣿⣿⣿⣶⣾⣿⣿⣿⣿⠟⠋⠁  ⣠⣼⣿⣿⡟
+                                                                                           ⠙⠛⠛⠛⠻⠛⢿⣿⣿⣿⣿⣷⣾⣿⣿⣿⡿⠏
+                                                                                                  ⠈⠙⠛⠿⠿⠿⠿⠛⠉
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol low · /private/tmp/fm-lab.relaunch.uAWQnC/wt    
+  ? for shortcuts                                                                                                                                                             ⚠ 3 warnings · f2 to view
+SCENARIO real pooled recovery relaunch
+fm-gate-refuse: gate agent lifecycle permitted only against lab home /tmp/fm-lab.relaunch.uAWQnC
+fm-gate-refuse: gate agent lifecycle permitted only against lab home /tmp/fm-lab.relaunch.uAWQnC
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no watcher has a fresh beacon (last beat: never, grace 300s).
+●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the guarded operation WILL still run.
+●  repair missing watcher supervision according to the session-start block for this harness; do not use shell &.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+warning: /tmp/fm-lab.relaunch.uAWQnC/data/pool-relaunch-z92/launch-brief.md records no ship branch; defaulting to legacy branch fm/pool-relaunch-z92
+warning: /tmp/fm-lab.relaunch.uAWQnC/data/pool-relaunch-z92/launch-brief.md records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode local-only - confirm its definition of done matches
+notice: pool-relaunch-z92 ships mode=local-only while the standing posture for project is no-mistakes - less rigor than the captain's standing posture; proceed only on a current explicit captain instruction or an intake judgment you can state
+relaunched pool-relaunch-z92 harness=codex from=codex model=pool:muse:gpt-5.6-luna effort=max backend=tmux endpoint=firstmate:fm-pool-relaunch-z92 worktree=/tmp/fm-lab.relaunch.uAWQnC/wt
+metadata model=pool:muse:gpt-5.6-luna effort=max
+{"kind": "GET", "path": "/muse/status", "authorization": "", "body": ""}
