@@ -1,0 +1,7 @@
+{"method": "GET", "path": "/muse/status"}
+{"authorization_present": true, "method": "POST", "model": "gpt-live-fixture", "path": "/muse/v1/responses", "tool_count": 15}
+{"authorization_present": true, "method": "POST", "model": "gpt-live-fixture", "path": "/muse/v1/responses", "tool_count": 0}
+{"authorization_present": true, "method": "POST", "model": "gpt-live-fixture", "path": "/muse/v1/responses", "tool_count": 16}
+{"authorization_present": true, "method": "POST", "model": "gpt-live-fixture", "path": "/muse/v1/responses", "tool_count": 0}
+{"authorization_present": true, "method": "POST", "model": "gpt-explicit:variant", "path": "/muse/v1/responses", "tool_count": 16}
+{"authorization_present": true, "method": "POST", "model": "gpt-explicit:variant", "path": "/muse/v1/responses", "tool_count": 0}

@@ -1,0 +1,5 @@
+fm-gate-refuse: gate agent lifecycle permitted only against lab home /Users/dylan/.no-mistakes/worktrees/6f97f6dd4e8d/01M4TWCJF27327MFR28SADBZ7A/.no-mistakes-live-pool-lab
+WARNING: watcher still down (same stale episode; last beat: never, grace 300s) - full banner already printed this episode.
+error: a pool: codex model needs the gateway base URL; set FLEET_LLM_BASE or write it to config/codex-pool-base
+exit_code=1
+meta_exists=no
