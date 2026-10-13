@@ -25,6 +25,8 @@ HERDR_STATE="$TMP_ROOT/remote-herdr.state"
 HERDR_LOG="$TMP_ROOT/remote-herdr.log"
 TMUX_LOG="$TMP_ROOT/remote-tmux.log"
 TMUX_STATE="$TMP_ROOT/remote-tmux.state"
+POOL_MODEL_FILE="$TMP_ROOT/pool-model"
+POOL_STATUS_LOG="$TMP_ROOT/pool-status.log"
 # One fixture value names the remote route's steering-inbox surface, so the
 # charter render assertions and the delivery checks below cannot drift apart.
 PARENT_ROUTE_INBOX="$REMOTE_HOME/state/parent-route/ios.inbox"
@@ -104,6 +106,15 @@ SH
 chmod +x "$REMOTE_ROOT/bin/tmux"
 install_remote_herdr_fixture "$REMOTE_ROOT" "$HERDR_STATE" "$HERDR_LOG" \
   "$TMP_ROOT/herdr-send-fail" "$TMP_ROOT/herdr.sock"
+cat > "$REMOTE_ROOT/bin/curl" <<SH
+#!/usr/bin/env bash
+url=
+for arg in "\$@"; do url=\$arg; done
+printf '%s\n' "\$url" >> '$POOL_STATUS_LOG'
+model=\$(cat '$POOL_MODEL_FILE')
+printf '{"models":["%s"]}' "\$model"
+SH
+chmod +x "$REMOTE_ROOT/bin/curl"
 git -C "$REMOTE_ROOT" init -q -b main
 git -C "$REMOTE_ROOT" config user.email test@example.com
 git -C "$REMOTE_ROOT" config user.name Test
@@ -846,6 +857,10 @@ pass "mixed local and remote routes validate without migration"
 # Launch on the remote home's own configured backend. Parent metadata records
 # host placement separately from that backend and arms the reply source.
 printf 'pi\n' > "$PARENT/config/crew-harness"
+printf 'codex pool:muse high\n' > "$PARENT/config/secondmate-harness"
+printf 'https://pool.example.test/llm\n' > "$REMOTE_HOME/config/codex-pool-base"
+printf 'gpt-5.6-luna\n' > "$POOL_MODEL_FILE"
+: > "$POOL_STATUS_LOG"
 launches_before_inherit=0
 [ ! -f "$HERDR_LOG" ] || launches_before_inherit=$(grep -c '^tab create' "$HERDR_LOG" || true)
 if FM_FAKE_SSH_MODE=inherit-partial remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate \
@@ -876,6 +891,27 @@ publish_healthy_watcher_identity "$PARENT/state" "$PARENT" "$ROOT/bin/fm-watch.s
 [ "$(remote_env "$ROOT/bin/fm-on.sh" ios fm-remote-secondmate-control.sh observe ios)" = idle ] \
   || fail "remote endpoint delivery observation did not execute on its own host"
 pass "remote spawn launches on the remote-local backend and records a host-qualified route"
+
+recorded_pool_model=$(sed -n 's/^model=//p' "$PARENT/state/ios.meta")
+[ "$recorded_pool_model" = pool:muse:gpt-5.6-luna ] \
+  || fail "the parent did not persist the remote host's resolved pool model: $recorded_pool_model"
+recorded_pool_target=$(sed -n 's/^remote_target=//p' "$PARENT/state/ios.meta")
+recorded_pool_pane=${recorded_pool_target#*:}
+jq --arg pane "$recorded_pool_pane" \
+  '.tabs |= map(select(.pane_id != $pane)) | del(.typed[$pane], .working[$pane])' \
+  "$HERDR_STATE" > "$HERDR_STATE.next"
+mv "$HERDR_STATE.next" "$HERDR_STATE"
+printf 'gpt-5.5\n' > "$POOL_MODEL_FILE"
+remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate >/dev/null \
+  || fail "the remote second mate did not restart from its recorded concrete pool model"
+assert_grep 'model=pool:muse:gpt-5.6-luna' "$PARENT/state/ios.meta" \
+  "the parent changed the recorded pool model during restart"
+assert_grep 'model=pool:muse:gpt-5.6-luna' "$REMOTE_HOME/state/parent-route/ios.meta" \
+  "the remote restart changed the concrete pool model"
+[ "$(wc -l < "$POOL_STATUS_LOG" | tr -d ' ')" -eq 1 ] \
+  || fail "the remote restart queried the changing pool status again: $(cat "$POOL_STATUS_LOG")"
+printf 'codex\n' > "$PARENT/config/secondmate-harness"
+pass "remote spawn records the concrete pool model and recovery reuses it"
 
 remote_route_meta="$REMOTE_HOME/state/parent-route/ios.meta"
 cp "$remote_route_meta" "$TMP_ROOT/remote-ios-before-default-session.meta"

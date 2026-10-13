@@ -991,7 +991,9 @@ fi
 
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
-  local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
+  local remote_schema remote_backend remote_target remote_harness remote_model remote_effort remote_herdr_session
+  local remote_schema_count remote_model_count remote_effort_count remote_response_valid requested_pool recorded_model
+  local registry_lock remote_lock remote_generation
   local remote_traceparent remote_recorded_traceparent sm_primary_head sync_out sync_rc
   local -a launch_args
   id=${POS[0]:-}
@@ -1097,6 +1099,17 @@ spawn_remote_secondmate() {
       echo "error: existing metadata for $id does not identify this remote secondmate route" >&2
       return 1
     fi
+    if [ "$harness" = codex ] && fm_codex_pool_is_spec "$model" \
+      && fm_codex_pool_parse "$model" >/dev/null 2>&1 \
+      && [ -z "$FM_CODEX_POOL_MODEL" ]; then
+      requested_pool=$FM_CODEX_POOL_NAME
+      recorded_model=$(fm_meta_get "$meta" model)
+      if fm_codex_pool_parse "$recorded_model" >/dev/null 2>&1 \
+        && [ "$FM_CODEX_POOL_NAME" = "$requested_pool" ] \
+        && [ -n "$FM_CODEX_POOL_MODEL" ]; then
+        model=$recorded_model
+      fi
+    fi
   fi
   # Gate the host before anything is published or transferred, so a host that
   # cannot hold a durable Herdr endpoint refuses here rather than half-way
@@ -1192,9 +1205,12 @@ spawn_remote_secondmate() {
     fi
     return "$rc"
   fi
+  remote_schema=$(printf '%s\n' "$out" | sed -n 's/^schema=//p' | tail -1)
   remote_backend=$(printf '%s\n' "$out" | sed -n 's/^backend=//p' | tail -1)
   remote_target=$(printf '%s\n' "$out" | sed -n 's/^target=//p' | tail -1)
   remote_harness=$(printf '%s\n' "$out" | sed -n 's/^harness=//p' | tail -1)
+  remote_model=$(printf '%s\n' "$out" | sed -n 's/^model=//p' | tail -1)
+  remote_effort=$(printf '%s\n' "$out" | sed -n 's/^effort=//p' | tail -1)
   remote_herdr_session=$(printf '%s\n' "$out" | sed -n 's/^herdr_session=//p' | tail -1)
   if [ "$remote_backend" != herdr ]; then
     fm_lock_release "$remote_lock" || true
@@ -1216,6 +1232,39 @@ spawn_remote_secondmate() {
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     echo "error: remote launch returned Herdr session '${remote_herdr_session:-missing}', expected 'fm-remote'; preserving the remote route for reconciliation" >&2
     return 1
+  fi
+  remote_schema_count=$(printf '%s\n' "$out" | grep -c '^schema=' || true)
+  remote_model_count=$(printf '%s\n' "$out" | grep -c '^model=' || true)
+  remote_effort_count=$(printf '%s\n' "$out" | grep -c '^effort=' || true)
+  remote_response_valid=1
+  [ "$remote_schema" = fm-remote-secondmate-control.v1 ] && [ "$remote_schema_count" -eq 1 ] \
+    && [ "$remote_model_count" -eq 1 ] && [ "$remote_effort_count" -eq 1 ] \
+    || remote_response_valid=0
+  case "$remote_model" in *[[:space:]]*) remote_response_valid=0 ;; esac
+  case "$remote_effort" in
+  '' | default | low | medium | high | xhigh | max | ultra) ;;
+  *) remote_response_valid=0 ;;
+  esac
+  if [ "$remote_response_valid" -ne 1 ]; then
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote launch returned malformed profile metadata; preserving the remote route for reconciliation" >&2
+    return 1
+  fi
+  if fm_codex_pool_is_spec "$model"; then
+    requested_pool=${model#pool:}
+    requested_pool=${requested_pool%%:*}
+    if ! fm_codex_pool_parse "$remote_model" >/dev/null 2>&1 \
+      || [ "$FM_CODEX_POOL_NAME" != "$requested_pool" ] \
+      || [ -z "$FM_CODEX_POOL_MODEL" ]; then
+      fm_lock_release "$remote_lock" || true
+      fm_lock_release "$registry_lock" || true
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: remote launch returned a model that does not identify the resolved codex pool; preserving the remote route for reconciliation" >&2
+      return 1
+    fi
+    model=$remote_model
   fi
   # Record what the remote endpoint ACTUALLY carries, read back from its own
   # launch, rather than what this side hoped to deliver. That keeps the #995
