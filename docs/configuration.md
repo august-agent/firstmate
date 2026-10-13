@@ -998,8 +998,10 @@ When [`config/launch-env-allowlist`](#worker-launch-environment-configlaunch-env
 
 ### Refusals
 
-A `pool:` model on any other harness or on a raw launch command refuses, as do a missing or invalid base, an unreachable status endpoint, and a pool with no fixed model.
-These refusals happen before any endpoint, local copy, or task record exists, and before a relaunch stops the running worker.
+A `pool:` model on any other harness or on a raw launch command refuses, and every pooled form refuses a missing or invalid base.
+The resolving `pool:<pool>` form also refuses an unreachable status endpoint or a pool with no fixed model.
+For a local launch, these refusals happen before any endpoint, task copy, or task record exists, and before a relaunch stops the running worker.
+A remote secondmate performs any needed pooled-profile resolution on its own host after readiness and inherited-material convergence, but still refuses before changing that host's endpoint record or the parent's route record.
 Resolving `pool:<pool>` needs `curl` and `jq`; the explicit form needs neither.
 
 [`bin/fm-codex-pool-lib.sh`](../bin/fm-codex-pool-lib.sh) owns the syntax, resolution, and exact launch flags, with regression coverage in [`tests/fm-spawn-dispatch-profile.test.sh`](../tests/fm-spawn-dispatch-profile.test.sh) and [`tests/fm-control-relaunch.test.sh`](../tests/fm-control-relaunch.test.sh).
