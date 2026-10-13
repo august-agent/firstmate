@@ -594,6 +594,7 @@ for a in "\$@"; do url=\$a; done
 printf '%s\n' "\$url" >> '$2'
 case "\$url" in
   '$POOL_BASE/muse/status') printf '%s' '{"pool":"muse","models":["$POOL_MODEL","meta/other"],"freeOnly":false}' ;;
+  '$POOL_BASE/luna/status') printf '%s' '{"pool":"luna","models":["gpt-5.6-luna"],"freeOnly":false}' ;;
   '$POOL_BASE/free/status') printf '%s' '{"pool":"free","models":[],"freeOnly":true}' ;;
   *) echo 'curl: (22) The requested URL returned error: 404' >&2; exit 22 ;;
 esac
@@ -693,6 +694,28 @@ test_codex_pool_explicit_model_skips_the_status_lookup() {
   assert_contains "$argv" "arg=model_providers.fleet-muse.base_url=\"$POOL_BASE/muse/v1\"" \
     "FLEET_LLM_BASE did not select the pool gateway"
   pass "codex pool:<pool>:<model> launches that model with no status lookup"
+}
+
+test_codex_pool_uses_the_resolved_model_for_max_effort() {
+  local rec id out status launch argv
+  id=profile-codex-pool-luna-max-z4q
+  rec=$(make_spawn_case profile-codex-pool-luna-max codex "$id")
+  read_case_record "$rec"
+  make_pool_status_stub "$FAKEBIN_DIR" "$CASE_DIR/curl.log"
+  make_codex_argv_recorder "$FAKEBIN_DIR"
+
+  out=$(FLEET_LLM_BASE="$POOL_BASE" run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --harness codex --model pool:luna --effort max)
+  status=$?
+  expect_code 0 "$status" "pooled codex Luna spawn with max effort should succeed"$'\n'"$out"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex pool:luna:gpt-5.6-luna max
+  launch=$(cat "$LAUNCH_LOG")
+  argv=$(codex_launch_argv "$launch" "$FAKEBIN_DIR" "$CASE_DIR/argv.log")
+  assert_contains "$argv" $'arg=--model\narg=gpt-5.6-luna\n' \
+    "the resolved pooled Luna model did not reach codex"
+  assert_contains "$argv" $'arg=-c\narg=model_reasoning_effort="max"\n' \
+    "the pooled Luna launch omitted max reasoning effort"
+  pass "pooled codex Luna receives max effort from its resolved model"
 }
 
 # The plain launch is the reference: pool configuration in the home and the
@@ -2404,6 +2427,7 @@ test_codex_threads_model_and_max_effort
 test_codex_omits_max_effort_for_unsupported_model
 test_codex_pool_resolves_the_status_model_and_routes_the_launch
 test_codex_pool_explicit_model_skips_the_status_lookup
+test_codex_pool_uses_the_resolved_model_for_max_effort
 test_plain_codex_launch_is_unchanged_by_pool_support
 test_codex_pool_refusals_happen_before_launch
 test_codex_crewmate_launch_disables_the_hook_layer

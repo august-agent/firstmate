@@ -5601,16 +5601,18 @@ sq_ompext=$(shell_quote "$STATE/$ID.omp-ext.ts")
 sq_ompcfg=$(shell_quote "${OMP_WORKER_CFG:-$FM_ROOT/.omp/fm-worker-overlay.yml}")
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
+EFFORT_MODEL=$MODEL
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 # A resolved pool model replaces codex's plain --model with the pooled-provider
 # flags and names the provider key the gateway expects (fm-codex-pool-lib.sh).
 if [ "$CODEX_POOL" = 1 ]; then
   MODELFLAG=$(fm_codex_pool_launch_flags "$FM_CODEX_POOL_BASE" "$FM_CODEX_POOL_NAME" "$FM_CODEX_POOL_MODEL")
+  EFFORT_MODEL=$FM_CODEX_POOL_MODEL
   LAUNCH="$(fm_codex_pool_launch_env) $LAUNCH"
 fi
 # A pinned Pi launch confines Pi's model lookup to the declared provider.
 [ -z "$WORKER_ACCOUNT_PROVIDER" ] || MODELFLAG="--provider $(shell_quote "$WORKER_ACCOUNT_PROVIDER") $MODELFLAG"
-EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL") || exit 1
+EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$EFFORT_MODEL") || exit 1
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 # Relaunch session continuity. Computed here, where the adopted endpoint (T) is

@@ -993,7 +993,8 @@ The file is not inherited into secondmate homes; create it in each home that dis
 The launch passes `--model <model>` plus `-c` overrides that point `model_provider` at a provider named `fleet-<pool>` with base URL `<base>/<pool>/v1`, `env_key=FLEET_LLM_KEY`, `wire_api=responses`, and a 300000 ms stream idle timeout.
 It also sets `features.apps=false`, because some pooled providers reject the long tool names of Codex's app connectors.
 
-The gateway supplies the real provider key, so the launch sets `FLEET_LLM_KEY` to a placeholder unless the destination pane already has a value; that value is never written into the launch command.
+The gateway supplies the real provider key, so the launch preserves an available destination-pane `FLEET_LLM_KEY` and otherwise sets a placeholder; the value is never written into the launch command.
+When [`config/launch-env-allowlist`](#worker-launch-environment-configlaunch-env-allowlist) enables filtering, list `FLEET_LLM_KEY` there to keep the destination-pane value; it is intentionally not part of Firstmate's operational floor, so omitting it selects the placeholder.
 
 ### Refusals
 
