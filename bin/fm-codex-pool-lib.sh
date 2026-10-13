@@ -155,6 +155,7 @@ fm_codex_pool_resolve() {  # <spec> <harness> <config-dir>
   if [ -z "$FM_CODEX_POOL_MODEL" ]; then
     FM_CODEX_POOL_MODEL=$(fm_codex_pool_status_model "$FM_CODEX_POOL_BASE" "$FM_CODEX_POOL_NAME") || return 1
   fi
+  # shellcheck disable=SC2034 # Output global, read by the sourcing spawn and relaunch callers.
   FM_CODEX_POOL_SPEC="pool:$FM_CODEX_POOL_NAME:$FM_CODEX_POOL_MODEL"
 }
 
