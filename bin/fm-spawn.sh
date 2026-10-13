@@ -98,6 +98,10 @@
 #   build agent's variant, keyed to the resolved model, inside the
 #   OPENCODE_CONFIG_CONTENT JSON its launch already carries (config schema
 #   verified on opencode 1.18.32); without a model the axis is recorded but omitted.
+#   On a canonical codex launch, --model pool:<pool>[:<model>] routes the worker
+#   through an OpenAI-compatible pooled gateway; bin/fm-codex-pool-lib.sh owns
+#   the syntax, gateway base, model lookup, and launch flags, and the record
+#   stores the resolved pool:<pool>:<model>. Any other harness refuses it.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -705,6 +709,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-project-capacity-lib.sh"
 # shellcheck source=bin/fm-worker-account-lib.sh
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
+# shellcheck source=bin/fm-codex-pool-lib.sh
+. "$SCRIPT_DIR/fm-codex-pool-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -985,7 +991,9 @@ fi
 
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
-  local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
+  local remote_schema remote_backend remote_target remote_harness remote_model remote_effort remote_herdr_session
+  local remote_schema_count remote_model_count remote_effort_count remote_response_valid requested_pool recorded_model
+  local registry_lock remote_lock remote_generation
   local remote_traceparent remote_recorded_traceparent sm_primary_head sync_out sync_rc
   local -a launch_args
   id=${POS[0]:-}
@@ -1091,6 +1099,17 @@ spawn_remote_secondmate() {
       echo "error: existing metadata for $id does not identify this remote secondmate route" >&2
       return 1
     fi
+    if [ "$harness" = codex ] && fm_codex_pool_is_spec "$model" \
+      && fm_codex_pool_parse "$model" >/dev/null 2>&1 \
+      && [ -z "$FM_CODEX_POOL_MODEL" ]; then
+      requested_pool=$FM_CODEX_POOL_NAME
+      recorded_model=$(fm_meta_get "$meta" model)
+      if fm_codex_pool_parse "$recorded_model" >/dev/null 2>&1 \
+        && [ "$FM_CODEX_POOL_NAME" = "$requested_pool" ] \
+        && [ -n "$FM_CODEX_POOL_MODEL" ]; then
+        model=$recorded_model
+      fi
+    fi
   fi
   # Gate the host before anything is published or transferred, so a host that
   # cannot hold a durable Herdr endpoint refuses here rather than half-way
@@ -1186,9 +1205,12 @@ spawn_remote_secondmate() {
     fi
     return "$rc"
   fi
+  remote_schema=$(printf '%s\n' "$out" | sed -n 's/^schema=//p' | tail -1)
   remote_backend=$(printf '%s\n' "$out" | sed -n 's/^backend=//p' | tail -1)
   remote_target=$(printf '%s\n' "$out" | sed -n 's/^target=//p' | tail -1)
   remote_harness=$(printf '%s\n' "$out" | sed -n 's/^harness=//p' | tail -1)
+  remote_model=$(printf '%s\n' "$out" | sed -n 's/^model=//p' | tail -1)
+  remote_effort=$(printf '%s\n' "$out" | sed -n 's/^effort=//p' | tail -1)
   remote_herdr_session=$(printf '%s\n' "$out" | sed -n 's/^herdr_session=//p' | tail -1)
   if [ "$remote_backend" != herdr ]; then
     fm_lock_release "$remote_lock" || true
@@ -1210,6 +1232,39 @@ spawn_remote_secondmate() {
     fm_lock_release "$SPAWN_TASK_LOCK" || true
     echo "error: remote launch returned Herdr session '${remote_herdr_session:-missing}', expected 'fm-remote'; preserving the remote route for reconciliation" >&2
     return 1
+  fi
+  remote_schema_count=$(printf '%s\n' "$out" | grep -c '^schema=' || true)
+  remote_model_count=$(printf '%s\n' "$out" | grep -c '^model=' || true)
+  remote_effort_count=$(printf '%s\n' "$out" | grep -c '^effort=' || true)
+  remote_response_valid=1
+  [ "$remote_schema" = fm-remote-secondmate-control.v1 ] && [ "$remote_schema_count" -eq 1 ] \
+    && [ "$remote_model_count" -eq 1 ] && [ "$remote_effort_count" -eq 1 ] \
+    || remote_response_valid=0
+  case "$remote_model" in *[[:space:]]*) remote_response_valid=0 ;; esac
+  case "$remote_effort" in
+  '' | default | low | medium | high | xhigh | max | ultra) ;;
+  *) remote_response_valid=0 ;;
+  esac
+  if [ "$remote_response_valid" -ne 1 ]; then
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote launch returned malformed profile metadata; preserving the remote route for reconciliation" >&2
+    return 1
+  fi
+  if fm_codex_pool_is_spec "$model"; then
+    requested_pool=${model#pool:}
+    requested_pool=${requested_pool%%:*}
+    if ! fm_codex_pool_parse "$remote_model" >/dev/null 2>&1 \
+      || [ "$FM_CODEX_POOL_NAME" != "$requested_pool" ] \
+      || [ -z "$FM_CODEX_POOL_MODEL" ]; then
+      fm_lock_release "$remote_lock" || true
+      fm_lock_release "$registry_lock" || true
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: remote launch returned a model that does not identify the resolved codex pool; preserving the remote route for reconciliation" >&2
+      return 1
+    fi
+    model=$remote_model
   fi
   # Record what the remote endpoint ACTUALLY carries, read back from its own
   # launch, rather than what this side hoped to deliver. That keeps the #995
@@ -2521,6 +2576,21 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
       esac
     fi
   fi
+fi
+# A pool: model routes a canonical codex launch through an OpenAI-compatible
+# pooled gateway (bin/fm-codex-pool-lib.sh owns the syntax, the gateway base,
+# and the model lookup). Resolve it to the concrete pool:<pool>:<model> before
+# any endpoint, worktree, or record exists, so the record names exactly what
+# runs and a relaunch reuses it without another lookup.
+CODEX_POOL=0
+if fm_codex_pool_is_spec "$MODEL"; then
+  [ "$RAW_LAUNCH" = 0 ] || {
+    echo "error: --model $MODEL requires the canonical --harness codex launch, not a raw launch command" >&2
+    exit 1
+  }
+  fm_codex_pool_resolve "$MODEL" "$HARNESS" "$CONFIG" || exit 1
+  MODEL=$FM_CODEX_POOL_SPEC
+  CODEX_POOL=1
 fi
 # Ultra is an explicit native capability, never a generic thinking-level alias.
 # Validate the fully resolved profile before worktree or endpoint provisioning.
@@ -5580,10 +5650,18 @@ sq_ompext=$(shell_quote "$STATE/$ID.omp-ext.ts")
 sq_ompcfg=$(shell_quote "${OMP_WORKER_CFG:-$FM_ROOT/.omp/fm-worker-overlay.yml}")
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
+EFFORT_MODEL=$MODEL
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
+# A resolved pool model replaces codex's plain --model with the pooled-provider
+# flags and names the provider key the gateway expects (fm-codex-pool-lib.sh).
+if [ "$CODEX_POOL" = 1 ]; then
+  MODELFLAG=$(fm_codex_pool_launch_flags "$FM_CODEX_POOL_BASE" "$FM_CODEX_POOL_NAME" "$FM_CODEX_POOL_MODEL")
+  EFFORT_MODEL=$FM_CODEX_POOL_MODEL
+  LAUNCH="$(fm_codex_pool_launch_env) $LAUNCH"
+fi
 # A pinned Pi launch confines Pi's model lookup to the declared provider.
 [ -z "$WORKER_ACCOUNT_PROVIDER" ] || MODELFLAG="--provider $(shell_quote "$WORKER_ACCOUNT_PROVIDER") $MODELFLAG"
-EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL") || exit 1
+EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$EFFORT_MODEL") || exit 1
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 # Relaunch session continuity. Computed here, where the adopted endpoint (T) is

@@ -423,10 +423,12 @@ bin/fm-spawn.sh <id> --secondmate
 
 The primary then takes these steps:
 
-1. It resolves the verified secondmate harness and optional model and effort.
+1. It selects the verified secondmate harness and optional model and effort.
 2. It runs the same readiness gate the seed runs.
 3. It transfers the inherited-material allowlist.
 4. It asks the remote host to launch on Herdr in `fm-remote`.
+
+A Codex pooled model follows the [pooled-provider contract](configuration.md#codex-pooled-providers-configcodex-pool-base) on the remote host, which returns the resolved concrete model for the primary's recovery record.
 
 All remote secondmates on one host share `fm-remote` and retain separate `2ndmate-<id>` workspaces inside it.
 

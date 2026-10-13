@@ -577,6 +577,219 @@ test_codex_omits_max_effort_for_unsupported_model() {
   pass "codex omits max for models without the catalog capability"
 }
 
+# --- codex pooled providers (bin/fm-codex-pool-lib.sh) -----------------------
+
+POOL_BASE=https://pool.example.test/llm
+POOL_MODEL=meta/muse-spark-1.3-contributor
+unset FLEET_LLM_BASE FLEET_LLM_KEY
+
+# Stands in for an OpenAI-compatible pool gateway's status endpoint: curl
+# answers <base>/<pool>/status for two known pools and fails any other URL the
+# way `curl -f` does on a 404. Every requested URL is logged.
+make_pool_status_stub() {  # <fakebin> <curl-log>
+  cat > "$1/curl" <<SH
+#!/usr/bin/env bash
+url=
+for a in "\$@"; do url=\$a; done
+printf '%s\n' "\$url" >> '$2'
+case "\$url" in
+  '$POOL_BASE/muse/status') printf '%s' '{"pool":"muse","models":["$POOL_MODEL","meta/other"],"freeOnly":false}' ;;
+  '$POOL_BASE/luna/status') printf '%s' '{"pool":"luna","models":["gpt-5.6-luna"],"freeOnly":false}' ;;
+  '$POOL_BASE/free/status') printf '%s' '{"pool":"free","models":[],"freeOnly":true}' ;;
+  *) echo 'curl: (22) The requested URL returned error: 404' >&2; exit 22 ;;
+esac
+SH
+  chmod +x "$1/curl"
+}
+
+# A fake codex that records the provider key it sees and every argument except
+# the trailing launch brief, one per line.
+make_codex_argv_recorder() {  # <fakebin>
+  cat > "$1/codex" <<'SH'
+#!/usr/bin/env bash
+{
+  printf 'FLEET_LLM_KEY=%s\n' "${FLEET_LLM_KEY-unset}"
+  for a in "${@:1:$#-1}"; do printf 'arg=%s\n' "$a"; done
+} > "$FM_CODEX_ARGV_LOG"
+SH
+  chmod +x "$1/codex"
+}
+
+# Executes an emitted launch the way the destination pane would, with the fake
+# codex first on PATH, and prints what codex received up to its hook flag.
+codex_launch_argv() {  # <launch> <fakebin> <argv-log> [FLEET_LLM_KEY value]
+  local launch=$1 fakebin=$2 log=$3
+  if [ $# -ge 4 ]; then
+    FLEET_LLM_KEY=$4 FM_CODEX_ARGV_LOG="$log" PATH="$fakebin:$PATH" bash -c "$launch" \
+      || fail "the emitted codex launch failed to execute"
+  else
+    env -u FLEET_LLM_KEY FM_CODEX_ARGV_LOG="$log" PATH="$fakebin:$PATH" bash -c "$launch" \
+      || fail "the emitted codex launch failed to execute"
+  fi
+  sed '/^arg=hooks$/q' "$log"
+}
+
+test_codex_pool_resolves_the_status_model_and_routes_the_launch() {
+  local rec id out status launch argv expected
+  id=profile-codex-pool-z4p
+  rec=$(make_spawn_case profile-codex-pool codex "$id")
+  read_case_record "$rec"
+  make_pool_status_stub "$FAKEBIN_DIR" "$CASE_DIR/curl.log"
+  make_codex_argv_recorder "$FAKEBIN_DIR"
+  printf '# pool gateway\n%s/\n' "$POOL_BASE" > "$HOME_DIR/config/codex-pool-base"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" \
+    --harness codex --model pool:muse --effort high)
+  status=$?
+  expect_code 0 "$status" "codex pool spawn should succeed"$'\n'"$out"
+  assert_contains "$out" "spawned $id harness=codex" "pool spawn did not report the codex harness"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex "pool:muse:$POOL_MODEL" high
+  [ "$(cat "$CASE_DIR/curl.log")" = "$POOL_BASE/muse/status" ] \
+    || fail "the pool model was not resolved from exactly its status endpoint: $(cat "$CASE_DIR/curl.log")"
+
+  launch=$(cat "$LAUNCH_LOG")
+  argv=$(codex_launch_argv "$launch" "$FAKEBIN_DIR" "$CASE_DIR/argv.log")
+  expected=$(printf '%s\n' \
+    'FLEET_LLM_KEY=fleet-pool' \
+    'arg=--model' "arg=$POOL_MODEL" \
+    'arg=-c' 'arg=features.apps=false' \
+    'arg=-c' 'arg=model_provider=fleet-muse' \
+    'arg=-c' 'arg=model_providers.fleet-muse.name=fleet-muse' \
+    'arg=-c' "arg=model_providers.fleet-muse.base_url=\"$POOL_BASE/muse/v1\"" \
+    'arg=-c' 'arg=model_providers.fleet-muse.env_key=FLEET_LLM_KEY' \
+    'arg=-c' 'arg=model_providers.fleet-muse.wire_api=responses' \
+    'arg=-c' 'arg=model_providers.fleet-muse.stream_idle_timeout_ms=300000' \
+    'arg=-c' 'arg=model_reasoning_effort="high"' \
+    'arg=--dangerously-bypass-approvals-and-sandbox' \
+    'arg=--disable' 'arg=hooks')
+  [ "$argv" = "$expected" ] \
+    || fail "the pooled codex launch did not start codex with the provider overrides"$'\n'"expected:"$'\n'"$expected"$'\n'"actual:"$'\n'"$argv"$'\n'"launch: $launch"
+
+  # A provider key already present in the destination pane wins over the
+  # placeholder, and is never written into the launch command itself.
+  argv=$(codex_launch_argv "$launch" "$FAKEBIN_DIR" "$CASE_DIR/argv.log" pane-supplied-key)
+  [ "$(printf '%s\n' "$argv" | head -1)" = 'FLEET_LLM_KEY=pane-supplied-key' ] \
+    || fail "the pooled launch replaced the destination pane's provider key: $argv"
+  assert_not_contains "$launch" "pane-supplied-key" "the provider key leaked into the launch command"
+  pass "codex pool:<pool> resolves the pool's model and launches codex on the pooled provider"
+}
+
+test_codex_pool_explicit_model_skips_the_status_lookup() {
+  local rec id out status launch argv
+  id=profile-codex-pool-explicit-z4q
+  rec=$(make_spawn_case profile-codex-pool-explicit codex "$id")
+  read_case_record "$rec"
+  make_pool_status_stub "$FAKEBIN_DIR" "$CASE_DIR/curl.log"
+  make_codex_argv_recorder "$FAKEBIN_DIR"
+
+  out=$(FLEET_LLM_BASE="$POOL_BASE" run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --harness codex --model pool:muse:openai/gpt-oss:free)
+  status=$?
+  expect_code 0 "$status" "codex pool spawn with an explicit model should succeed"$'\n'"$out"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex "pool:muse:openai/gpt-oss:free" default
+  [ ! -e "$CASE_DIR/curl.log" ] || fail "an explicit pool model still queried the status endpoint: $(cat "$CASE_DIR/curl.log")"
+  launch=$(cat "$LAUNCH_LOG")
+  argv=$(codex_launch_argv "$launch" "$FAKEBIN_DIR" "$CASE_DIR/argv.log")
+  assert_contains "$argv" $'arg=--model\narg=openai/gpt-oss:free\n' "the explicit pool model did not reach codex"
+  assert_contains "$argv" "arg=model_providers.fleet-muse.base_url=\"$POOL_BASE/muse/v1\"" \
+    "FLEET_LLM_BASE did not select the pool gateway"
+  pass "codex pool:<pool>:<model> launches that model with no status lookup"
+}
+
+test_codex_pool_uses_the_resolved_model_for_max_effort() {
+  local rec id out status launch argv
+  id=profile-codex-pool-luna-max-z4q
+  rec=$(make_spawn_case profile-codex-pool-luna-max codex "$id")
+  read_case_record "$rec"
+  make_pool_status_stub "$FAKEBIN_DIR" "$CASE_DIR/curl.log"
+  make_codex_argv_recorder "$FAKEBIN_DIR"
+
+  out=$(FLEET_LLM_BASE="$POOL_BASE" run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --harness codex --model pool:luna --effort max)
+  status=$?
+  expect_code 0 "$status" "pooled codex Luna spawn with max effort should succeed"$'\n'"$out"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex pool:luna:gpt-5.6-luna max
+  launch=$(cat "$LAUNCH_LOG")
+  argv=$(codex_launch_argv "$launch" "$FAKEBIN_DIR" "$CASE_DIR/argv.log")
+  assert_contains "$argv" $'arg=--model\narg=gpt-5.6-luna\n' \
+    "the resolved pooled Luna model did not reach codex"
+  assert_contains "$argv" $'arg=-c\narg=model_reasoning_effort="max"\n' \
+    "the pooled Luna launch omitted max reasoning effort"
+  pass "pooled codex Luna receives max effort from its resolved model"
+}
+
+# The plain launch is the reference: pool configuration in the home and the
+# environment must not change one byte of an ordinary codex launch.
+test_plain_codex_launch_is_unchanged_by_pool_support() {
+  local rec id_a id_b out status launch_a launch_b dir_a fakebin_a
+  id_a=profile-codex-plain-a-z4r
+  rec=$(make_spawn_case profile-codex-plain-a codex "$id_a")
+  read_case_record "$rec"
+  dir_a=$CASE_DIR
+  fakebin_a=$FAKEBIN_DIR
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id_a" "$PROJ_DIR" --model gpt-5 --effort high)
+  status=$?
+  expect_code 0 "$status" "plain codex reference spawn should succeed"$'\n'"$out"
+  launch_a=$(cat "$LAUNCH_LOG")
+
+  id_b=profile-codex-plain-b-z4r
+  rec=$(make_spawn_case profile-codex-plain-b codex "$id_b")
+  read_case_record "$rec"
+  make_pool_status_stub "$FAKEBIN_DIR" "$CASE_DIR/curl.log"
+  printf '%s\n' "$POOL_BASE" > "$HOME_DIR/config/codex-pool-base"
+  out=$(FLEET_LLM_BASE="$POOL_BASE" run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id_b" "$PROJ_DIR" --model gpt-5 --effort high)
+  status=$?
+  expect_code 0 "$status" "plain codex spawn beside pool configuration should succeed"$'\n'"$out"
+  launch_b=$(cat "$LAUNCH_LOG")
+  launch_b=${launch_b//$CASE_DIR/$dir_a}
+  launch_b=${launch_b//$FAKEBIN_DIR/$fakebin_a}
+  launch_b=${launch_b//$id_b/$id_a}
+  [ "$launch_a" = "$launch_b" ] \
+    || fail "pool configuration changed a plain codex launch"$'\n'"without: $launch_a"$'\n'"with:    $launch_b"
+  [ ! -e "$CASE_DIR/curl.log" ] || fail "a plain codex spawn queried a pool status endpoint"
+  assert_meta_profile "$HOME_DIR/state/$id_b.meta" codex gpt-5 high
+  assert_not_contains "$launch_a" "FLEET_LLM_KEY" "a plain codex launch carries the pool provider key"
+  assert_not_contains "$launch_a" "model_provider" "a plain codex launch carries pool provider overrides"
+  pass "a plain codex launch is byte-identical with or without pool configuration"
+}
+
+test_codex_pool_refusals_happen_before_launch() {
+  local rec out status
+  rec=$(make_spawn_case profile-codex-pool-refusals codex \
+    pool-refuse-claude-z4s pool-refuse-raw-z4s pool-refuse-unknown-z4s pool-refuse-free-z4s \
+    pool-refuse-nobase-z4s pool-refuse-badname-z4s)
+  read_case_record "$rec"
+  make_pool_status_stub "$FAKEBIN_DIR" "$CASE_DIR/curl.log"
+
+  check_refusal() {  # <id> <expected-message> <spawn args...>
+    local rid=$1 msg=$2
+    shift 2
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$rid" "$PROJ_DIR" "$@")
+    status=$?
+    [ "$status" -ne 0 ] || fail "$rid: a refused pool spawn succeeded"$'\n'"$out"
+    assert_contains "$out" "$msg" "$rid: the refusal did not explain itself"
+    [ ! -s "$LAUNCH_LOG" ] || fail "$rid: a launch was sent despite the refusal: $(cat "$LAUNCH_LOG")"
+    [ ! -e "$HOME_DIR/state/$rid.meta" ] || fail "$rid: a task record was written despite the refusal"
+  }
+
+  FLEET_LLM_BASE="$POOL_BASE" check_refusal pool-refuse-claude-z4s "applies only to --harness codex" \
+    --harness claude --model pool:muse
+  FLEET_LLM_BASE="$POOL_BASE" check_refusal pool-refuse-raw-z4s "not a raw launch command" \
+    --model pool:muse "codex --flag"
+  FLEET_LLM_BASE="$POOL_BASE" check_refusal pool-refuse-unknown-z4s "codex pool 'nope' did not answer" \
+    --harness codex --model pool:nope
+  FLEET_LLM_BASE="$POOL_BASE" check_refusal pool-refuse-free-z4s "has no fixed model; pass --model pool:free:<model>" \
+    --harness codex --model pool:free
+  check_refusal pool-refuse-nobase-z4s "needs the gateway base URL" \
+    --harness codex --model pool:muse
+  FLEET_LLM_BASE="$POOL_BASE" check_refusal pool-refuse-badname-z4s "bad pool name" \
+    --harness codex --model pool:Bad_Name
+  [ "$(cat "$CASE_DIR/curl.log")" = "$POOL_BASE/nope/status"$'\n'"$POOL_BASE/free/status" ] \
+    || fail "only the two refusals that need a lookup may query the status endpoint: $(cat "$CASE_DIR/curl.log")"
+  pass "pool model refusals happen before any endpoint, record, or launch"
+}
+
 # Codex parks a crewmate launch forever on its unanswerable hook-trust modal
 # unless the launch turns the hook layer off. These two cases pin the split:
 # a crewmate runs hook-free, a secondmate keeps the project hooks that carry its
@@ -2212,6 +2425,11 @@ test_claude_threads_model_and_effort
 test_codex_threads_model_and_effort
 test_codex_threads_model_and_max_effort
 test_codex_omits_max_effort_for_unsupported_model
+test_codex_pool_resolves_the_status_model_and_routes_the_launch
+test_codex_pool_explicit_model_skips_the_status_lookup
+test_codex_pool_uses_the_resolved_model_for_max_effort
+test_plain_codex_launch_is_unchanged_by_pool_support
+test_codex_pool_refusals_happen_before_launch
 test_codex_crewmate_launch_disables_the_hook_layer
 test_codex_secondmate_launch_keeps_the_hook_layer
 test_grok_threads_model_and_reasoning_effort
