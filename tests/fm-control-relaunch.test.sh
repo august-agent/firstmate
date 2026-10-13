@@ -873,6 +873,77 @@ test_explicit_model_wins_over_the_recorded_one() {
   pass "fm-control relaunch: explicit model and effort win over the recorded ones"
 }
 
+# A pool gateway's status endpoint, standing in for curl: one known pool, and a
+# 404-style failure for anything else. Every requested URL is logged. The home's
+# config/codex-pool-base names the gateway, so no ambient base may override it.
+unset FLEET_LLM_BASE
+make_pool_status_stub() {  # <case-dir>
+  cat > "$1/fakebin/curl" <<SH
+#!/usr/bin/env bash
+url=
+for a in "\$@"; do url=\$a; done
+printf '%s\n' "\$url" >> '$1/fake/curl.log'
+case "\$url" in
+  'https://pool.example.test/llm/muse/status') printf '%s' '{"models":["meta/muse-spark-1.3-contributor"]}' ;;
+  *) exit 22 ;;
+esac
+SH
+  chmod +x "$1/fakebin/curl"
+  mkdir -p "$1/home/config"
+  printf '%s\n' 'https://pool.example.test/llm' > "$1/home/config/codex-pool-base"
+}
+
+test_codex_pool_relaunch_records_the_resolved_pool_and_reuses_it() {
+  local dir out rc id=rl-pool
+  dir=$(new_case codex-pool "$id")
+  add_ship_task "$dir" "$id" codex
+  printf codex > "$dir/fake/command"
+  printf codex > "$dir/fake/becomes"
+  make_pool_status_stub "$dir"
+  out=$(run_control "$dir" "$id" relaunch --model pool:muse --note "move onto the pool"); rc=$?
+  expect_code 0 "$rc" "a relaunch onto a codex pool should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" model)" = pool:muse:meta/muse-spark-1.3-contributor ] \
+    || fail "the relaunch did not record the resolved pool model: $(meta_field "$dir" "$id" model)"
+  assert_contains "$(cat "$dir/fake/literal")" "'model_provider=fleet-muse'" \
+    "the relaunched codex did not receive the pooled provider"
+  [ "$(cat "$dir/fake/curl.log")" = https://pool.example.test/llm/muse/status ] \
+    || fail "the pool model was not resolved exactly once: $(cat "$dir/fake/curl.log")"
+
+  : > "$dir/fake/literal"
+  out=$(run_control "$dir" "$id" relaunch --note "recover on the same pool"); rc=$?
+  expect_code 0 "$rc" "a recovery relaunch on the recorded pool should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" "$id" model)" = pool:muse:meta/muse-spark-1.3-contributor ] \
+    || fail "a recovery relaunch lost the recorded pool model"
+  assert_contains "$(cat "$dir/fake/literal")" "--model 'meta/muse-spark-1.3-contributor'" \
+    "the recovery relaunch did not reuse the recorded pool model"
+  [ "$(wc -l < "$dir/fake/curl.log" | tr -d ' ')" = 1 ] \
+    || fail "a recovery relaunch looked the pool model up again: $(cat "$dir/fake/curl.log")"
+  pass "fm-control relaunch: a codex pool model is resolved, recorded, and reused on recovery"
+}
+
+test_codex_pool_relaunch_refusals_happen_before_the_agent_stops() {
+  local dir out rc
+  dir=$(new_case pool-claude rl-pool-claude)
+  add_ship_task "$dir" rl-pool-claude claude
+  make_pool_status_stub "$dir"
+  out=$(run_control "$dir" rl-pool-claude relaunch --model pool:muse --note "x"); rc=$?
+  expect_code 1 "$rc" "a pool model on claude should refuse"
+  assert_contains "$out" "applies only to --harness codex" "the refusal should name the codex-only scope"
+  [ "$(cat "$dir/fake/command")" = claude ] || fail "a refused pool relaunch stopped the agent"
+  [ ! -s "$dir/fake/literal" ] || fail "a refused pool relaunch sent lifecycle input"
+
+  dir=$(new_case pool-unknown rl-pool-unknown)
+  add_ship_task "$dir" rl-pool-unknown codex
+  printf codex > "$dir/fake/command"
+  make_pool_status_stub "$dir"
+  out=$(run_control "$dir" rl-pool-unknown relaunch --model pool:nope --note "x"); rc=$?
+  expect_code 1 "$rc" "an unreachable pool should refuse"
+  assert_contains "$out" "codex pool 'nope' did not answer" "the refusal should name the unreachable pool"
+  [ "$(cat "$dir/fake/command")" = codex ] || fail "an unreachable pool stopped the agent"
+  [ ! -s "$dir/fake/literal" ] || fail "an unreachable pool relaunch sent lifecycle input"
+  pass "fm-control relaunch: codex pool refusals happen before the running agent stops"
+}
+
 test_relaunch_onto_an_unverified_harness_is_refused() {
   local dir out rc
   dir=$(new_case badharness rl8)
@@ -2551,6 +2622,8 @@ test_worker_account_pin_follows_the_relaunch
 test_pi_exclude_tools_follow_the_relaunch
 test_exclude_tools_refusals_happen_before_the_agent_stops
 test_explicit_model_wins_over_the_recorded_one
+test_codex_pool_relaunch_records_the_resolved_pool_and_reuses_it
+test_codex_pool_relaunch_refusals_happen_before_the_agent_stops
 test_relaunch_onto_an_unverified_harness_is_refused
 test_prior_harness_turnend_registry_entry_is_cleared
 test_wiring_removal_failure_refuses_before_replacement_arm

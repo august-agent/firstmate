@@ -9,7 +9,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | --- | --- |
 | Firstmate's code, private files, or project location | [FM_HOME](#fm_home) and [operational home layout](#operational-home-layout-and-state) |
 | Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend) and [harness support](#harness-support) |
-| Worker permissions, accounts, or environment | [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), and [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist) |
+| Worker permissions, accounts, or environment | [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [codex pooled providers](#codex-pooled-providers-configcodex-pool-base), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), and [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
@@ -964,6 +964,44 @@ Pins are not inherited into secondmate homes: a local secondmate agent launches 
 A remote secondmate is launched on its host from its own home's configuration, so create the file in that remote home.
 
 [`bin/fm-worker-account-lib.sh`](../bin/fm-worker-account-lib.sh) owns parsing, the sign-in check, and the full list of credentials a Claude launch unsets; [runtime backend verification](verification/runtime-backends.md#worker-account-pin-sign-in-check) records the check against the real runners.
+
+## Codex pooled providers (config/codex-pool-base)
+
+A codex worker can run on an OpenAI-compatible pooled gateway instead of Codex's own provider, on the same verified codex adapter, trust handling, and lifecycle.
+Select it with the model axis: `fm-spawn.sh ... --harness codex --model pool:<pool>`, or `fm-control.sh <id> relaunch --harness codex --model pool:<pool>`.
+Every codex launch without a `pool:` model is unchanged.
+
+### Model syntax and resolution
+
+`pool:<pool>` uses the model the pool advertises: Firstmate reads `<base>/<pool>/status` and takes the first entry of its `models` list.
+`pool:<pool>:<model>` names the model explicitly and skips that lookup; everything after the second colon is the model id, so ids containing colons work.
+A pool name is lowercase letters, digits, and dashes, starting with a letter, up to 32 characters.
+
+A pool that reports `freeOnly` or no models has no fixed model, so it needs the explicit form.
+The task record's `model=` line stores the resolved `pool:<pool>:<model>`, so a recovery relaunch reuses the same pool and model without another lookup.
+
+### Gateway base
+
+`FLEET_LLM_BASE` in the launching environment wins.
+Otherwise the first non-blank line not starting with `#` in the local, gitignored `config/codex-pool-base` names the base, for example `https://gateway.example/llm`.
+It must be an `http` or `https` URL; one trailing slash is dropped.
+Firstmate has no built-in gateway host.
+The file is not inherited into secondmate homes; create it in each home that dispatches pooled workers, or export `FLEET_LLM_BASE`.
+
+### Launch and credentials
+
+The launch passes `--model <model>` plus `-c` overrides that point `model_provider` at a provider named `fleet-<pool>` with base URL `<base>/<pool>/v1`, `env_key=FLEET_LLM_KEY`, `wire_api=responses`, and a 300000 ms stream idle timeout.
+It also sets `features.apps=false`, because some pooled providers reject the long tool names of Codex's app connectors.
+
+The gateway supplies the real provider key, so the launch sets `FLEET_LLM_KEY` to a placeholder unless the destination pane already has a value; that value is never written into the launch command.
+
+### Refusals
+
+A `pool:` model on any other harness or on a raw launch command refuses, as do a missing or invalid base, an unreachable status endpoint, and a pool with no fixed model.
+These refusals happen before any endpoint, local copy, or task record exists, and before a relaunch stops the running worker.
+Resolving `pool:<pool>` needs `curl` and `jq`; the explicit form needs neither.
+
+[`bin/fm-codex-pool-lib.sh`](../bin/fm-codex-pool-lib.sh) owns the syntax, resolution, and exact launch flags, with regression coverage in [`tests/fm-spawn-dispatch-profile.test.sh`](../tests/fm-spawn-dispatch-profile.test.sh) and [`tests/fm-control-relaunch.test.sh`](../tests/fm-control-relaunch.test.sh).
 
 ## Lavish server address (config/lavish-axi-host)
 

@@ -79,6 +79,10 @@
 #              The same pre-stop refusal applies to this home's worker tool
 #              exclusions (bin/fm-exclude-tools-lib.sh): a malformed list, or a
 #              replacement runtime that cannot hide the listed tools.
+#              A codex pool:<pool>[:<model>] model (bin/fm-codex-pool-lib.sh)
+#              resolves here too, so an unreachable gateway or a pool model on
+#              another harness refuses before the old agent stops, and the
+#              launch receives the concrete pool:<pool>:<model>.
 #              --note is required for a ship or scout, whose replacement
 #              inherits the local copy but none of the conversation; a
 #              secondmate reconciles its own home's records at startup, so its
@@ -181,6 +185,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
 # shellcheck source=bin/fm-exclude-tools-lib.sh
 . "$SCRIPT_DIR/fm-exclude-tools-lib.sh"
+# shellcheck source=bin/fm-codex-pool-lib.sh
+. "$SCRIPT_DIR/fm-codex-pool-lib.sh"
 
 POLL=${FM_CONTROL_POLL:-0.5}
 SETTLE_WAIT=${FM_CONTROL_SETTLE_WAIT:-5}
@@ -953,6 +959,13 @@ resolve_relaunch_profile() {
   fi
   if [ "$TARGET_EFFORT" = ultra ]; then
     "$SCRIPT_DIR/fm-harness.sh" validate-native-effort "$TARGET_HARNESS" "$TARGET_MODEL" "$TARGET_EFFORT" || return 1
+  fi
+  # A codex pool model resolves to its concrete pool:<pool>:<model> while
+  # nothing has changed yet (bin/fm-codex-pool-lib.sh); a recorded concrete
+  # spec resolves without a lookup.
+  if fm_codex_pool_is_spec "$TARGET_MODEL"; then
+    fm_codex_pool_resolve "$TARGET_MODEL" "$TARGET_HARNESS" "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" || return 1
+    TARGET_MODEL=$FM_CODEX_POOL_SPEC
   fi
   # The launch owner applies this home's worker account pin too, but only after
   # the old agent has been stopped, so a pin that no longer resolves or is

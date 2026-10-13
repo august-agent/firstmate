@@ -98,6 +98,10 @@
 #   build agent's variant, keyed to the resolved model, inside the
 #   OPENCODE_CONFIG_CONTENT JSON its launch already carries (config schema
 #   verified on opencode 1.18.32); without a model the axis is recorded but omitted.
+#   On a canonical codex launch, --model pool:<pool>[:<model>] routes the worker
+#   through an OpenAI-compatible pooled gateway; bin/fm-codex-pool-lib.sh owns
+#   the syntax, gateway base, model lookup, and launch flags, and the record
+#   stores the resolved pool:<pool>:<model>. Any other harness refuses it.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -705,6 +709,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-project-capacity-lib.sh"
 # shellcheck source=bin/fm-worker-account-lib.sh
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
+# shellcheck source=bin/fm-codex-pool-lib.sh
+. "$SCRIPT_DIR/fm-codex-pool-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -2521,6 +2527,21 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
       esac
     fi
   fi
+fi
+# A pool: model routes a canonical codex launch through an OpenAI-compatible
+# pooled gateway (bin/fm-codex-pool-lib.sh owns the syntax, the gateway base,
+# and the model lookup). Resolve it to the concrete pool:<pool>:<model> before
+# any endpoint, worktree, or record exists, so the record names exactly what
+# runs and a relaunch reuses it without another lookup.
+CODEX_POOL=0
+if fm_codex_pool_is_spec "$MODEL"; then
+  [ "$RAW_LAUNCH" = 0 ] || {
+    echo "error: --model $MODEL requires the canonical --harness codex launch, not a raw launch command" >&2
+    exit 1
+  }
+  fm_codex_pool_resolve "$MODEL" "$HARNESS" "$CONFIG" || exit 1
+  MODEL=$FM_CODEX_POOL_SPEC
+  CODEX_POOL=1
 fi
 # Ultra is an explicit native capability, never a generic thinking-level alias.
 # Validate the fully resolved profile before worktree or endpoint provisioning.
@@ -5581,6 +5602,12 @@ sq_ompcfg=$(shell_quote "${OMP_WORKER_CFG:-$FM_ROOT/.omp/fm-worker-overlay.yml}"
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
+# A resolved pool model replaces codex's plain --model with the pooled-provider
+# flags and names the provider key the gateway expects (fm-codex-pool-lib.sh).
+if [ "$CODEX_POOL" = 1 ]; then
+  MODELFLAG=$(fm_codex_pool_launch_flags "$FM_CODEX_POOL_BASE" "$FM_CODEX_POOL_NAME" "$FM_CODEX_POOL_MODEL")
+  LAUNCH="$(fm_codex_pool_launch_env) $LAUNCH"
+fi
 # A pinned Pi launch confines Pi's model lookup to the declared provider.
 [ -z "$WORKER_ACCOUNT_PROVIDER" ] || MODELFLAG="--provider $(shell_quote "$WORKER_ACCOUNT_PROVIDER") $MODELFLAG"
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL") || exit 1
