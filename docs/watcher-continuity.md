@@ -88,9 +88,11 @@ The hook fires on every Stop.
 On each Stop, an eligible primary with supervision need admits one home-scoped generation owner in an isolated process session.
 The ordinary hook waits for that owner and relays its exit status, retrying untrappable owner deaths within a bounded budget.
 A separate native `asyncRewake` hook (`bin/fm-claude-stop-recovery.sh`) keeps one tokenless recovery monitor per home, so losing the ordinary hook itself does not also lose the only notification channel.
-The ordinary hook waits for monitor readiness before claiming, and completion closes the monitor so sibling hooks cannot hold up feedback.
-The monitor reclaims abandoned `arming` generations through the same generation gate and returns the recovered wake on its own hook channel without requiring another Stop.
-An open supervised generation must prove both its owner and notification transport by process identity; legacy generations retain their existing owner proof.
+The ordinary hook waits for monitor readiness before claiming, routes readiness exhaustion through the bounded failure episode, and closes the monitor on completion so sibling hooks cannot hold up feedback.
+The monitor reclaims only the exact observed generation while it remains abandoned and `arming` under the generation mutex, and returns the recovered wake on its own hook channel without requiring another Stop.
+Its singleton lock revalidates a mismatched process identity under the steal mutex before replacing a reused PID.
+An open supervised generation must prove both its owner and notification transport by process identity; the transport captures its identity before forking and an adopted child refuses startup.
+Legacy generations retain their existing owner proof.
 The owner stops its arm when its transport or session disappears, leaving transport-loss recovery to the independent hook.
 Both hooks remain subject to the host's configured timeout and session teardown; terminating every hook transport or the session itself cannot deliver a wake to that session.
 While supervision is still needed and away mode remains inactive, an actionable close wakes the idle session through exit 2.

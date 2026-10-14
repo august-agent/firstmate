@@ -2032,6 +2032,179 @@ SH
   pass "auto-arm: a killed arming owner recovers within the original Stop"
 }
 
+
+# Hold the monitor after its initial arming read while the genuine owner commits.
+# The claimant must compare the observed generation again under its write lock.
+test_recovery_does_not_replace_concurrent_rewake() {
+  local dir status=0
+  dir=$(make_primary_dir "$TMP_ROOT/recovery-terminal-race")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  cat >> "$dir/bin/fm-wake-lib.sh" <<'SH'
+eval "$(declare -f fm_autoarm_claim_open | sed '1s/fm_autoarm_claim_open/fixture_claim_open/')"
+fm_autoarm_claim_open() {
+  if [ "${FM_CLAUDE_AUTOARM_RECOVERY_WATCH:-0}" = 1 ] && [ ! -e "$FM_HOME/read-barrier" ]; then
+    touch "$FM_HOME/read-barrier"
+    while [ ! -e "$FM_HOME/commit-done" ]; do sleep 0.1; done
+  fi
+  fixture_claim_open "$@"
+}
+SH
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    . "$FM_HOME/bin/fm-wake-lib.sh"
+    fm_autoarm_claim_next "$FM_HOME/state" || exit 10
+    generation=$FM_AUTOARM_MY_GEN
+    "$FM_HOME/bin/fm-claude-stop-recovery.sh" </dev/null > "$FM_HOME/recovery.out" 2>&1 & recovery=$!
+    for ((i=0; i<200; i++)); do [ -e "$FM_HOME/read-barrier" ] && break; sleep 0.1; done
+    [ -e "$FM_HOME/read-barrier" ] || { kill "$recovery"; exit 11; }
+    fm_autoarm_write_owned "$FM_HOME/state" "$generation" rewake || exit 12
+    touch "$FM_HOME/commit-done"
+    wait "$recovery"
+  ' || status=$?
+  expect_code 0 "$status" "a concurrently committed rewake must close recovery silently"
+  [ "$(epoch_field "$dir" epoch)" = 1 ] || fail "recovery replaced a terminal generation"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "recovery changed the committed outcome"
+  assert_absent "$dir/state/arm-ran" "recovery armed after the owner committed rewake"
+  pass "auto-arm: recovery compare-and-claim preserves a concurrent terminal commit"
+}
+
+test_recovery_reclaims_reused_monitor_pid() {
+  local dir status=0
+  dir=$(make_primary_dir "$TMP_ROOT/reused-monitor")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    mkdir "$FM_HOME/state/old-monitor"
+    printf "%s\n" "$$" > "$FM_HOME/state/old-monitor/pid"
+    printf "different-process-identity\n" > "$FM_HOME/state/old-monitor/pid-identity"
+    ln -s "$FM_HOME/state/old-monitor" "$FM_HOME/state/.claude-autoarm-recovery.lock"
+    "$FM_HOME/bin/fm-claude-stop-recovery.sh" </dev/null > "$FM_HOME/recovery.out" 2>&1 & recovery=$!
+    FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1 "$FM_HOME/bin/fm-claude-stop-autoarm.sh" </dev/null > "$FM_HOME/ordinary.out" 2>&1
+    rc=$?
+    wait "$recovery"
+    kill -0 "$$" || exit 20
+    exit "$rc"
+  ' || status=$?
+  expect_code 2 "$status" "replacement monitor must permit the ordinary wake"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "reused monitor pid prevented an arm"
+  assert_absent "$dir/state/.claude-autoarm-recovery.lock" "replacement monitor leaked its lock"
+  pass "auto-arm: stale monitor identity is reclaimed without signalling the live unrelated pid"
+}
+
+test_missing_monitor_uses_bounded_failure_episode() {
+  local dir out status=0
+  dir=$(make_primary_dir "$TMP_ROOT/missing-monitor")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  out=$(FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1 run_autoarm "$dir" 2>/dev/null) || status=$?
+  expect_code 2 "$status" "readiness exhaustion must request the first failure wake"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "missing monitor bypassed the durable failure episode"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "missing monitor left no terminal failure"
+  : > "$dir/state/.claude-autoarm-failure-alarmed"
+  status=0
+  out=$(FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1 run_autoarm "$dir" 2>/dev/null) || status=$?
+  expect_code 0 "$status" "an attended readiness failure must stop automatic continuation"
+  [ -z "$out" ] || fail "attended readiness failure repeated its notice"
+  assert_absent "$dir/state/arm-ran" "missing readiness started an unprotected arm"
+  pass "auto-arm: missing monitor readiness follows the bounded failure episode"
+}
+
+# Intercept fork in the fixture Perl interpreter to hold the child before init.
+# The entry wrapper counts actual script starts, independent of scope gates.
+test_transport_death_before_child_initialization() {
+  local dir harness child transport i status=0 real_perl
+  dir=$(make_primary_dir "$TMP_ROOT/fork-parent-death")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  real_perl=$(command -v perl)
+  mkdir "$dir/fakebin"
+  cat > "$dir/ForkBarrier.pm" <<'PERL'
+package ForkBarrier;
+use strict;
+use warnings;
+BEGIN {
+  *CORE::GLOBAL::fork = sub {
+    my $parent = $$;
+    my $pid = CORE::fork();
+    if (defined($pid) && !$pid) {
+      open my $fh, ">", "$ENV{FM_HOME}/fork-child" or die $!;
+      print {$fh} "$$ $parent\n";
+      close $fh;
+      select undef, undef, undef, 0.1 until -e "$ENV{FM_HOME}/release-child";
+    }
+    return $pid;
+  };
+}
+1;
+PERL
+  cat > "$dir/fakebin/perl" <<'SH'
+#!/usr/bin/env bash
+if [[ "$1" == -MPOSIX=setsid,WIFSIGNALED,* ]]; then
+  exec "$REAL_PERL" -I"$FM_HOME" -MForkBarrier "$@"
+fi
+exec "$REAL_PERL" "$@"
+SH
+  chmod +x "$dir/fakebin/perl"
+  mv "$dir/bin/fm-claude-stop-autoarm.sh" "$dir/bin/autoarm-implementation.sh"
+  cat > "$dir/bin/fm-claude-stop-autoarm.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >> "$FM_HOME/entry-starts"
+exec "$FM_HOME/bin/autoarm-implementation.sh" "$@"
+SH
+  chmod +x "$dir/bin/fm-claude-stop-autoarm.sh"
+  FM_HOME="$dir" REAL_PERL="$real_perl" PATH="$dir/fakebin:$PATH" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    "$FM_HOME/bin/fm-claude-stop-autoarm.sh" </dev/null
+  ' > "$dir/harness.out" 2>&1 & harness=$!
+  child=
+  trap 'touch "$dir/release-child"; kill "$harness" ${child:+"$child"} 2>/dev/null || true; fm_test_cleanup' EXIT
+  for i in $(seq 1 200); do [ -s "$dir/fork-child" ] && break; sleep 0.1; done
+  assert_present "$dir/fork-child" "fork barrier was not reached"
+  read -r child transport < "$dir/fork-child"
+  kill -KILL "$transport" || fail "could not kill the recorded fork parent"
+  wait "$harness" || status=$?
+  expect_code 137 "$status" "fixture transport must actually die"
+  touch "$dir/release-child"
+  for i in $(seq 1 100); do bash -c '. "$1"; fm_pid_alive "$2"' _ "$dir/bin/fm-wake-lib.sh" "$child" || break; sleep 0.1; done
+  bash -c '. "$1"; fm_pid_alive "$2"' _ "$dir/bin/fm-wake-lib.sh" "$child" && fail "orphaned pre-init owner did not retire"
+  [ "$(wc -l < "$dir/entry-starts" | tr -d ' ')" = 1 ] || fail "orphaned child entered owner startup with a replacement parent"
+  assert_absent "$dir/state/.claude-autoarm-epoch" "orphaned child claimed a generation"
+  trap fm_test_cleanup EXIT
+  pass "auto-arm: transport death before child initialization refuses owner startup"
+}
+
+
+test_recovery_owner_retries_keep_the_generation_fence() {
+  local dir out status=0
+  dir=$(make_primary_dir "$TMP_ROOT/recovery-owner-budget")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  printf 'epoch=1 owner_pid=9999999 outcome=arming updated_at=1\ndead-owner\n' > "$dir/state/.claude-autoarm-epoch"
+  cat > "$dir/config/x-mode.env" <<'SH'
+pgid=$(ps -o pgid= -p "$$" | tr -d '[:space:]')
+[ "$pgid" = "$$" ] || exit 1
+printf '%s\n' "$$" >> "$FM_HOME/state/killed-owners"
+kill -KILL -- "-$$"
+SH
+  out=$(FM_CLAUDE_AUTOARM_EXPECTED_GEN=1 run_autoarm "$dir" 2>/dev/null) || status=$?
+  expect_code 2 "$status" "recovery transport must exhaust its own bounded owner retry budget"
+  [ "$(wc -l < "$dir/state/killed-owners" | tr -d ' ')" -eq 2 ] || fail "recovery transport abandoned its retry budget after the first owner death"
+  [ "$(epoch_field "$dir" epoch)" = 4 ] || fail "recovery retries lost their generation fence"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "recovery owner deaths stranded arming"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "recovery retries lost durable failure evidence"
+  assert_contains "$out" 'auto-arm FAILED' "recovery transport lost the bounded failure wake"
+  pass "auto-arm: recovery owner retries advance only their own generation fence and finish bounded"
+}
+
+test_recovery_owner_retries_keep_the_generation_fence
+
+test_recovery_does_not_replace_concurrent_rewake
+test_recovery_reclaims_reused_monitor_pid
+test_missing_monitor_uses_bounded_failure_episode
+test_transport_death_before_child_initialization
+
 test_recovery_hook_closes_with_normal_delivery
 test_recovery_hook_survives_notification_transport_death
 test_killed_owner_recovers_without_another_stop

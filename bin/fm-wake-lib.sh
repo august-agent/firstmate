@@ -1943,9 +1943,10 @@ fm_autoarm_midturn_healthy() {  # <state-dir> [grace]
 # short micro-mutex hold. Returns 0 with FM_AUTOARM_MY_GEN set on success, 2
 # when a competing claimant won the race (the ledger holds an open claim), and
 # 1 when the micro-mutex is contended, the mandatory identity cannot be
-# computed, or the write failed.
-fm_autoarm_claim_next() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp transport='' transport_identity=''
+# computed, or the write failed. An optional expected generation restricts
+# recovery to that still-arming, abandoned generation under the same mutex.
+fm_autoarm_claim_next() {  # <state-dir> [grace] [expected-abandoned-generation]
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} expected=${3:-} lock epoch pid gen identity tmp transport='' transport_identity=''
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
@@ -1956,10 +1957,21 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
   identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
   if [ "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" = "$PPID" ]; then
-    transport_identity=$(fm_pid_identity "$PPID" 2>/dev/null) || return 1
+    transport_identity=${FM_CLAUDE_AUTOARM_TRANSPORT_IDENTITY:-}
+    [ -n "$transport_identity" ] || return 1
+    [ "$(fm_pid_identity "$PPID" 2>/dev/null)" = "$transport_identity" ] || return 1
     transport=" transport_pid=$PPID"
   fi
   fm_lock_try_acquire "$lock" || return 1
+  # A recovery monitor may only replace the exact abandoned arming generation
+  # it observed. A terminal commit or another claimant wins this race.
+  if [ -n "$expected" ]; then
+    if ! fm_autoarm_ledger_read "$state" || [ "$FM_AUTOARM_GEN" != "$expected" ] \
+      || [ "$FM_AUTOARM_OUTCOME" != arming ]; then
+      fm_lock_release "$lock"
+      return 2
+    fi
+  fi
   if fm_autoarm_claim_open "$state" "$grace"; then
     fm_lock_release "$lock"
     return 2
