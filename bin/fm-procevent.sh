@@ -1500,17 +1500,62 @@ start_owner_guard() {  # <source-id>
   return 1
 }
 
-# A live lock holder is independent owner evidence, even across a watcher gap.
-# Keep this proof inside the guard: public runner operations still cannot
-# refresh their own lease. Reject the runner's group and the guard itself.
+# A live lock holder is independent owner evidence only when its acquisition
+# recorded this process-start identity. An old pid alone is not proof. The
+# provenance check follows ancestry across group changes and rejects the
+# inherited runner marker even after a detached child has been reparented.
+# Unreadable identity, ancestry, or environment falls back to the lease.
+owner_process_independent() {  # <holder-pid> <runner-pid>
+  local holder=$1 candidate=$1 parent depth=0
+  while [ "$candidate" -gt 1 ] && [ "$depth" -lt 128 ]; do
+    [ "$candidate" != "$2" ] && [ "$candidate" != "$$" ] || return 1
+    parent=$(ps -o ppid= -p "$candidate" 2>/dev/null | tr -d '[:space:]') || return 1
+    case "$parent" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$parent" != "$candidate" ] && [ "$parent" -gt 0 ] || return 1
+    candidate=$parent
+    depth=$((depth + 1))
+  done
+  [ "$candidate" -eq 1 ] || return 1
+  if [ -d /proc/self ]; then
+    # Never print environment bytes: only the predicate's exit status escapes.
+    perl -e '
+      open my $in, "<", $ARGV[0] or exit 1;
+      local $/; my $env = <$in>;
+      defined($env) && length($env) or exit 1;
+      my $marked = grep { $_ eq "FM_PROCEVENT_IN_RUNNER=1" } split /\0/, $env;
+      exit($marked ? 1 : 0);
+    ' "/proc/$holder/environ"
+  else
+    # BSD ps exposes the inherited environment after argv. Require a visible
+    # PATH entry as evidence that environment inspection succeeded, and treat
+    # an ambiguous marker in argv conservatively as runner provenance too.
+    (
+      set -o pipefail
+      ps eww -p "$holder" -o command= 2>/dev/null | perl -e '
+        local $/; my $env = <STDIN>;
+        defined($env) && length($env) or exit 1;
+        $env =~ /(?:^|\s)PATH=\S+/ or exit 1;
+        exit($env =~ /(?:^|\s)FM_PROCEVENT_IN_RUNNER=1(?:\s|$)/ ? 1 : 0);
+      '
+    )
+  fi
+}
+
 owner_lock_present() {  # <runner-pid>
-  local group
+  local holder identity recorded_pid recorded_identity sidecar="$STATE/.lock-identity"
   fm_session_lock_inspect "$STATE"
   [ "$FM_LOCK_INSPECT_STATE" = held ] || return 1
-  [ "$FM_LOCK_INSPECT_PID" != "$$" ] || return 1
-  group=$(ps -o pgid= -p "$FM_LOCK_INSPECT_PID" 2>/dev/null | tr -d '[:space:]') || return 1
-  case "$group" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$group" != "$1" ]
+  holder=$FM_LOCK_INSPECT_PID
+  [ -f "$sidecar" ] && [ ! -L "$sidecar" ] || return 1
+  recorded_pid=$(sed -n '1p' "$sidecar") || return 1
+  recorded_identity=$(sed -n '2p' "$sidecar") || return 1
+  [ "$recorded_pid" = "$holder" ] && [ -n "$recorded_identity" ] || return 1
+  identity=$(fm_pid_identity "$holder") || return 1
+  [ "$identity" = "$recorded_identity" ] || return 1
+  owner_process_independent "$holder" "$1" || return 1
+  # Recheck after the provenance walk so a changing holder cannot borrow it.
+  [ "$(sed -n '1p' "$STATE/.lock" 2>/dev/null)" = "$holder" ] || return 1
+  [ "$(fm_pid_identity "$holder")" = "$identity" ]
 }
 
 # The runner's owner guard, which bounds an accidentally orphaned detached

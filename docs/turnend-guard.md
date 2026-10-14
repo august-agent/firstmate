@@ -386,7 +386,7 @@ An upgrade mid-session can therefore neither double-arm nor deadlock, and a fail
 Fresh `failed` and `failed-suppressed` outcomes enter or advance the failure progression instead of acting as unconditional recovery proof.
 The auto-arm itself rechecks the healthy watcher predicate and retries a bounded number of times before reporting a genuine failure, with one second of backoff before the second attempt and two before the third.
 An unexpected shell exit while its generation is still `arming` uses the remaining attempt budget and ordinary durable failure handoff, instead of leaving a dead owner recorded as arming.
-This fallback disables its own EXIT trap to prevent recursive recovery and accepts an already healthy watcher without starting another arm.
+This fallback disables its own EXIT trap to prevent recursive recovery; a retry attaches to an already healthy watcher and keeps following its wake instead of starting a second watcher or abandoning delivery.
 Untrappable termination such as SIGKILL still requires a later Stop firing to reclaim the dead generation.
 
 The foreground arm legitimately follows a healthy watcher until its next wake.

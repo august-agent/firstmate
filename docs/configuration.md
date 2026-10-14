@@ -2279,9 +2279,10 @@ Detaching a runner into its own process group is what lets a persistent source o
 - A home's process-event state carries a lease that registration, attached start, reconciliation, acknowledgement, and listing refresh.
 - An attached public `start` continues refreshing the lease while its caller remains attached.
 - Each runner fails closed unless a small guard starts successfully beside it in a separate process group.
-- That guard requires the state root to retain the device/inode identity recorded by the runner's claim, and accepts either a fresh lease or a live home lock holder verified by the same inspection used by `fm-lock.sh`.
+- That guard requires the state root to retain the device/inode identity recorded by the runner's claim, and accepts either a fresh lease or a live home lock holder whose acquisition-time process identity still matches (`fm-lock.sh` owns the `.lock-identity` record).
 - The lock-holder check runs independently of the watcher, so a watcher gap does not expire a healthy home's listener; it does not write or extend the lease.
-- The guard rejects itself and any holder in the runner's process group as owner evidence, so a source cannot keep itself alive by writing its child into the home lock.
+- The guard rejects itself, runner descendants across process-group changes, and holders carrying `FM_PROCEVENT_IN_RUNNER=1`, including reparented children.
+- Missing identity records or unreadable provenance fall back to the lease; an existing home gains the identity record on its next successful `fm-lock.sh` acquisition or ownership confirmation.
 - Two consecutive reads unable to prove both the root identity and either form of owner presence initiate the verified stop, so one unreadable read cannot kill a live runner.
 - Those two reads are spaced half a check interval apart, so the pair the debounce requires completes inside one check interval instead of costing two of them.
 

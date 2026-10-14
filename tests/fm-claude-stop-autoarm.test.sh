@@ -697,11 +697,11 @@ test_unexpected_hook_exit_recovers_owned_generation() {
   pass "auto-arm: unexpected hook exit retries and records the ordinary failure"
 }
 
-test_exit_recovery_does_not_arm_over_healthy_watcher() {
+test_exit_recovery_attaches_to_healthy_watcher() {
   local dir out status pid identity
   dir=$(make_primary_dir "$TMP_ROOT/exit-healthy")
   : > "$dir/state/task.meta"
-  write_arm_fixture "$dir" failed
+  write_arm_fixture "$dir" attached-delivered
   sleep 60 &
   pid=$!
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify watcher"
@@ -711,11 +711,85 @@ test_exit_recovery_does_not_arm_over_healthy_watcher() {
   out=$(run_autoarm "$dir" 2>/dev/null); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  expect_code 0 "$status" "healthy watcher must make EXIT recovery silent"
-  [ -z "$out" ] || fail "healthy recovery emitted a failure"
-  assert_absent "$dir/state/arm-ran" "EXIT recovery started an arm over a healthy watcher"
-  [ "$(epoch_outcome "$dir")" = clean ] || fail "healthy EXIT recovery stranded arming"
-  pass "auto-arm: EXIT recovery accepts a healthy watcher without another arm"
+  expect_code 2 "$status" "healthy EXIT recovery must attach and deliver the wake"
+  assert_contains "$out" "fixture peer cycle ended" "attached wake was abandoned"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 1 ] || fail "EXIT recovery exceeded its remaining attempt budget"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "healthy EXIT recovery did not deliver its wake"
+  pass "auto-arm: EXIT recovery follows a healthy watcher and delivers its wake"
+}
+
+test_late_watcher_is_attached_and_delivers_wake() {
+  local dir fakebin real_sleep hook watcher i status out
+  dir=$(make_primary_dir "$TMP_ROOT/late-watcher")
+  # Real arm and watcher, with all production dependencies in this private home.
+  cp -R "$ROOT/bin/." "$dir/bin/"
+  mv "$dir/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm-real.sh"
+  : > "$dir/state/task.meta"
+  fakebin=$(fm_fakebin "$dir/tools")
+  real_sleep=$(command -v sleep)
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  cat > "$fakebin/sleep" <<SH
+#!/usr/bin/env bash
+if [ "\${FM_TEST_LATE_HOME:-}" = "$dir" ] && [ "\${1:-}" = 1 ] && [ ! -e "$dir/continue" ]; then
+  : > "$dir/backoff"
+  for _ in \$(seq 1 300); do
+    [ -e "$dir/continue" ] && break
+    "$real_sleep" 0.1
+  done
+fi
+exec "$real_sleep" "\$@"
+SH
+  cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${FM_WATCH_PREDECESSOR_ARM_PID:-}" ]; then
+  printf 'watcher: started pid=%s\n' "$$"
+  exit 0
+fi
+if [ ! -e "$FM_HOME/first-arm" ]; then
+  : > "$FM_HOME/first-arm"
+  exit 0
+fi
+"$FM_HOME/bin/fm-watch-arm-real.sh" > "$FM_HOME/attached.log" 2>&1
+rc=$?
+cat "$FM_HOME/attached.log"
+exit "$rc"
+SH
+  chmod +x "$fakebin/sleep" "$fakebin/tmux" "$dir/bin/fm-watch-arm.sh"
+  PATH="$fakebin:$PATH" FM_TEST_LATE_HOME="$dir" run_autoarm_bg "$dir" "$dir/hook.out"
+  hook=$RUN_AUTOARM_BG_PID
+  watcher=
+  trap 'kill "$hook" ${watcher:+"$watcher"} 2>/dev/null || true; fm_test_cleanup' EXIT
+  for i in $(seq 1 100); do [ -e "$dir/backoff" ] && break; sleep 0.1; done
+  assert_present "$dir/backoff" "hook did not reach backoff after the arm died"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$dir/bin/fm-watch.sh" > "$dir/watch.out" 2>&1 &
+  watcher=$!
+  for i in $(seq 1 200); do [ -e "$dir/state/.last-watcher-beat" ] && break; sleep 0.1; done
+  FM_HOME="$dir" bash -c '. "$1"; fm_watcher_healthy "$2" "$3" 300 "$4"' _ \
+    "$dir/bin/fm-wake-lib.sh" "$dir/state" "$dir/bin/fm-watch.sh" "$dir" \
+    || fail "late watcher was not identity-verified healthy during backoff"
+  touch "$dir/continue"
+  for i in $(seq 1 200); do
+    grep -q "watcher: attached pid=$watcher" "$dir/attached.log" 2>/dev/null && break
+    sleep 0.1
+  done
+  assert_contains "$(cat "$dir/attached.log" 2>/dev/null)" "watcher: attached pid=$watcher" "retry did not attach to the late watcher"
+  [ "$(cat "$dir/state/.watch.lock/pid")" = "$watcher" ] || fail "retry replaced the healthy watcher"
+  printf 'done: late watcher delivered\n' > "$dir/state/task.status"
+  for i in $(seq 1 200); do kill -0 "$hook" 2>/dev/null || break; sleep 0.1; done
+  kill -0 "$hook" 2>/dev/null && fail "attached watcher did not wake the hook"
+  status=0; wait "$hook" || status=$?
+  wait "$watcher" 2>/dev/null || true
+  trap fm_test_cleanup EXIT
+  out=$(cat "$dir/hook.out")
+  expect_code 2 "$status" "late watcher's actionable wake must become a continuation"
+  assert_contains "$out" "signal: $dir/state/task.status" "late watcher wake was not translated"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "late watcher wake was not committed"
+  pass "auto-arm: late healthy watcher is attached without replacement and its wake is delivered"
 }
 
 test_post_alarm_actionable_close_is_suppressed() {
@@ -1816,7 +1890,8 @@ test_failure_notice_marker_write_refuses_delivery_and_retries
 test_unverified_clean_close_exhausts_retries
 test_silent_arm_exit_has_bounded_backoff
 test_unexpected_hook_exit_recovers_owned_generation
-test_exit_recovery_does_not_arm_over_healthy_watcher
+test_exit_recovery_attaches_to_healthy_watcher
+test_late_watcher_is_attached_and_delivers_wake
 test_post_alarm_actionable_close_is_suppressed
 test_benign_cycle_end_with_live_watcher_is_silent
 test_positive_recovery_budget_contention_preserves_episode

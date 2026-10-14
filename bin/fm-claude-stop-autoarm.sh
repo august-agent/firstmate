@@ -417,7 +417,7 @@ run_autoarm_attempts() {
     fi
     if [ "$attempt" -gt 0 ]; then
       # Keep the open generation while backing off; concurrent Stop hooks defer.
-      # A watcher recovered during that interval needs no second arm invocation.
+      # A late watcher is attached by the next arm invocation.
       sleep "$attempt"
       fm_autoarm_still_owner "$STATE" "$MY_GEN" || exit 0
       if [ -e "$STATE/.afk" ]; then
@@ -426,11 +426,8 @@ run_autoarm_attempts() {
         exit 0
       fi
       need_supervision || break
-      if [ "$HOST_MODE" -eq 0 ] \
-        && fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"; then
-        HEALTHY=1
-        break
-      fi
+      # fm-watch-arm attaches to a verified late watcher instead of starting
+      # another. Keep following it: health alone cannot deliver its next wake.
     fi
     attempt=$((attempt + 1))
     [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
@@ -628,11 +625,6 @@ handle_autoarm_exit() {
   if [ -e "$STATE/.afk" ]; then
     autoarm_record afk
     exit 0
-  fi
-  if [ "$HOST_MODE" -eq 0 ] \
-    && fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"; then
-    HEALTHY=1
-    finish_autoarm
   fi
   # An exit before the first arm still consumes one attempt.
   [ "$attempt" -gt 0 ] || attempt=1
