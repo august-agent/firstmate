@@ -490,7 +490,7 @@ It checks that a newly appended keyed decision is classified without rereading e
 - Stale and live session owners.
 - Unchanged AFK and need boundaries.
 - Single-flight.
-- Bounded failure retries.
+- Bounded failure retries with backoff, silent arm exits, and unexpected shell-exit recovery without duplicate arming.
 - Benign live-watcher cycle ends.
 - One-notice failure episodes.
 - Exit-2 translation.

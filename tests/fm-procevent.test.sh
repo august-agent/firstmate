@@ -3617,6 +3617,60 @@ assert_absent "$TMP_ROOT/unguarded-launches" \
   "a source command ran without a successfully initialized owner guard"
 pass "a runner fails closed when its owner guard cannot initialize"
 
+# A verified home lock holder keeps the listener across a watcher gap without
+# a reconcile or lease refresh. When that holder dies, the already-expired
+# lease must again bound the runner. Use a real process with a harness-shaped
+# executable, exactly as the portable lock tests do; no tmux server is used.
+HLOCK="$TMP_ROOT/lock-owner"; new_home "$HLOCK"
+LOCK_BIN=$(fm_fakebin "$TMP_ROOT/lock-owner-bin")
+ln -s /bin/bash "$LOCK_BIN/claude"
+# shellcheck disable=SC2016 # Variables expand inside the fixture harness.
+"$LOCK_BIN/claude" -c 'sleep 60 & child=$!; trap "kill $child 2>/dev/null; wait $child 2>/dev/null" EXIT; wait' &
+LOCK_OWNER_PID=$!
+trap 'kill "$LOCK_OWNER_PID" 2>/dev/null || true; wait "$LOCK_OWNER_PID" 2>/dev/null || true; fm_test_cleanup' EXIT
+printf '%s\n' "$LOCK_OWNER_PID" > "$HLOCK/state/.lock"
+pe_register "$HLOCK" lavish lock-owner-src -- "$BLOCKER" "$HLOCK/trigger" "lock payload" >/dev/null
+FM_PROCEVENT_OWNER_LEASE_SECONDS=2 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
+  pe "$HLOCK" reconcile >/dev/null
+wait_for "$HLOCK/state/procevent/lock-owner-src.runner" || fail "lock-owned runner never started"
+LOCK_RUNNER_PID=$(cat "$HLOCK/state/procevent/lock-owner-src.runner")
+LOCK_LEASE=$(cat "$HLOCK/state/procevent/.owner-lease")
+sleep 5
+kill -0 "$LOCK_RUNNER_PID" 2>/dev/null || fail "watcher gap expired a listener with a live home lock holder"
+[ "$(cat "$HLOCK/state/procevent/.owner-lease")" = "$LOCK_LEASE" ] || fail "guard refreshed its own lease"
+kill "$LOCK_OWNER_PID"
+wait "$LOCK_OWNER_PID" 2>/dev/null || true
+trap fm_test_cleanup EXIT
+deadline=$((SECONDS + 6))
+while kill -0 "$LOCK_RUNNER_PID" 2>/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "dead home lock holder preserved an orphaned runner"
+  sleep 0.1
+done
+pass "a live home lock survives a watcher gap; its death restores bounded orphan cleanup"
+
+# A source cannot certify its own owner by starting a harness-shaped child in
+# its own process group and writing that child's pid into the home lock.
+HSELFLOCK="$TMP_ROOT/self-lock-owner"; new_home "$HSELFLOCK"
+SELF_LOCK_SOURCE="$TMP_ROOT/self-lock-source.sh"
+cat > "$SELF_LOCK_SOURCE" <<'SH'
+#!/usr/bin/env bash
+"$1" -c 'sleep 60 & wait' &
+printf '%s\n' "$!" > "$FM_HOME/state/.lock"
+wait
+SH
+chmod +x "$SELF_LOCK_SOURCE"
+pe_register "$HSELFLOCK" lavish self-lock-src -- "$SELF_LOCK_SOURCE" "$LOCK_BIN/claude" >/dev/null
+FM_PROCEVENT_OWNER_LEASE_SECONDS=2 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
+  pe "$HSELFLOCK" reconcile >/dev/null
+wait_for "$HSELFLOCK/state/.lock" || fail "source never attempted self-certification"
+SELF_LOCK_RUNNER=$(cat "$HSELFLOCK/state/procevent/self-lock-src.runner")
+deadline=$((SECONDS + 8))
+while kill -0 "$SELF_LOCK_RUNNER" 2>/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "source certified its own owner through a child lock holder"
+  sleep 0.1
+done
+pass "a runner's harness-shaped child cannot certify its own home"
+
 HATTACHED="$TMP_ROOT/attached-owner"; new_home "$HATTACHED"
 fm_test_track_procevent_home "$HATTACHED"
 ATTACHED_TRIGGER="$TMP_ROOT/attached.trigger"

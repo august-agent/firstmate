@@ -217,11 +217,12 @@
 # spawns - running with nobody left to reap it. So every runner starts a small
 # guard beside it, in its own separate process group, which re-reads the owning
 # state root's lease on a bounded cadence and stops the runner's whole process
-# group once that lease can no longer be proved fresh. Owner-presence operations
-# refresh the lease, an attached public start keeps it fresh while its caller
+# group once neither that lease nor the home's verified lock holder proves
+# presence. Owner-presence operations refresh the lease, an attached public start keeps it fresh while its caller
 # remains attached, and the watcher's reconcile cycle keeps it fresh in a live
-# home. A runner exports the inherited FM_PROCEVENT_IN_RUNNER marker and every
-# refresh is skipped under it, so a runner and its ordinary children do not
+# home. The guard also accepts a live home lock holder independently of those
+# refreshes, without writing the lease. A runner exports the inherited
+# FM_PROCEVENT_IN_RUNNER marker and every refresh is skipped under it, so a runner and its ordinary children do not
 # certify their own owner. That rule is CONFUSED-AGENT-GRADE, the grade
 # bin/fm-lease-lib.sh documents: a source that DELIBERATELY strips the marker
 # can still refresh, and adversarial-grade unforgeability is out of scope (see
@@ -1499,10 +1500,23 @@ start_owner_guard() {  # <source-id>
   return 1
 }
 
+# A live lock holder is independent owner evidence, even across a watcher gap.
+# Keep this proof inside the guard: public runner operations still cannot
+# refresh their own lease. Reject the runner's group and the guard itself.
+owner_lock_present() {  # <runner-pid>
+  local group
+  fm_session_lock_inspect "$STATE"
+  [ "$FM_LOCK_INSPECT_STATE" = held ] || return 1
+  [ "$FM_LOCK_INSPECT_PID" != "$$" ] || return 1
+  group=$(ps -o pgid= -p "$FM_LOCK_INSPECT_PID" 2>/dev/null | tr -d '[:space:]') || return 1
+  case "$group" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$group" != "$1" ]
+}
+
 # The runner's owner guard, which bounds an accidentally orphaned detached
 # runner after its home ends. It revalidates the recorded physical state root
-# and its lease on a bounded cadence and, after two consecutive reads cannot prove
-# both, invokes the identity-gated stop for the runner's whole process group -
+# and owner presence on a bounded cadence and, after two consecutive reads
+# cannot prove both, invokes the identity-gated stop for the runner's whole group -
 # which is what reaches the blocking child and everything that child spawned,
 # exactly as retirement does. A failed verified stop stays on the retry cadence;
 # an absent leader ends the guard without signalling an ambiguous group.
@@ -1520,6 +1534,8 @@ start_owner_guard() {  # <source-id>
 cmd_owner_watchdog() {  # <source-id> <runner-pid> <runner-identity> <ready-file> <state-device> <state-inode>
   local id=${1-} pid=${2-} identity=${3-} ready=${4-} state_device=${5-} state_inode=${6-}
   local lease tick half misses=0 pid_state state_identity current_device current_inode
+  # shellcheck source=bin/fm-session-lock-lib.sh
+  . "$SCRIPT_DIR/fm-session-lock-lib.sh"
   [ "$#" -eq 6 ] || usage
   fm_procevent_source_id_valid "$id" || die "source id must be path-safe: $id"
   case "$pid" in ''|*[!0-9]*) die "runner pid must be a positive integer: $pid" ;; esac
@@ -1572,7 +1588,7 @@ cmd_owner_watchdog() {  # <source-id> <runner-pid> <runner-identity> <ready-file
       || IFS=$'\t' read -r _ current_device current_inode _ _ <<< "$state_identity"
     if [ "$current_device" = "$state_device" ] \
       && [ "$current_inode" = "$state_inode" ] \
-      && fm_procevent_owner_alive "$STATE" "$lease"; then
+      && { owner_lock_present "$pid" || fm_procevent_owner_alive "$STATE" "$lease"; }; then
       misses=0
       continue
     fi

@@ -657,6 +657,67 @@ test_unverified_clean_close_exhausts_retries() {
   pass "auto-arm: unverified clean close exhausts retries and fails closed"
 }
 
+test_silent_arm_exit_has_bounded_backoff() {
+  local dir out status started elapsed
+  dir=$(make_primary_dir "$TMP_ROOT/silent-exit")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" clean
+  # No status line at all, including the misleading attached line in clean.
+  cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >> "$FM_HOME/state/arm-ran"
+exit 0
+SH
+  started=$SECONDS
+  out=$(FM_CLAUDE_AUTOARM_ATTEMPTS=3 run_autoarm "$dir" 2>/dev/null); status=$?
+  elapsed=$((SECONDS - started))
+  expect_code 2 "$status" "silent arm death must request recovery"
+  assert_contains "$out" "3 bounded attempts" "silent death did not exhaust the configured budget"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 3 ] || fail "silent death escaped its attempt bound"
+  [ "$elapsed" -ge 3 ] || fail "retries skipped their backoff"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "silent death left an arming epoch"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "silent death left no durable failure episode"
+  pass "auto-arm: silent child exit records failure after bounded backoff"
+}
+
+test_unexpected_hook_exit_recovers_owned_generation() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/unexpected-exit")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" failed
+  # The supported sourced config boundary exits the shell after it claimed its
+  # generation, before ordinary arm-result translation can run.
+  printf 'exit 0\n' > "$dir/config/x-mode.env"
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "unexpected hook exit must run failure recovery"
+  assert_contains "$out" "2 bounded attempts" "EXIT recovery lost the attempt budget"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 1 ] || fail "EXIT recovery retried the aborted first attempt without charging it"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "unexpected hook exit stranded arming"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "unexpected exit recorded no failure episode"
+  pass "auto-arm: unexpected hook exit retries and records the ordinary failure"
+}
+
+test_exit_recovery_does_not_arm_over_healthy_watcher() {
+  local dir out status pid identity
+  dir=$(make_primary_dir "$TMP_ROOT/exit-healthy")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" failed
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || fail "could not identify watcher"
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  printf 'exit 0\n' > "$dir/config/x-mode.env"
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "healthy watcher must make EXIT recovery silent"
+  [ -z "$out" ] || fail "healthy recovery emitted a failure"
+  assert_absent "$dir/state/arm-ran" "EXIT recovery started an arm over a healthy watcher"
+  [ "$(epoch_outcome "$dir")" = clean ] || fail "healthy EXIT recovery stranded arming"
+  pass "auto-arm: EXIT recovery accepts a healthy watcher without another arm"
+}
+
 test_post_alarm_actionable_close_is_suppressed() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/post-alarm-actionable")
@@ -1753,6 +1814,9 @@ test_failed_close_rewakes_with_failure_banner
 test_failed_cycles_notify_once_and_keep_retrying
 test_failure_notice_marker_write_refuses_delivery_and_retries
 test_unverified_clean_close_exhausts_retries
+test_silent_arm_exit_has_bounded_backoff
+test_unexpected_hook_exit_recovers_owned_generation
+test_exit_recovery_does_not_arm_over_healthy_watcher
 test_post_alarm_actionable_close_is_suppressed
 test_benign_cycle_end_with_live_watcher_is_silent
 test_positive_recovery_budget_contention_preserves_episode
