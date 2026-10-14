@@ -1672,7 +1672,14 @@ ${context.command}
   pi.on?.("before_agent_start", async (event, ctx) => {
     // Pi 1.2.0 also fires this event for extension-triggered custom runs, which carry a message and no prompt.
     // This handler stages user dialog only, so custom runs return here. Events without a messageType predate the split and carry a user prompt.
-    if (event.messageType === "custom") return;
+    // A run opened by our queued processing request still arms the away-record abort below; any other custom run clears it.
+    if (event.messageType === "custom") {
+      processingOpenedThisRun =
+        queuedProcessingContent !== null &&
+        isProcessingCustomMessage(event.message) &&
+        event.message.content === queuedProcessingContent;
+      return;
+    }
     rememberMainModel(ctx);
     currentMainSession = ctx?.sessionManager ?? null;
     const promptGeneration = generation;
