@@ -1504,8 +1504,10 @@ start_owner_guard() {  # <source-id>
 # recorded this process-start identity. An old pid alone is not proof. The
 # provenance check follows ancestry across group changes and rejects the
 # inherited runner marker even after a detached child has been reparented.
-# Unreadable identity, ancestry, or environment falls back to the lease.
-owner_process_independent() {  # <holder-pid> <runner-pid>
+# New acquisitions record the inherited marker before environment inspection
+# can become unavailable. Legacy records require readable holder environment.
+# Unreadable identity, ancestry, or provenance falls back to the lease.
+owner_process_independent() {  # <holder-pid> <runner-pid> <acquisition-provenance>
   local holder=$1 candidate=$1 parent depth=0
   while [ "$candidate" -gt 1 ] && [ "$depth" -lt 128 ]; do
     [ "$candidate" != "$2" ] && [ "$candidate" != "$$" ] || return 1
@@ -1516,6 +1518,11 @@ owner_process_independent() {  # <holder-pid> <runner-pid>
     depth=$((depth + 1))
   done
   [ "$candidate" -eq 1 ] || return 1
+  case "${3:-}" in
+    independent) return 0 ;;
+    '') ;; # Legacy two-line record: require live environment evidence below.
+    *) return 1 ;;
+  esac
   if [ -d /proc/self ]; then
     # Never print environment bytes: only the predicate's exit status escapes.
     perl -e '
@@ -1542,7 +1549,7 @@ owner_process_independent() {  # <holder-pid> <runner-pid>
 }
 
 owner_lock_present() {  # <runner-pid>
-  local holder identity recorded_pid recorded_identity sidecar="$STATE/.lock-identity"
+  local holder identity recorded_pid recorded_identity provenance sidecar="$STATE/.lock-identity"
   fm_session_lock_inspect "$STATE"
   [ "$FM_LOCK_INSPECT_STATE" = held ] || return 1
   holder=$FM_LOCK_INSPECT_PID
@@ -1552,7 +1559,8 @@ owner_lock_present() {  # <runner-pid>
   [ "$recorded_pid" = "$holder" ] && [ -n "$recorded_identity" ] || return 1
   identity=$(fm_pid_identity "$holder") || return 1
   [ "$identity" = "$recorded_identity" ] || return 1
-  owner_process_independent "$holder" "$1" || return 1
+  provenance=$(sed -n '3p' "$sidecar") || return 1
+  owner_process_independent "$holder" "$1" "$provenance" || return 1
   # Recheck after the provenance walk so a changing holder cannot borrow it.
   [ "$(sed -n '1p' "$STATE/.lock" 2>/dev/null)" = "$holder" ] || return 1
   [ "$(fm_pid_identity "$holder")" = "$identity" ]

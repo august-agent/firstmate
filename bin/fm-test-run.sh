@@ -1498,6 +1498,10 @@ families_for_changed_path() {
       printf '%s\n' "__script__:fm-claude-stop-autoarm.test.sh"
       printf '%s\n' live-harness-optin
       ;;
+    bin/fm-claude-stop-autoarm.sh|bin/fm-claude-stop-recovery.sh)
+      printf '%s\n' '__script__:fm-claude-stop-autoarm.test.sh'
+      printf '%s\n' live-harness-optin
+      ;;
     bin/fm-supervisor-target-lib.sh)
       printf '%s\n' watcher-wake-lock
       printf '%s\n' real-herdr-gated

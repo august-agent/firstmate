@@ -85,7 +85,16 @@ It re-arms by parking that awaited hook on `bin/fm-watch-arm.sh` and returning a
 Claude's `.claude/settings.json` Stop `asyncRewake` hook (`bin/fm-claude-stop-autoarm.sh`) owns routine tokenless re-arm.
 Do not run the hook as a manual arm from a tool turn: a short-lived tool process cannot own its park; its header and help own the invocation contract.
 The hook fires on every Stop.
-On each Stop, an eligible primary with supervision need admits one home-scoped owner, which foregrounds `bin/fm-watch-arm.sh` inside the hook-owned process tree.
+On each Stop, an eligible primary with supervision need admits one home-scoped generation owner in an isolated process session.
+The ordinary hook waits for that owner and relays its exit status, retrying untrappable owner deaths within a bounded budget.
+A separate native `asyncRewake` hook (`bin/fm-claude-stop-recovery.sh`) keeps one tokenless recovery monitor per home, so losing the ordinary hook itself does not also lose the only notification channel.
+The ordinary hook waits for monitor readiness before claiming, routes readiness exhaustion through the bounded failure episode, and closes the monitor on completion so sibling hooks cannot hold up feedback.
+The monitor reclaims only the exact observed generation while it remains abandoned and `arming` under the generation mutex, and returns the recovered wake on its own hook channel without requiring another Stop.
+Its singleton lock revalidates a mismatched process identity under the steal mutex before replacing a reused PID.
+An open supervised generation must prove both its owner and notification transport by process identity; the transport captures its identity before forking and an adopted child refuses startup.
+Legacy generations retain their existing owner proof.
+The owner stops its arm when its transport or session disappears, leaving transport-loss recovery to the independent hook.
+Both hooks remain subject to the host's configured timeout and session teardown; terminating every hook transport or the session itself cannot deliver a wake to that session.
 While supervision is still needed and away mode remains inactive, an actionable close wakes the idle session through exit 2.
 
 ### Claude session-lock ownership
@@ -104,6 +113,7 @@ That verdict accepts either of two cases:
 With that verdict, a background session keeps arming after its transient helper chain is recycled.
 [`turnend-guard.md`](turnend-guard.md#guard-predicates) owns the Claude guard's behavior when that live owner is genuinely another session.
 The stale-owner claim occurs only after the existing AFK and supervision-need gates pass.
+An eligible hook also reconfirms an already-owned lock through `fm-lock.sh`, upgrading a legacy lock's process-identity sidecar so process-event listeners can retain their independent owner proof through a watcher gap.
 
 ### Claude arm failures
 

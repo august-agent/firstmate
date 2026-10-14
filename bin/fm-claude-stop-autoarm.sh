@@ -36,18 +36,17 @@
 #     continuation (fm_autoarm_claim_open/fm_autoarm_claim_next in
 #     bin/fm-wake-lib.sh own the contract, including the legacy shim for a
 #     pre-generation lock).
-#   - Foreground arm: the owner runs bin/fm-watch-arm.sh as a tracked child it
-#     waits on inside this hook-owned process tree (never a fire-and-forget
-#     shell &); Claude owns the process group, so its timeout/session teardown
-#     kills arm and watcher together, and the hook TERMs the arm with itself.
-#     HUP, TERM, and INT are translated through the ordinary durable failure
-#     handoff instead of leaving the generation frozen at arming. Claude does
-#     not deliver the exit 2 of a hook it terminated at the configured timeout
-#     as a rewake (measured on Claude Code 2.1.278 and 2.1.281,
-#     docs/verification/supervision.md), so a park that outlives that timeout
-#     records the failure durably without waking an idle primary; nothing here
-#     shortens a quiet park, because no-change heartbeats are absorbed without
-#     closing the arm.
+#   - Supervised arm: the harness-owned transport waits for a generation owner
+#     in its own process session, preserving its stderr and exit status. An
+#     untrappable owner death is retried within this same Stop, with a final
+#     owner committing the ordinary failure after the bounded retry budget.
+#     The generation records both process identities. A second asyncRewake
+#     entry, fm-claude-stop-recovery.sh, monitors abandoned arming claims and
+#     supplies an independent notification channel if the first transport dies.
+#     One home-scoped recovery monitor closes with the ordinary hook;
+#     its session, AFK, and supervision-need gates remain identical. Both native
+#     hooks remain subject to host timeout and session teardown: no hook can
+#     wake a session after every notification transport has been terminated.
 #   - Handling successor: Pi, omp, and OpenCode start the next arm before they
 #     deliver an actionable wake, so the fleet stays covered while the model
 #     handles it. After an actionable close, including an attached peer cycle
@@ -89,7 +88,8 @@
 #   - Failure handling: an unexpected EXIT while still arming reuses the
 #     remaining attempt budget instead of stranding the claim. Retries wait
 #     one second after the first attempt and two after the second. An
-#     untrappable termination (SIGKILL) still needs a later Stop to recover.
+#     untrappable termination (SIGKILL) is handled by the transport supervisor
+#     or the independent recovery hook, without waiting for another Stop.
 #     A typed failure is rechecked against the same live,
 #     fresh watcher predicate and retried a bounded number of times in this
 #     hook. An exhausted failure to deliver an actionable close emits one
@@ -198,6 +198,13 @@ if [ -n "$PAYLOAD" ] && command -v jq >/dev/null 2>&1; then
   printf '%s' "$PAYLOAD" | jq -e '(.transcript_path // "") | type == "string" and contains("/.pi/")' >/dev/null 2>&1 && exit 0
 fi
 
+# A marked child must never reinterpret an adoptive parent as its transport.
+if [ -n "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" ]; then
+  [ "$FM_CLAUDE_AUTOARM_SUPERVISOR_PID" = "$PPID" ] || exit 0
+  [ -n "${FM_CLAUDE_AUTOARM_TRANSPORT_IDENTITY:-}" ] || exit 0
+  [ "$(fm_pid_identity "$PPID" 2>/dev/null)" = "$FM_CLAUDE_AUTOARM_TRANSPORT_IDENTITY" ] || exit 0
+fi
+
 # --- scope: genuine primary checkout only -----------------------------------
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
@@ -235,6 +242,194 @@ if [ "$RECOVER_SESSION_LOCK" -eq 1 ]; then
   fm_session_lock_owned_by_self "$STATE" || exit 0
 fi
 
+# Confirming our existing lock also upgrades its process-identity sidecar.
+# The process-event owner guard can then keep listeners through a watcher gap
+# after an in-session update, without trusting a bare PID or refreshing itself.
+"$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1 || exit 0
+fm_session_lock_owned_by_self "$STATE" || exit 0
+
+# A second native asyncRewake hook owns an independent notification channel.
+# It stays tokenless until completion, with one recovery monitor per home.
+# Killing the generation owner OR its original hook transport therefore leaves
+# a hook able to reclaim the abandoned generation and deliver its exit-2 wake.
+# The monitor writes identity after acquisition. Missing identity remains an
+# in-progress/uncertain holder; only a positive mismatch permits live-PID reclaim.
+autoarm_recovery_lock_acquire() {
+  local owner pid identity current steal steal_owner acquired rc=1
+  fm_lock_try_acquire "$RECOVERY_LOCK" && return 0
+  owner=$(fm_lock_link_owner "$RECOVERY_LOCK") || return 1
+  pid=$(cat "$owner/pid" 2>/dev/null) || return 1
+  identity=$(cat "$owner/pid-identity" 2>/dev/null) || return 1
+  [ -n "$identity" ] || return 1
+  current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  [ "$current" != "$identity" ] || return 1
+  steal="$RECOVERY_LOCK.steal"
+  fm_lock_try_acquire_steal_mutex "$steal" || return 1
+  steal_owner=$FM_LOCK_OWNER_DIR
+  # Revalidate the exact immutable directory, pid, and identity while the steal
+  # mutex excludes replacement claims. Never signal the unrelated live process.
+  if fm_lock_points_to_owner "$steal" "$steal_owner" \
+    && fm_lock_points_to_owner "$RECOVERY_LOCK" "$owner" \
+    && [ "$(cat "$owner/pid" 2>/dev/null)" = "$pid" ] \
+    && [ "$(cat "$owner/pid-identity" 2>/dev/null)" = "$identity" ]; then
+    current=$(fm_pid_identity "$pid" 2>/dev/null) || current=
+    if [ -n "$current" ] && [ "$current" != "$identity" ]; then
+      fm_lock_remove_path "$RECOVERY_LOCK" || true
+      if fm_lock_try_create "$RECOVERY_LOCK" "$steal_owner"; then
+        acquired=$FM_LOCK_OWNER_DIR
+        rc=0
+      fi
+    fi
+  fi
+  fm_lock_release "$steal"
+  FM_LOCK_OWNER_DIR=${acquired:-}
+  return "$rc"
+}
+RECOVERY_LOCK="$STATE/.claude-autoarm-recovery.lock"
+if [ "${FM_CLAUDE_AUTOARM_RECOVERY_WATCH:-0}" = 1 ]; then
+  autoarm_recovery_lock_acquire || exit 0
+  RECOVERY_OWNER_DIR=$FM_LOCK_OWNER_DIR
+  trap 'rm -f "$RECOVERY_OWNER_DIR/complete"; fm_lock_release "$RECOVERY_LOCK"' EXIT
+  fm_pid_identity "$$" > "$RECOVERY_OWNER_DIR/pid-identity" || exit 0
+  RECOVERY_SEEN_ARM=0
+  RECOVERY_START=$(date +%s)
+  while fm_session_lock_owned_by_self "$STATE" && [ ! -e "$STATE/.afk" ] && need_supervision; do
+    [ ! -e "$RECOVERY_OWNER_DIR/complete" ] || exit 0
+    if fm_autoarm_ledger_read "$STATE"; then
+      if [ "$FM_AUTOARM_OUTCOME" = arming ]; then
+        RECOVERY_SEEN_ARM=1
+        RECOVERY_EXPECTED_GEN=$FM_AUTOARM_GEN
+        if ! fm_autoarm_claim_open "$STATE" "$GRACE"; then
+          FM_CLAUDE_AUTOARM_EXPECTED_GEN="$RECOVERY_EXPECTED_GEN" \
+          FM_CLAUDE_AUTOARM_RECOVERY_WATCH=0 FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=0 \
+            "$SCRIPT_DIR/fm-claude-stop-autoarm.sh" <<< "$PAYLOAD"
+          RECOVERY_RC=$?
+          [ "$RECOVERY_RC" -ne 2 ] || exit 2
+        fi
+      elif [ "$RECOVERY_SEEN_ARM" -eq 1 ]; then
+        exit 0
+      fi
+    fi
+    # An entry that never claims must not hold another hook's feedback forever.
+    # Ordinary registered transports wait for readiness before they can claim.
+    if [ "$RECOVERY_SEEN_ARM" -eq 0 ] && [ "$(( $(date +%s) - RECOVERY_START ))" -ge 10 ]; then
+      exit 0
+    fi
+    sleep 1
+  done
+  exit 0
+fi
+
+# Native asyncRewake feedback is delivered only after sibling hooks settle.
+# Bind the transport to this monitor's immutable lock directory before claiming,
+# and notify that exact monitor when an owned terminal result commits. A newer
+# monitor can never consume an older transport's completion.
+if [ "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" != "$PPID" ]; then
+  FM_CLAUDE_AUTOARM_MONITOR_DIR=
+  MONITOR_DEADLINE=$(( $(date +%s) + 5 ))
+  while :; do
+    MONITOR_DIR=$(fm_lock_link_owner "$RECOVERY_LOCK" 2>/dev/null || true)
+    MONITOR_PID=$(cat "$MONITOR_DIR/pid" 2>/dev/null || true)
+    MONITOR_IDENTITY=$(cat "$MONITOR_DIR/pid-identity" 2>/dev/null || true)
+    if [ -n "$MONITOR_DIR" ] && [ -n "$MONITOR_IDENTITY" ] && [ ! -e "$MONITOR_DIR/complete" ] \
+      && fm_pid_alive "$MONITOR_PID" \
+      && [ "$(fm_pid_identity "$MONITOR_PID" 2>/dev/null)" = "$MONITOR_IDENTITY" ]; then
+      FM_CLAUDE_AUTOARM_MONITOR_DIR=$MONITOR_DIR
+      break
+    fi
+    [ "${FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY:-0}" = 1 ] || break
+    if [ "$(date +%s)" -ge "$MONITOR_DEADLINE" ]; then
+      FM_CLAUDE_AUTOARM_RECOVERY_EXHAUSTED=1
+      export FM_CLAUDE_AUTOARM_RECOVERY_EXHAUSTED
+      break
+    fi
+    sleep 0.1
+  done
+  export FM_CLAUDE_AUTOARM_MONITOR_DIR
+fi
+
+# Keep the harness notification transport separate from the generation owner.
+# The transport waits for the owner and preserves its exact exit status/stderr.
+# Each owner leads a new session, so killing the transport process group cannot
+# reap the owner, arm, and watcher together. Conversely an untrappable owner
+# death is retried here, within this SAME Stop, without relying on its traps.
+# The parent-PID check prevents the marker leaking into a later nested hook.
+if [ "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" != "$PPID" ]; then
+  exec perl -MPOSIX=setsid,WIFSIGNALED,WEXITSTATUS -MErrno=EINTR -e '
+    use strict;
+    use warnings;
+    my ($script, $attempts, $library, $state) = @ARGV;
+    my $transport = $$;
+    open my $identity_reader, "-|", "bash", "-c",
+      q{. "$1"; fm_pid_identity "$2"}, "_", $library, $transport
+      or die "auto-arm transport identity: $!";
+    my $identity = do { local $/; <$identity_reader> } // "";
+    close $identity_reader or die "auto-arm transport identity failed";
+    chomp $identity;
+    die "auto-arm empty transport identity" unless length $identity;
+    my $payload = do { local $/; <STDIN> } // "";
+    my ($child, $interrupted);
+    for my $signal (qw(HUP TERM INT)) {
+      $SIG{$signal} = sub {
+        $interrupted = $signal;
+        kill $signal, $child if $child;
+      };
+    }
+    for my $round (0 .. $attempts) {
+      pipe(my $input, my $writer) or die "auto-arm input pipe: $!";
+      $child = fork();
+      defined $child or die "auto-arm fork: $!";
+      if (!$child) {
+        exit 0 unless getppid() == $transport;
+        close $writer;
+        open STDIN, "<&", $input or die "auto-arm stdin: $!";
+        close $input;
+        setsid() >= 0 or die "auto-arm setsid: $!";
+        $ENV{FM_CLAUDE_AUTOARM_SUPERVISOR_PID} = $transport;
+        $ENV{FM_CLAUDE_AUTOARM_TRANSPORT_IDENTITY} = $identity;
+        $ENV{FM_CLAUDE_AUTOARM_RECOVERY_EXHAUSTED} ||= ($round == $attempts ? 1 : 0);
+        exec $script;
+        die "auto-arm exec: $!";
+      }
+      close $input;
+      { local $SIG{PIPE} = "IGNORE"; print {$writer} $payload; }
+      close $writer;
+      my $waited;
+      do { $waited = waitpid($child, 0); } while $waited < 0 && $! == EINTR;
+      die "auto-arm wait: $!" if $waited < 0;
+      my $status = $?;
+      # Recovery retries may advance their fence only over their own dead
+      # child, never over a terminal result or a different transport.
+      if (WIFSIGNALED($status) && $ENV{FM_CLAUDE_AUTOARM_EXPECTED_GEN}) {
+        if (open my $ledger, "<", "$state/.claude-autoarm-epoch") {
+          my $line = <$ledger> // "";
+          my $owner_identity = <$ledger>;
+          my $recorded_transport = <$ledger> // "";
+          close $ledger;
+          chomp $recorded_transport;
+          if ($recorded_transport eq $identity &&
+              $line =~ /^epoch=(\d+) owner_pid=\Q$child\E outcome=arming .* transport_pid=\Q$transport\E\n$/) {
+            $ENV{FM_CLAUDE_AUTOARM_EXPECTED_GEN} = $1;
+          }
+        }
+      }
+      $child = undef;
+      exit WEXITSTATUS($status) unless WIFSIGNALED($status);
+      # A host-requested shutdown must not turn into an automatic retry storm.
+      exit 2 if $interrupted;
+      sleep($round + 1) if $round < $attempts;
+    }
+    print STDERR "firstmate watcher auto-arm FAILED - every isolated owner was terminated.\n";
+    exit 2;
+  ' "$SCRIPT_DIR/fm-claude-stop-autoarm.sh" "$AUTOARM_ATTEMPTS" "$SCRIPT_DIR/fm-wake-lib.sh" "$STATE" <<< "$PAYLOAD"
+fi
+
+AUTOARM_TRANSPORT_IDENTITY=$FM_CLAUDE_AUTOARM_TRANSPORT_IDENTITY
+autoarm_transport_alive() {
+  fm_pid_alive "$PPID" || return 1
+  [ "$(fm_pid_identity "$PPID" 2>/dev/null)" = "$AUTOARM_TRANSPORT_IDENTITY" ]
+}
+
 # --- single-flight generation claim --------------------------------------------
 # Claude runs one background process per firing with no dedupe. Exactly one
 # generation owner arms and translates per event epoch: every firing defers to
@@ -248,14 +443,14 @@ fi
 # shim defers to while genuinely deciding and reclaims once when proven
 # abandoned.
 fm_autoarm_claim_open "$STATE" "$GRACE" && exit 0
-fm_autoarm_claim_next "$STATE" "$GRACE"
+fm_autoarm_claim_next "$STATE" "$GRACE" "${FM_CLAUDE_AUTOARM_EXPECTED_GEN:-}"
 CLAIM_RC=$?
 if [ "$CLAIM_RC" -ne 0 ]; then
   [ "$CLAIM_RC" -eq 2 ] && exit 0
   ROLE=$(fm_lock_role "$OWNER_LOCK" 2>/dev/null || true)
   [ -n "$ROLE" ] || exit 0
   fm_autoarm_release_abandoned "$STATE" "$GRACE" || exit 0
-  fm_autoarm_claim_next "$STATE" "$GRACE" || exit 0
+  fm_autoarm_claim_next "$STATE" "$GRACE" "${FM_CLAUDE_AUTOARM_EXPECTED_GEN:-}" || exit 0
 fi
 MY_GEN=$FM_AUTOARM_MY_GEN
 [ -n "$MY_GEN" ] || exit 0
@@ -268,7 +463,7 @@ MY_GEN=$FM_AUTOARM_MY_GEN
 # (cleanup, exit 0) - the harness discards the collected stderr on exit 0, so
 # even an already-printed banner is never delivered by a losing generation.
 autoarm_commit() {  # <outcome> [marker-file]
-  local outcome=$1 marker=${2:-} session_pid recovery
+  local outcome=$1 marker=${2:-} session_pid recovery rc
   if [ "$outcome" = rewake ]; then
     fm_session_lock_owned_by_self "$STATE" || return 2
     session_pid=$(sed -n '1p' "$STATE/.lock" 2>/dev/null || true)
@@ -283,12 +478,23 @@ autoarm_commit() {  # <outcome> [marker-file]
   else
     fm_autoarm_write_owned "$STATE" "$MY_GEN" "$outcome"
   fi
+  rc=$?
+  [ "$rc" -ne 0 ] || autoarm_monitor_complete
+  return "$rc"
+}
+# Completion releases the sibling hook so native feedback can be delivered.
+autoarm_monitor_complete() {
+  local dir=${FM_CLAUDE_AUTOARM_MONITOR_DIR:-}
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  : > "$dir/complete" 2>/dev/null || true
 }
 
 # Best-effort ownership-checked record for exit-0 paths, where supersession
 # changes nothing about the action taken.
 autoarm_record() {  # <outcome>
-  fm_autoarm_write_owned "$STATE" "$MY_GEN" "$1" >/dev/null 2>&1 || true
+  if fm_autoarm_write_owned "$STATE" "$MY_GEN" "$1" >/dev/null 2>&1; then
+    autoarm_monitor_complete
+  fi
 }
 
 # Claude terminates the complete async-hook process tree when the configured
@@ -329,9 +535,8 @@ trap 'handle_autoarm_signal TERM' TERM
 trap 'handle_autoarm_signal INT' INT
 
 # --- foreground the real arm wrapper ------------------------------------------
-# The arm is a tracked child this hook waits on, never a fire-and-forget shell
-# & whose child would be reaped when the hook returned: this hook process tree
-# is the harness-owned lifecycle. The arm forks the watcher as its own tracked
+# The arm is a tracked child the isolated generation owner waits on; the
+# native hook transport waits on that owner. The arm forks the watcher as its own tracked
 # child exactly as it does for the model-driven background-task path, and
 # propagates the wake reason on close. Holding the arm's pid lets the signal
 # handler TERM it with the hook and lets the handling successor below name it
@@ -348,6 +553,16 @@ run_arm() {  # <output file, or empty for none>
     FM_GUARD_GRACE="$GRACE" "$SCRIPT_DIR/fm-watch-arm.sh" >/dev/null 2>&1 &
   fi
   ARM_PID=$!
+  # A detached owner must not leak its watcher after its session or transport
+  # ends. Leave an interrupted transport claim arming for the independent hook
+  # to reclaim; a genuine session shutdown has no recovery recipient.
+  while fm_pid_alive "$ARM_PID"; do
+    if ! autoarm_transport_alive || ! fm_session_lock_owned_by_self "$STATE"; then
+      kill -TERM "$ARM_PID" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
   wait "$ARM_PID" || true
   CLOSED_ARM_PID=$ARM_PID
   ARM_PID=
@@ -443,6 +658,20 @@ run_autoarm_attempts() {
         "$SCRIPT_DIR/fm-supervision-host.sh" park >"${OUT:-/dev/null}" 2>&1 || HOST_RC=$?
     else
       run_arm "$OUT"
+    fi
+
+    if ! autoarm_transport_alive; then
+      # No exit-status recipient remains here. The separate recovery hook must
+      # see an abandoned open generation, rather than a false clean close.
+      AUTOARM_FINALIZING=1
+      [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
+      exit 0
+    fi
+    if ! fm_session_lock_owned_by_self "$STATE"; then
+      autoarm_record clean
+      AUTOARM_FINALIZING=1
+      [ -z "$OUT" ] || rm -f "$OUT" 2>/dev/null || true
+      exit 0
     fi
 
     # AFK may have appeared mid-cycle: the daemon owns triage now, so suppress
@@ -634,6 +863,12 @@ handle_autoarm_exit() {
 
 AUTOARM_FINALIZING=0
 trap handle_autoarm_exit EXIT
+# A final isolated owner commits the ordinary durable failure without loading
+# config or starting another arm after repeated untrappable owner deaths.
+if [ "${FM_CLAUDE_AUTOARM_RECOVERY_EXHAUSTED:-0}" = 1 ]; then
+  attempt=$AUTOARM_ATTEMPTS
+  finish_autoarm
+fi
 # X mode cadence: source the generated config so an X instance polls at its
 # 30s cadence (fm-bootstrap.sh x_mode_setup contract).
 # shellcheck source=/dev/null

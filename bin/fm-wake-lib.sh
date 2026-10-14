@@ -469,6 +469,15 @@ fm_watcher_supervision_verdict() {
   esac
   model=$(fm_supervision_model)
   if [ "$model" = autoarm ]; then
+    # A leftover fresh beat cannot excuse a demonstrably abandoned arm.
+    # Cursor keeps its between-turn grace even after switching from Claude.
+    if fm_autoarm_ledger_read "$state" && [ "$FM_AUTOARM_OUTCOME" = arming ] \
+      && ! fm_autoarm_claim_open "$state" "$grace" \
+      && [ "$("$FM_WAKE_LIB_DIR/fm-harness.sh" 2>/dev/null)" != cursor ] \
+      && ! fm_watcher_healthy "$state" "$watch" "$grace" "$home"; then
+      FM_WATCHER_VERDICT_REASON=no-watcher
+      return 0
+    fi
     if [ "$fresh" = true ] || fm_autoarm_midturn_healthy "$state" "$grace"; then
       FM_WATCHER_VERDICT_OK=true
     fi
@@ -1754,7 +1763,9 @@ fm_failure_episode_reset() {
 #     identity is MANDATORY: a claimant that cannot record it does not claim
 #     (continuity falls to the synchronous guard), and the identity is read
 #     from the ledger entry alone - never substituted from any lock - so a
-#     reused pid can never authenticate someone else's stale entry.
+#     reused pid can never authenticate someone else's stale entry. Supervised
+#     claims also record transport_pid on line 1 and its identity on line 3;
+#     both must remain live and match for that claim to be open.
 #   - A claim is OPEN (fm_autoarm_claim_open) while its outcome is "arming",
 #     its owner pid is alive, its recorded identity successfully recomputes
 #     and matches that pid, and it is not STUCK - stuck meaning both the
@@ -1843,11 +1854,15 @@ fm_autoarm_ledger_read() {  # <state-dir>
   FM_AUTOARM_SESSION=
   FM_AUTOARM_RECOVERY=
   FM_AUTOARM_IDENTITY=
+  FM_AUTOARM_TRANSPORT=
+  FM_AUTOARM_TRANSPORT_IDENTITY=
   FM_AUTOARM_GEN=$(_fm_autoarm_epoch_field "$epoch" epoch) || return 1
   FM_AUTOARM_OWNER=$(_fm_autoarm_epoch_field "$epoch" owner_pid) || return 1
   FM_AUTOARM_OUTCOME=$(_fm_autoarm_epoch_field "$epoch" outcome) || return 1
   FM_AUTOARM_SESSION=$(_fm_autoarm_epoch_field "$epoch" session_pid 2>/dev/null || true)
   FM_AUTOARM_RECOVERY=$(_fm_autoarm_epoch_field "$epoch" recovery_generation 2>/dev/null || true)
+  FM_AUTOARM_TRANSPORT=$(_fm_autoarm_epoch_field "$epoch" transport_pid 2>/dev/null || true)
+  FM_AUTOARM_TRANSPORT_IDENTITY=$(sed -n '3p' "$epoch" 2>/dev/null || true)
   case "$FM_AUTOARM_GEN" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -1877,6 +1892,12 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
   current=$(fm_pid_identity "$FM_AUTOARM_OWNER" 2>/dev/null) || return 1
   [ -n "$current" ] || return 1
   [ "$current" = "$FM_AUTOARM_IDENTITY" ] || return 1
+  if [ -n "$FM_AUTOARM_TRANSPORT" ]; then
+    fm_pid_alive "$FM_AUTOARM_TRANSPORT" || return 1
+    [ -n "$FM_AUTOARM_TRANSPORT_IDENTITY" ] || return 1
+    current=$(fm_pid_identity "$FM_AUTOARM_TRANSPORT" 2>/dev/null) || return 1
+    [ "$current" = "$FM_AUTOARM_TRANSPORT_IDENTITY" ] || return 1
+  fi
   if [ "$(fm_path_age "$epoch")" -ge "$grace" ] \
     && [ "$(fm_path_age "$state/.last-watcher-beat")" -ge "$grace" ]; then
     return 1
@@ -1922,9 +1943,10 @@ fm_autoarm_midturn_healthy() {  # <state-dir> [grace]
 # short micro-mutex hold. Returns 0 with FM_AUTOARM_MY_GEN set on success, 2
 # when a competing claimant won the race (the ledger holds an open claim), and
 # 1 when the micro-mutex is contended, the mandatory identity cannot be
-# computed, or the write failed.
-fm_autoarm_claim_next() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp
+# computed, or the write failed. An optional expected generation restricts
+# recovery to that still-arming, abandoned generation under the same mutex.
+fm_autoarm_claim_next() {  # <state-dir> [grace] [expected-abandoned-generation]
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} expected=${3:-} lock epoch pid gen identity tmp transport='' transport_identity=''
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
@@ -1934,7 +1956,22 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
   pid=${BASHPID:-$$}
   identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
+  if [ "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" = "$PPID" ]; then
+    transport_identity=${FM_CLAUDE_AUTOARM_TRANSPORT_IDENTITY:-}
+    [ -n "$transport_identity" ] || return 1
+    [ "$(fm_pid_identity "$PPID" 2>/dev/null)" = "$transport_identity" ] || return 1
+    transport=" transport_pid=$PPID"
+  fi
   fm_lock_try_acquire "$lock" || return 1
+  # A recovery monitor may only replace the exact abandoned arming generation
+  # it observed. A terminal commit or another claimant wins this race.
+  if [ -n "$expected" ]; then
+    if ! fm_autoarm_ledger_read "$state" || [ "$FM_AUTOARM_GEN" != "$expected" ] \
+      || [ "$FM_AUTOARM_OUTCOME" != arming ]; then
+      fm_lock_release "$lock"
+      return 2
+    fi
+  fi
   if fm_autoarm_claim_open "$state" "$grace"; then
     fm_lock_release "$lock"
     return 2
@@ -1945,8 +1982,8 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
   esac
   gen=$((gen + 1))
   tmp="$epoch.tmp.$pid"
-  if ! printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s\n%s\n' \
-      "$gen" "$pid" "$(date +%s)" "$identity" > "$tmp" 2>/dev/null \
+  if ! printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s%s\n%s\n%s\n' \
+      "$gen" "$pid" "$(date +%s)" "$transport" "$identity" "$transport_identity" > "$tmp" 2>/dev/null \
     || ! mv -f "$tmp" "$epoch" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     fm_lock_release "$lock"

@@ -25,7 +25,7 @@ fail() {
   exit 1
 }
 
-LAB="$ROOT/.claude-autoarm-live-e2e.$$"
+LAB=$(mktemp -d "${TMPDIR:-/tmp}/fm-claude-autoarm-live-e2e.XXXXXX")
 PROJECT="$LAB/project"
 HOME_DIR="$LAB/fmhome"
 LIVE_OWNER_HOME="$LAB/live-owner-home"
@@ -75,12 +75,27 @@ printf 'project=fixture\nwindow=fixture\nbackend=tmux\n' > "$HOME_DIR/state/task
 # A numeric pid above the supported OS pid range is a demonstrably dead prior
 # harness owner under fm_harness_pid_alive, matching the reproduced incident.
 printf '9999999\n' > "$HOME_DIR/state/.lock"
-
 # Rapid-death arm fixture: started plus an immediate actionable reason, the
 # exact spent-Stop edge shape. Runs 1-2 close actionable; run 3 closes clean so
 # a misbehaving session can never loop forever.
 cat > "$PROJECT/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
+# A handling successor covers the model turn; it is not another delivered wake.
+if [ -n "${FM_WATCH_PREDECESSOR_ARM_PID:-}" ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  exit 0
+fi
+if [ ! -e "$FM_HOME/state/killed-transport" ]; then
+  # Let the synchronous guard observe a healthy initial claim before simulating
+  # a later hook death. An already-dead claim must correctly block that guard.
+  sleep 2
+  transport=$(sed -n '1s/.* transport_pid=\([0-9]*\).*/\1/p' "$FM_HOME/state/.claude-autoarm-epoch")
+  owner=$(sed -n '1s/.*owner_pid=\([0-9]*\) .*/\1/p' "$FM_HOME/state/.claude-autoarm-epoch")
+  [ -n "$transport" ] && [ -n "$owner" ] || exit 1
+  printf '%s\n' "$transport" > "$FM_HOME/state/killed-transport"
+  kill -KILL "$transport" "$owner"
+  exit 0
+fi
 N=$(cat "$FM_HOME/state/arm-count" 2>/dev/null || echo 0); N=$((N+1)); echo "$N" > "$FM_HOME/state/arm-count"
 echo "arm-run=$N pid=$$" >> "$FM_HOME/state/arm-ran"
 if [ "$N" -ge 3 ]; then
@@ -117,6 +132,9 @@ PROMPT='After reading the complete session-start digest, reply with exactly CYCL
     --effort low --output-format stream-json --verbose
 ) > "$TRANSCRIPT" 2>&1 || fail "Claude credentialed auto-arm session failed: $(tail -20 "$TRANSCRIPT")"
 
+[ -s "$HOME_DIR/state/killed-transport" ] || fail "native transport kill injection never ran"
+KILLED_TRANSPORT=$(cat "$HOME_DIR/state/killed-transport")
+kill -0 "$KILLED_TRANSPORT" 2>/dev/null && fail "native transport survived the kill injection"
 ARM_RUNS=$(wc -l < "$HOME_DIR/state/arm-ran" 2>/dev/null | tr -d ' ')
 [ "$ARM_RUNS" = 2 ] || fail "expected exactly 2 hook-owned arm cycles, got $ARM_RUNS: $(cat "$HOME_DIR/state/arm-ran" 2>/dev/null)"
 DRAIN_RUNS=$(wc -l < "$HOME_DIR/state/drain-ran" 2>/dev/null | tr -d ' ')
@@ -128,6 +146,8 @@ REWAKES=$(jq -r '
   | .text
 ' "$TRANSCRIPT" 2>/dev/null | awk '/^Stop hook feedback:/{count++} END{print count+0}')
 [ "$REWAKES" -ge 2 ] || fail "expected at least 2 exit-2 rewake deliveries, got $REWAKES"
+grep -q 'fm-claude-stop-recovery.sh.*firstmate watcher wake' "$TRANSCRIPT" \
+  || fail "the independent native recovery hook did not deliver a wake"
 grep -q 'stale: fixture-rapid-1' "$TRANSCRIPT" || fail "first rapid rewake reason missing from the transcript"
 grep -q 'stale: fixture-rapid-2' "$TRANSCRIPT" || fail "second rapid rewake reason missing from the transcript"
 [ -s "$HOME_DIR/state/tool-calls.log" ] \
@@ -183,4 +203,4 @@ printf '%s\n' '{"session_id":"live-owner-control"}' \
 [ ! -s "$LAB/live-owner.out" ] && [ ! -s "$LAB/live-owner.err" ] || fail "competing Stop hook produced a rewake while another live session owned the home"
 wait "$LIVE_OWNER_PID"
 
-printf 'ok - Claude %s live E2E reclaimed a stale session lock through session start, completed two tokenless Stop-owned rewake cycles, and preserved the competing-live-owner boundary\n' "$CLAUDE_VERSION"
+printf 'ok - Claude %s live E2E reclaimed a stale session lock through session start, recovered a killed native hook transport, completed two tokenless Stop-owned rewake cycles, and preserved the competing-live-owner boundary\n' "$CLAUDE_VERSION"

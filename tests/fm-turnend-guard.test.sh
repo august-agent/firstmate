@@ -891,7 +891,7 @@ test_tracked_claude_entries_inert_under_grok() {
   command -v jq >/dev/null 2>&1 || fail "test host must provide jq"
   dir="$TMP_ROOT/claude-entries-grok-inert"
   mkdir -p "$dir/bin"
-  for script in fm-turnend-guard.sh fm-claude-stop-autoarm.sh fm-sessionstart-run.sh \
+  for script in fm-turnend-guard.sh fm-claude-stop-autoarm.sh fm-claude-stop-recovery.sh fm-sessionstart-run.sh \
     fm-arm-pretool-check.sh fm-cd-pretool-check.sh fm-subagent-pretool-check.sh fm-host-mirror.sh; do
     printf '#!/usr/bin/env bash\nprintf ran >> %q\n' "$dir/invoked" > "$dir/bin/$script"
     chmod +x "$dir/bin/$script"
@@ -933,7 +933,7 @@ test_tracked_claude_entries_inert_under_grok() {
       || fail "tracked entry for $target ran under a legacy GROK_AGENT environment"
   done < <(jq -r '.hooks[][].hooks[].command' "$ROOT/.claude/settings.json")
 
-  [ "$guarded" -eq 7 ] || fail "expected 7 grok-guarded tracked entries, saw $guarded"
+  [ "$guarded" -eq 8 ] || fail "expected 8 grok-guarded tracked entries, saw $guarded"
   [ "$unguarded" -eq 1 ] || fail "expected 1 documented unguarded tracked entry, saw $unguarded"
   pass "tracked .claude/settings.json entries: $guarded inert under grok, the documented subagent exception still armed, all live under Claude"
 }
@@ -1525,6 +1525,18 @@ test_hook_claude_mode_allows_on_open_generation_claim() {
   expect_code 0 "$status" "--claude mode must allow when a live open generation claim owns recovery"
   [ -z "$out" ] || fail "open-generation-claim allow produced output: $out"
   pass "fm-turnend-guard --claude: a live open generation claim owns recovery with no lock held"
+}
+
+test_hook_claude_mode_blocks_on_dead_generation_with_fresh_beat() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-dead-fresh")
+  : > "$dir/state/task1.meta"
+  printf 'epoch=464 owner_pid=9999999 outcome=arming updated_at=1\ndead-owner\n' > "$dir/state/.claude-autoarm-epoch"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=200 run_hook_claude "$dir" true); status=$?
+  expect_code 2 "$status" "a dead arming owner cannot allow Stop on a leftover fresh beat"
+  assert_contains "$out" 'TURN WOULD END BLIND' "dead-owner block omitted the diagnostic"
+  pass "fm-turnend-guard --claude: a dead arming owner blocks even with a fresh beacon"
 }
 
 # The same claim gone stuck (entry and beacon both past grace) stops counting
@@ -2282,6 +2294,7 @@ test_hook_claude_mode_blocks_on_pid_reused_arming_claim
 test_hook_claude_mode_blocks_on_stuck_arming_claim
 test_hook_claude_mode_allows_on_open_generation_claim
 test_hook_claude_mode_blocks_on_stuck_generation_claim
+test_hook_claude_mode_blocks_on_dead_generation_with_fresh_beat
 test_hook_claude_mode_terminal_fail_open_clears_abandoned_claim
 test_hook_claude_mode_preserves_fresh_failed_progression
 test_hook_claude_mode_integrated_monotonic_fail_open

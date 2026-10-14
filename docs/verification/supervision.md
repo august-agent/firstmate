@@ -488,6 +488,21 @@ Observed output:
 fm-claude-stop-autoarm: ok
 ```
 
+### Claude interrupted hook recovery, 2026-10-15
+
+The native Stop path was measured with Claude Code 2.1.300 on macOS using the tracked ordinary and recovery hook registrations in an isolated home.
+The guard kills the ordinary hook transport and generation owner during the first arm, then requires a recovery-hook wake and a second delivered cycle without another user message or a model arm command.
+The recovery monitor finishes with the ordinary hook on normal completion because Claude waits for sibling hooks to settle before continuing from their feedback.
+
+```sh
+FM_CLAUDE_LIVE_E2E=1 bin/fm-test-run.sh tests/fm-claude-stop-autoarm-live-e2e.test.sh
+```
+
+```text
+ok - Claude 2.1.300 (Claude Code) live E2E reclaimed a stale session lock through session start, recovered a killed native hook transport, completed two tokenless Stop-owned rewake cycles, and preserved the competing-live-owner boundary
+FM_TEST_SUMMARY total=1 failed=0 skipped_gate=0 duration_ms=24566
+```
+
 ### Claude drops the exit 2 of a hook it timed out, 2026-09-23
 
 This supports the `bin/fm-claude-stop-autoarm.sh` header statement that a park outliving the hook timeout ends without a rewake.

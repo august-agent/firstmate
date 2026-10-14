@@ -3617,20 +3617,45 @@ assert_absent "$TMP_ROOT/unguarded-launches" \
   "a source command ran without a successfully initialized owner guard"
 pass "a runner fails closed when its owner guard cannot initialize"
 
-# A verified home lock holder keeps the listener across a watcher gap without
-# a reconcile or lease refresh. When that holder dies, the already-expired
-# lease must again bound the runner. Use a real process with a harness-shaped
-# executable, exactly as the portable lock tests do; no tmux server is used.
+# An in-session auto-arm upgrades a legacy bare session lock before its owner
+# is killed. The replacement owner recovers without another Stop, and the
+# resulting identity sidecar keeps listeners across an expired watcher lease.
+# When the real harness holder dies, that expired lease again bounds the runner.
 HLOCK="$TMP_ROOT/lock-owner"; new_home "$HLOCK"
 LOCK_BIN=$(fm_fakebin "$TMP_ROOT/lock-owner-bin")
 ln -s /bin/bash "$LOCK_BIN/claude"
+mkdir -p "$HLOCK/bin" "$HLOCK/config"
+cp -R "$ROOT/bin/." "$HLOCK/bin/"
+printf 'listener-upgrade-test\n' > "$HLOCK/.fm-secondmate-home"
+: > "$HLOCK/AGENTS.md"
+: > "$HLOCK/config/supervision-host-off"
+: > "$HLOCK/state/task.meta"
+cat > "$HLOCK/config/x-mode.env" <<'SH'
+if [ ! -e "$FM_HOME/killed-owner" ]; then
+  printf '%s\n' "$$" > "$FM_HOME/killed-owner"
+  kill -KILL "$$"
+fi
+SH
+cat > "$HLOCK/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+rm -f "$FM_HOME/state/task.meta"
+SH
+chmod +x "$HLOCK/bin/fm-watch-arm.sh"
 # shellcheck disable=SC2016 # Variables expand inside the fixture harness.
-FM_HOME="$HLOCK" "$LOCK_BIN/claude" -c '"$1/bin/fm-lock.sh" > "$FM_HOME/acquired" || exit; sleep 60 & child=$!; trap "kill $child 2>/dev/null; wait $child 2>/dev/null" EXIT; wait' _ "$ROOT" &
+FM_HOME="$HLOCK" "$LOCK_BIN/claude" -c '
+  printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+  "$FM_HOME/bin/fm-claude-stop-autoarm.sh" </dev/null || exit
+  printf "ready\n" > "$FM_HOME/acquired"
+  sleep 60 & child=$!
+  trap "kill $child 2>/dev/null; wait $child 2>/dev/null" EXIT
+  wait
+' &
 LOCK_OWNER_PID=$!
 trap 'kill "$LOCK_OWNER_PID" 2>/dev/null || true; wait "$LOCK_OWNER_PID" 2>/dev/null || true; fm_test_cleanup' EXIT
 wait_for "$HLOCK/acquired" || fail "home lock acquisition did not complete"
 [ "$(cat "$HLOCK/state/.lock")" = "$LOCK_OWNER_PID" ] || fail "lock did not record the fixture harness"
 [ "$(sed -n '1p' "$HLOCK/state/.lock-identity")" = "$LOCK_OWNER_PID" ] || fail "acquisition did not bind process identity to the holder"
+[ "$(sed -n '3p' "$HLOCK/state/.lock-identity")" = independent ] || fail "acquisition did not record independent provenance"
 pe_register "$HLOCK" lavish lock-owner-src -- "$BLOCKER" "$HLOCK/trigger" "lock payload" >/dev/null
 FM_PROCEVENT_OWNER_LEASE_SECONDS=2 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
   pe "$HLOCK" reconcile >/dev/null
@@ -3720,6 +3745,7 @@ for self_mode in same-group detached; do
   trap 'kill "$SELF_LOCK_OWNER" 2>/dev/null || true; fm_test_cleanup' EXIT
   [ "$(cat "$HSELFLOCK/inherited-marker")" = 1 ] || fail "holder lost the inherited runner marker"
   [ "$(sed -n '1p' "$HSELFLOCK/state/.lock-identity")" = "$SELF_LOCK_OWNER" ] || fail "holder has no acquired identity proof"
+  [ "$(sed -n '3p' "$HSELFLOCK/state/.lock-identity")" = process-event ] || fail "acquisition lost runner provenance"
   if [ "$self_mode" = detached ]; then
     [ "$(ps -o pgid= -p "$SELF_LOCK_OWNER" | tr -d ' ')" != "$SELF_LOCK_RUNNER" ] || fail "detached holder stayed in the runner group"
     [ "$(ps -o ppid= -p "$SELF_LOCK_OWNER" | tr -d ' ')" != "$SELF_LOCK_RUNNER" ] || fail "detached holder was not reparented"
@@ -5042,7 +5068,7 @@ done
 [ ! -e "$drain_claim" ] || fail "the first generation of the draining fixture never exited"
 # Stand the first generation's claim back up on a live process so the re-arm
 # meets it still held, then release it partway through the confirm window.
-setsid sleep 60 &
+perl -MPOSIX=setsid -e 'setsid() >= 0 or exit 1; exec @ARGV' sleep 60 &
 drain_holder=$!
 # Read the identity only once the holder has exec'd sleep: mid-exec its cmdline
 # can read empty, and a pre-exec identity would never match the live holder.
