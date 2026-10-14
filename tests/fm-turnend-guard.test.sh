@@ -1259,6 +1259,24 @@ SH
   chmod +x "$dir/bin/fm-watch-arm.sh"
 }
 
+write_integrated_recovering_arm() {
+  local dir=$1
+  cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${FM_WATCH_PREDECESSOR_ARM_PID:-}" ]; then
+  printf 'watcher: started pid=%s\n' "$$"
+  exit 0
+fi
+if [ ! -e "$FM_HOME/state/recovery-attempted" ]; then
+  : > "$FM_HOME/state/recovery-attempted"
+  exit 1
+fi
+printf 'pending:downtime:recovered-generation\n' > "$FM_HOME/state/.watcher-down"
+printf 'signal: recovered watcher wake\n'
+SH
+  chmod +x "$dir/bin/fm-watch-arm.sh"
+}
+
 # The 2026-07-21 incident regression: after a spent forced continuation the old
 # one-shot loop guard ALLOWED a blind stop (stop_hook_active=true) while the
 # watcher was already dead. In --claude mode the guard must re-block instead.
@@ -1624,14 +1642,21 @@ test_hook_claude_mode_integrated_monotonic_fail_open() {
   }
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
+  # Health alone is insufficient: the replacement arm must actually deliver.
+  write_integrated_recovering_arm "$dir"
   out=$(run_integrated_autoarm "$dir"); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   rm -rf "$dir/state/.watch.lock"
-  expect_code 0 "$status" "positive watcher recovery must make the auto-arm silent"
+  expect_code 2 "$status" "positive attachment recovery must deliver its wake"
+  assert_contains "$out" "signal: recovered watcher wake" "positive recovery abandoned delivery"
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "positive recovery left the failure notice marker"
   assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "positive recovery left the attended alarm marker"
   assert_absent "$dir/state/.turnend-claude-blocks" "positive recovery left the bounded block budget"
+  # Model a later watcher failure, distinct from the just-delivered recovery.
+  touch -t 202001010000 "$dir/state/.claude-autoarm-epoch"
+  printf 'pending:downtime:next-generation\n' > "$dir/state/.watcher-down"
+  write_integrated_failed_arm "$dir"
   guard_out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" false); guard_status=$?
   expect_code 2 "$guard_status" "a guard after one-shot recovery must start a fresh failure budget"
   count=$(sed -n '2s/^count=//p' "$dir/state/.turnend-claude-blocks")
@@ -1776,7 +1801,7 @@ test_hook_claude_mode_concurrent_recovery_resets_are_idempotent() {
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-concurrent-recovery")
   : > "$dir/state/task1.meta"
   install_integrated_autoarm "$dir"
-  write_integrated_failed_arm "$dir"
+  write_integrated_recovering_arm "$dir"
   seed_claude_budget "$dir" 3
   : > "$dir/state/.claude-autoarm-failure-notified"
   : > "$dir/state/.claude-autoarm-failure-alarmed"

@@ -3617,6 +3617,125 @@ assert_absent "$TMP_ROOT/unguarded-launches" \
   "a source command ran without a successfully initialized owner guard"
 pass "a runner fails closed when its owner guard cannot initialize"
 
+# A verified home lock holder keeps the listener across a watcher gap without
+# a reconcile or lease refresh. When that holder dies, the already-expired
+# lease must again bound the runner. Use a real process with a harness-shaped
+# executable, exactly as the portable lock tests do; no tmux server is used.
+HLOCK="$TMP_ROOT/lock-owner"; new_home "$HLOCK"
+LOCK_BIN=$(fm_fakebin "$TMP_ROOT/lock-owner-bin")
+ln -s /bin/bash "$LOCK_BIN/claude"
+# shellcheck disable=SC2016 # Variables expand inside the fixture harness.
+FM_HOME="$HLOCK" "$LOCK_BIN/claude" -c '"$1/bin/fm-lock.sh" > "$FM_HOME/acquired" || exit; sleep 60 & child=$!; trap "kill $child 2>/dev/null; wait $child 2>/dev/null" EXIT; wait' _ "$ROOT" &
+LOCK_OWNER_PID=$!
+trap 'kill "$LOCK_OWNER_PID" 2>/dev/null || true; wait "$LOCK_OWNER_PID" 2>/dev/null || true; fm_test_cleanup' EXIT
+wait_for "$HLOCK/acquired" || fail "home lock acquisition did not complete"
+[ "$(cat "$HLOCK/state/.lock")" = "$LOCK_OWNER_PID" ] || fail "lock did not record the fixture harness"
+[ "$(sed -n '1p' "$HLOCK/state/.lock-identity")" = "$LOCK_OWNER_PID" ] || fail "acquisition did not bind process identity to the holder"
+pe_register "$HLOCK" lavish lock-owner-src -- "$BLOCKER" "$HLOCK/trigger" "lock payload" >/dev/null
+FM_PROCEVENT_OWNER_LEASE_SECONDS=2 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
+  pe "$HLOCK" reconcile >/dev/null
+wait_for "$HLOCK/state/procevent/lock-owner-src.runner" || fail "lock-owned runner never started"
+LOCK_RUNNER_PID=$(cat "$HLOCK/state/procevent/lock-owner-src.runner")
+LOCK_LEASE=$(cat "$HLOCK/state/procevent/.owner-lease")
+sleep 5
+kill -0 "$LOCK_RUNNER_PID" 2>/dev/null || fail "watcher gap expired a listener with a live home lock holder"
+[ "$(cat "$HLOCK/state/procevent/.owner-lease")" = "$LOCK_LEASE" ] || fail "guard refreshed its own lease"
+kill "$LOCK_OWNER_PID"
+wait "$LOCK_OWNER_PID" 2>/dev/null || true
+trap fm_test_cleanup EXIT
+deadline=$((SECONDS + 6))
+while kill -0 "$LOCK_RUNNER_PID" 2>/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "dead home lock holder preserved an orphaned runner"
+  sleep 0.1
+done
+pass "a live home lock survives a watcher gap; its death restores bounded orphan cleanup"
+
+# A stale process-start identity must not authenticate a live unrelated harness.
+HREUSEDLOCK="$TMP_ROOT/reused-lock-owner"; new_home "$HREUSEDLOCK"
+# shellcheck disable=SC2016 # Variables expand inside the fixture harness.
+FM_HOME="$HREUSEDLOCK" "$LOCK_BIN/claude" -c '"$1/bin/fm-lock.sh" > "$FM_HOME/acquired" || exit; sleep 60 & child=$!; trap "kill $child 2>/dev/null; wait $child 2>/dev/null" EXIT; wait' _ "$ROOT" &
+REUSED_LOCK_OWNER=$!
+trap 'kill "$REUSED_LOCK_OWNER" 2>/dev/null || true; wait "$REUSED_LOCK_OWNER" 2>/dev/null || true; fm_test_cleanup' EXIT
+wait_for "$HREUSEDLOCK/acquired" || fail "reused-pid fixture never acquired its lock"
+# Preserve the live pid but replace the start identity, as a stale record does.
+printf '%s\nold-process-start-identity\n' "$REUSED_LOCK_OWNER" > "$HREUSEDLOCK/state/.lock-identity"
+pe_register "$HREUSEDLOCK" lavish reused-lock-src -- "$BLOCKER" "$HREUSEDLOCK/trigger" "stale identity" >/dev/null
+FM_PROCEVENT_OWNER_LEASE_SECONDS=2 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
+  pe "$HREUSEDLOCK" reconcile >/dev/null
+wait_for "$HREUSEDLOCK/state/procevent/reused-lock-src.runner" || fail "reused-pid runner did not start"
+REUSED_LOCK_RUNNER=$(cat "$HREUSEDLOCK/state/procevent/reused-lock-src.runner")
+deadline=$((SECONDS + 8))
+while kill -0 "$REUSED_LOCK_RUNNER" 2>/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "a reused pid kept the abandoned home alive"
+  sleep 0.1
+done
+kill -0 "$REUSED_LOCK_OWNER" || fail "the negative control did not retain its live harness"
+kill "$REUSED_LOCK_OWNER"
+wait "$REUSED_LOCK_OWNER" 2>/dev/null || true
+trap fm_test_cleanup EXIT
+pass "a live unrelated harness cannot authenticate a stale lock process identity"
+
+# A source cannot certify its own owner even through a reparented child in a
+# separate group. Acquire a real lock so rejection cannot pass vacuously due
+# to a missing identity sidecar; the child retains the runner marker.
+SELF_LOCK_HOLDER="$TMP_ROOT/self-lock-holder.sh"
+cat > "$SELF_LOCK_HOLDER" <<'SH'
+#!/usr/bin/env bash
+"$1/bin/fm-lock.sh" > "$FM_HOME/acquired" || exit 1
+printf '%s\n' "$FM_PROCEVENT_IN_RUNNER" > "$FM_HOME/inherited-marker"
+sleep 60 &
+child=$!
+trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null' EXIT
+wait
+SH
+SELF_LOCK_SOURCE="$TMP_ROOT/self-lock-source.sh"
+cat > "$SELF_LOCK_SOURCE" <<'SH'
+#!/usr/bin/env bash
+mode=$1; shift
+printf '%s\n' "$$" > "$FM_HOME/source-pid"
+if [ "$mode" = detached ]; then
+  perl -MPOSIX=setsid -e '
+    defined(my $pid = fork) or exit 1;
+    exit 0 if $pid;
+    setsid() >= 0 or exit 1;
+    exec @ARGV; exit 1;
+  ' "$@"
+else
+  "$@" &
+fi
+sleep 60 &
+child=$!
+trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null' EXIT
+wait
+SH
+chmod +x "$SELF_LOCK_SOURCE" "$SELF_LOCK_HOLDER"
+for self_mode in same-group detached; do
+  HSELFLOCK="$TMP_ROOT/self-lock-$self_mode"; new_home "$HSELFLOCK"
+  pe_register "$HSELFLOCK" lavish self-lock-src -- "$SELF_LOCK_SOURCE" "$self_mode" "$LOCK_BIN/claude" "$SELF_LOCK_HOLDER" "$ROOT" >/dev/null
+  FM_PROCEVENT_OWNER_LEASE_SECONDS=2 FM_PROCEVENT_OWNER_CHECK_SECONDS=1 \
+    pe "$HSELFLOCK" reconcile >/dev/null
+  wait_for "$HSELFLOCK/inherited-marker" || fail "source never acquired its self-certifying lock"
+  SELF_LOCK_OWNER=$(cat "$HSELFLOCK/state/.lock")
+  SELF_LOCK_RUNNER=$(cat "$HSELFLOCK/state/procevent/self-lock-src.runner")
+  trap 'kill "$SELF_LOCK_OWNER" 2>/dev/null || true; fm_test_cleanup' EXIT
+  [ "$(cat "$HSELFLOCK/inherited-marker")" = 1 ] || fail "holder lost the inherited runner marker"
+  [ "$(sed -n '1p' "$HSELFLOCK/state/.lock-identity")" = "$SELF_LOCK_OWNER" ] || fail "holder has no acquired identity proof"
+  if [ "$self_mode" = detached ]; then
+    [ "$(ps -o pgid= -p "$SELF_LOCK_OWNER" | tr -d ' ')" != "$SELF_LOCK_RUNNER" ] || fail "detached holder stayed in the runner group"
+    [ "$(ps -o ppid= -p "$SELF_LOCK_OWNER" | tr -d ' ')" != "$SELF_LOCK_RUNNER" ] || fail "detached holder was not reparented"
+    [ "$(ps -o ppid= -p "$SELF_LOCK_OWNER" | tr -d ' ')" != "$(cat "$HSELFLOCK/source-pid")" ] || fail "detached holder retained its source parent"
+  fi
+  deadline=$((SECONDS + 8))
+  while kill -0 "$SELF_LOCK_RUNNER" 2>/dev/null; do
+    [ "$SECONDS" -lt "$deadline" ] || fail "source certified its own owner through a $self_mode child"
+    sleep 0.1
+  done
+  # A detached fixture escapes the runner's kill group; clean up our exact pid.
+  kill "$SELF_LOCK_OWNER" 2>/dev/null || true
+  trap fm_test_cleanup EXIT
+  pass "a runner's $self_mode harness child cannot certify its own home"
+done
+
 HATTACHED="$TMP_ROOT/attached-owner"; new_home "$HATTACHED"
 fm_test_track_procevent_home "$HATTACHED"
 ATTACHED_TRIGGER="$TMP_ROOT/attached.trigger"

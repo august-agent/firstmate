@@ -110,9 +110,8 @@ The stale-owner claim occurs only after the existing AFK and supervision-need ga
 After each non-actionable arm close, the hook rechecks the identity-matched watcher lock and fresh beacon before retrying a bounded number of times.
 The beacon is `state/.last-watcher-beat`, which only the watcher process touches.
 
-- A cycle-end failure is benign when that live-watcher predicate is true.
-  In that case the hook suppresses the arm output and continues silently.
-- Only an exhausted failure with no verified watcher commits one last-resort notice for the continuous failure episode.
+- A cycle-end failure retries through the arm even when that live-watcher predicate is true, so the next arm attaches and keeps following the watcher's eventual wake.
+- An exhausted failure to deliver an actionable close commits one last-resort notice for the continuous failure episode, including when a healthy watcher remains without a working arm.
 - A refused notice commit stays silent for a later retry.
 - After a successful notice, later Stop cycles exit 2 without repeating it until the turn-end guard consumes the attended fail-open.
 
@@ -490,8 +489,8 @@ It checks that a newly appended keyed decision is classified without rereading e
 - Stale and live session owners.
 - Unchanged AFK and need boundaries.
 - Single-flight.
-- Bounded failure retries.
-- Benign live-watcher cycle ends.
+- Bounded failure retries with backoff, silent arm exits, unexpected shell-exit recovery, and attachment to a late healthy watcher through actionable wake delivery.
+- Bounded recovery when a healthy watcher survives a failed arm, with no health-only completion.
 - One-notice failure episodes.
 - Exit-2 translation.
 - The handling successor an ended attached cycle starts with the closed arm as its predecessor and that outlives the rewake.
