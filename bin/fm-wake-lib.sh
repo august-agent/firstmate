@@ -470,9 +470,10 @@ fm_watcher_supervision_verdict() {
   model=$(fm_supervision_model)
   if [ "$model" = autoarm ]; then
     # A leftover fresh beat cannot excuse a demonstrably abandoned arm.
-    # Cursor has no Claude epoch and keeps its ordinary between-turn grace.
+    # Cursor keeps its between-turn grace even after switching from Claude.
     if fm_autoarm_ledger_read "$state" && [ "$FM_AUTOARM_OUTCOME" = arming ] \
       && ! fm_autoarm_claim_open "$state" "$grace" \
+      && [ "$("$FM_WAKE_LIB_DIR/fm-harness.sh" 2>/dev/null)" != cursor ] \
       && ! fm_watcher_healthy "$state" "$watch" "$grace" "$home"; then
       FM_WATCHER_VERDICT_REASON=no-watcher
       return 0
