@@ -387,6 +387,8 @@ Fresh `failed` and `failed-suppressed` outcomes enter or advance the failure pro
 The auto-arm itself rechecks the healthy watcher predicate and retries a bounded number of times before reporting a genuine failure, with one second of backoff before the second attempt and two before the third.
 An unexpected shell exit while its generation is still `arming` uses the remaining attempt budget and ordinary durable failure handoff, instead of leaving a dead owner recorded as arming.
 This fallback disables its own EXIT trap to prevent recursive recovery; a retry attaches to an already healthy watcher and keeps following its wake instead of starting a second watcher or abandoning delivery.
+A watcher that is already healthy when an arm exits also takes that attachment path; health alone never completes an owned arm cycle.
+After a verified watcher survives a failed arm, the hook resets its old failure episode only when a retry returns an actionable close, preserving failure evidence if every attachment attempt fails.
 Untrappable termination such as SIGKILL still requires a later Stop firing to reclaim the dead generation.
 
 The foreground arm legitimately follows a healthy watcher until its next wake.

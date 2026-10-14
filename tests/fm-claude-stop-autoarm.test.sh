@@ -140,6 +140,17 @@ printf 'watcher: FAILED - cycle ended without an actionable reason\n'
 exit 1
 SH
       ;;
+    recovered-live)
+      cat >> "$dir/bin/fm-watch-arm.sh" <<'SH'
+if [ ! -e "$FM_HOME/state/recovery-attempted" ]; then
+  : > "$FM_HOME/state/recovery-attempted"
+  printf 'watcher: FAILED - cycle ended without an actionable reason\n'
+  exit 1
+fi
+printf 'pending:downtime:recovered-generation\n' > "$FM_HOME/state/.watcher-down"
+printf 'signal: recovered watcher wake\n'
+SH
+      ;;
     actionable-many)
       cat >> "$dir/bin/fm-watch-arm.sh" <<'SH'
 printf 'pending:downtime:fixture-generation\n' > "$FM_HOME/state/.watcher-down"
@@ -151,10 +162,15 @@ SH
       ;;
     reset-boundary)
       cat >> "$dir/bin/fm-watch-arm.sh" <<'SH'
+if [ ! -e "$FM_HOME/state/reset-attempted" ]; then
+  : > "$FM_HOME/state/reset-attempted"
+  exit 1
+fi
 : > "$FM_HOME/state/arm-waiting"
 while [ ! -e "$FM_HOME/state/arm-release" ]; do sleep 0.02; done
-printf 'watcher: FAILED - cycle ended without an actionable reason\n'
-exit 1
+printf 'pending:downtime:reset-generation\n' > "$FM_HOME/state/.watcher-down"
+printf 'signal: recovered watcher wake\n'
+exit 0
 SH
       ;;
     slow-actionable)
@@ -503,7 +519,7 @@ test_stands_down_only_on_pi_code_transcript_path() {
 }
 
 test_actionable_close_with_live_successor_rewakes_once() {
-  local dir out out2 status status2 pid identity
+  local dir out out2 out3 status status2 status3 pid identity
   dir=$(make_primary_dir "$TMP_ROOT/actionable-live-successor")
   : > "$dir/state/task.meta"
   write_arm_fixture "$dir" actionable
@@ -515,18 +531,25 @@ test_actionable_close_with_live_successor_rewakes_once() {
 
   out=$(run_autoarm "$dir" 2>/dev/null); status=$?
   write_arm_fixture "$dir" benign-live
-  out2=$(run_autoarm "$dir" 2>/dev/null); status2=$?
+  out2=$(FM_CLAUDE_AUTOARM_ATTEMPTS=3 run_autoarm "$dir" 2>/dev/null); status2=$?
 
   expect_code 2 "$status" "an actionable close must rewake when a live successor already exists"
-  expect_code 0 "$status2" "a repeated non-actionable close with the live successor must stay quiet"
+  expect_code 2 "$status2" "repeated non-actionable closes must report exhausted delivery recovery"
   [ "$(printf '%s\n' "$out" | grep -c '^firstmate watcher wake')" -eq 1 ] \
     || fail "actionable close with a live successor did not emit exactly one wake banner: $out"
   [ "$(printf '%s\n' "$out" | grep -c '^stale: fixture-win actionable')" -eq 1 ] \
     || fail "actionable close with a live successor did not surface its reason exactly once: $out"
-  [ -z "$out2" ] || fail "repeated hook duplicated the delivered actionable result: $out2"
+  assert_contains "$out2" "auto-arm FAILED" "exhausted attachment recovery was not reported"
+  [[ "$out2" != *"stale: fixture-win actionable"* ]] || fail "repeated hook duplicated the delivered actionable result: $out2"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 4 ] || fail "healthy failed arms escaped the retry bound"
   kill -0 "$pid" 2>/dev/null || fail "actionable delivery stopped or replaced the live successor"
-  [ "$(epoch_outcome "$dir")" = clean ] || fail "the later benign close must record outcome=clean"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "exhausted delivery recovery must record outcome=failed"
 
+  out3=$(FM_CLAUDE_AUTOARM_ATTEMPTS=3 run_autoarm "$dir" 2>/dev/null); status3=$?
+  expect_code 2 "$status3" "healthy but undelivered recovery must keep the bounded retry handoff"
+  [ -z "$out3" ] || fail "healthy failed arms repeated the episode notice: $out3"
+  [ "$(epoch_outcome "$dir")" = failed-suppressed ] || fail "healthy failed arms reset their own failure episode"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 7 ] || fail "consecutive healthy failures exceeded their retry budgets"
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   pass "auto-arm: actionable close survives a healthy successor without duplicate delivery"
@@ -718,13 +741,16 @@ test_exit_recovery_attaches_to_healthy_watcher() {
   pass "auto-arm: EXIT recovery follows a healthy watcher and delivers its wake"
 }
 
-test_late_watcher_is_attached_and_delivers_wake() {
-  local dir fakebin real_sleep hook watcher i status out
-  dir=$(make_primary_dir "$TMP_ROOT/late-watcher")
+test_healthy_watcher_is_attached_and_delivers_wake() {
+  local timing=$1 dir fakebin real_sleep hook watcher i status out
+  dir=$(make_primary_dir "$TMP_ROOT/$timing-watcher")
+  [ "$timing" != already ] || touch "$dir/wait-for-watcher"
   # Real arm and watcher, with all production dependencies in this private home.
   cp -R "$ROOT/bin/." "$dir/bin/"
   mv "$dir/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm-real.sh"
   : > "$dir/state/task.meta"
+  : > "$dir/state/.claude-autoarm-failure-notified"
+  : > "$dir/state/.claude-autoarm-failure-alarmed"
   fakebin=$(fm_fakebin "$dir/tools")
   real_sleep=$(command -v sleep)
   cat > "$fakebin/tmux" <<'SH'
@@ -750,6 +776,12 @@ if [ -n "${FM_WATCH_PREDECESSOR_ARM_PID:-}" ]; then
 fi
 if [ ! -e "$FM_HOME/first-arm" ]; then
   : > "$FM_HOME/first-arm"
+  if [ -e "$FM_HOME/wait-for-watcher" ]; then
+    for _ in $(seq 1 200); do
+      [ -e "$FM_HOME/first-arm-release" ] && break
+      sleep 0.1
+    done
+  fi
   exit 0
 fi
 "$FM_HOME/bin/fm-watch-arm-real.sh" > "$FM_HOME/attached.log" 2>&1
@@ -762,8 +794,13 @@ SH
   hook=$RUN_AUTOARM_BG_PID
   watcher=
   trap 'kill "$hook" ${watcher:+"$watcher"} 2>/dev/null || true; fm_test_cleanup' EXIT
-  for i in $(seq 1 100); do [ -e "$dir/backoff" ] && break; sleep 0.1; done
-  assert_present "$dir/backoff" "hook did not reach backoff after the arm died"
+  if [ "$timing" = already ]; then
+    for i in $(seq 1 100); do [ -e "$dir/first-arm" ] && break; sleep 0.1; done
+    assert_present "$dir/first-arm" "initial arm did not start"
+  else
+    for i in $(seq 1 100); do [ -e "$dir/backoff" ] && break; sleep 0.1; done
+    assert_present "$dir/backoff" "hook did not reach backoff after the arm died"
+  fi
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     "$dir/bin/fm-watch.sh" > "$dir/watch.out" 2>&1 &
@@ -772,6 +809,9 @@ SH
   FM_HOME="$dir" bash -c '. "$1"; fm_watcher_healthy "$2" "$3" 300 "$4"' _ \
     "$dir/bin/fm-wake-lib.sh" "$dir/state" "$dir/bin/fm-watch.sh" "$dir" \
     || fail "late watcher was not identity-verified healthy during backoff"
+  touch "$dir/first-arm-release"
+  for i in $(seq 1 100); do [ -e "$dir/backoff" ] && break; sleep 0.1; done
+  assert_present "$dir/backoff" "healthy watcher caused the hook to abandon attachment"
   touch "$dir/continue"
   for i in $(seq 1 200); do
     grep -q "watcher: attached pid=$watcher" "$dir/attached.log" 2>/dev/null && break
@@ -789,7 +829,9 @@ SH
   expect_code 2 "$status" "late watcher's actionable wake must become a continuation"
   assert_contains "$out" "signal: $dir/state/task.status" "late watcher wake was not translated"
   [ "$(epoch_outcome "$dir")" = rewake ] || fail "late watcher wake was not committed"
-  pass "auto-arm: late healthy watcher is attached without replacement and its wake is delivered"
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "attachment delivery left the failure episode"
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "attachment delivery left the attended alarm"
+  pass "auto-arm: $timing healthy watcher is attached without replacement and its wake is delivered"
 }
 
 test_post_alarm_actionable_close_is_suppressed() {
@@ -808,11 +850,11 @@ test_post_alarm_actionable_close_is_suppressed() {
   pass "auto-arm: post-alarm actionable outcomes cannot continue or reset failure state"
 }
 
-test_benign_cycle_end_with_live_watcher_is_silent() {
+test_verified_attachment_wake_resets_episode() {
   local dir out out2 status status2 pid identity
   dir=$(make_primary_dir "$TMP_ROOT/benign-live")
   : > "$dir/state/task.meta"
-  write_arm_fixture "$dir" benign-live
+  write_arm_fixture "$dir" recovered-live
   sleep 60 &
   pid=$!
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify live watcher holder for benign close"
@@ -825,23 +867,23 @@ test_benign_cycle_end_with_live_watcher_is_silent() {
   out2=$(run_autoarm "$dir" 2>/dev/null); status2=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  expect_code 0 "$status" "a failed-looking cycle with a live fresh watcher must be benign"
-  expect_code 0 "$status2" "the next Stop-owned cycle must remain benign with the live watcher"
-  [ -z "$out" ] || fail "benign live cycle produced an operator notice: $out"
-  [ -z "$out2" ] || fail "next benign live cycle produced an operator notice: $out2"
-  [ "$(epoch_outcome "$dir")" = clean ] || fail "benign live cycle must record outcome=clean, got: $(epoch_outcome "$dir")"
-  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 2 ] || fail "the next Stop-owned cycle must run its own bounded arm"
-  [ ! -e "$dir/state/.turnend-claude-blocks" ] || fail "benign live cycle must clear the prior block budget"
-  [ ! -e "$dir/state/.claude-autoarm-failure-notified" ] || fail "benign live cycle must not leave a failure-notice marker"
-  [ ! -e "$dir/state/.claude-autoarm-failure-alarmed" ] || fail "benign live cycle must not leave an attended-alarm marker"
-  pass "auto-arm: benign cycle end with a live watcher and fresh beacon stays silent across the next cycle"
+  expect_code 2 "$status" "a recovered attachment must deliver its wake"
+  expect_code 2 "$status2" "the next Stop-owned cycle must deliver its new wake"
+  assert_contains "$out" "signal: recovered watcher wake" "recovery abandoned its wake"
+  assert_contains "$out2" "signal: recovered watcher wake" "next cycle abandoned its wake"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "recovered attachment did not commit rewake"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 3 ] || fail "recovery must retry once before the next Stop-owned cycle"
+  [ ! -e "$dir/state/.turnend-claude-blocks" ] || fail "recovered attachment must clear the prior block budget"
+  [ ! -e "$dir/state/.claude-autoarm-failure-notified" ] || fail "recovered attachment must not leave a failure-notice marker"
+  [ ! -e "$dir/state/.claude-autoarm-failure-alarmed" ] || fail "recovered attachment must not leave an attended-alarm marker"
+  pass "auto-arm: verified attachment delivery resets the episode and preserves later wakes"
 }
 
 test_positive_recovery_budget_contention_preserves_episode() {
   local dir out status pid identity holder
   dir=$(make_primary_dir "$TMP_ROOT/recovery-budget-contention")
   : > "$dir/state/task.meta"
-  write_arm_fixture "$dir" benign-live
+  write_arm_fixture "$dir" recovered-live
   sleep 60 &
   pid=$!
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify live watcher holder for recovery contention"
@@ -861,10 +903,12 @@ test_positive_recovery_budget_contention_preserves_episode() {
   assert_present "$dir/state/.claude-autoarm-failure-notified" "recovery contention partially cleared the failure notice"
   kill "$holder" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
+  rm -f "$dir/state/recovery-attempted"
   out=$(run_autoarm "$dir" 2>/dev/null); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  expect_code 0 "$status" "a later healthy auto-arm must complete the episode reset"
+  expect_code 2 "$status" "a later recovered attachment must reset the episode and deliver"
+  assert_contains "$out" "signal: recovered watcher wake" "reset retry abandoned wake delivery"
   assert_absent "$dir/state/.turnend-claude-blocks" "successful retry left the block budget"
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "successful retry left the failure notice"
   pass "auto-arm: budget contention preserves the episode and forces a reset retry"
@@ -1891,9 +1935,10 @@ test_unverified_clean_close_exhausts_retries
 test_silent_arm_exit_has_bounded_backoff
 test_unexpected_hook_exit_recovers_owned_generation
 test_exit_recovery_attaches_to_healthy_watcher
-test_late_watcher_is_attached_and_delivers_wake
+test_healthy_watcher_is_attached_and_delivers_wake late
+test_healthy_watcher_is_attached_and_delivers_wake already
 test_post_alarm_actionable_close_is_suppressed
-test_benign_cycle_end_with_live_watcher_is_silent
+test_verified_attachment_wake_resets_episode
 test_positive_recovery_budget_contention_preserves_episode
 test_owner_mutex_contention_preserves_failure_episode_reset
 test_arms_for_x_mode_poll_need_without_inflight
