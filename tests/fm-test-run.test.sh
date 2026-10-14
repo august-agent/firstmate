@@ -1027,9 +1027,11 @@ test_list_scheduled_non_lane_selections_use_serial_weights() {
   for script in "${scripts[@]}"; do
     printf '\n' >>"$repo/$script"
   done
+  # Order follows the serial duration hints: muse outgrew kimi in the
+  # 2026-10-14 refresh, while the three default-weight scripts keep path order.
   printf '%s\n' \
-    tests/fm-kimi-harness.test.sh \
     tests/fm-muse-harness.test.sh \
+    tests/fm-kimi-harness.test.sh \
     tests/fm-brief.test.sh \
     tests/fm-captain-hold-lifecycle.test.sh \
     tests/fm-lint.test.sh \

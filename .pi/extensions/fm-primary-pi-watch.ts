@@ -1200,6 +1200,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on?.("before_agent_start", (event) => {
+    // Pi 1.2.0 also fires this event for extension-triggered custom runs, which carry a message and no prompt.
+    // Wakes are user dialog only, so custom runs return here. Events without a messageType predate the split and carry a user prompt.
+    if (event.messageType === "custom") return;
     consumeWake(generation, event.prompt);
   });
   pi.on?.("message_start", (event) => {

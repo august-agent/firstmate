@@ -197,6 +197,23 @@ suite_cleanup() {
 }
 trap suite_cleanup EXIT
 
+# tests/lib.sh's pass, plus suite hygiene for this file's host homes. Hosts,
+# watchers and arms left running pile up across the suite: every later poll
+# loop competes with them for scheduling, which stretches each case's waits
+# without failing them until the whole file outruns its CI job cap. Every case
+# builds its own homes through make_home and never touches another case's
+# home, so stopping all registered homes on each pass is safe; the EXIT trap
+# still owns the final cleanup when a case fails instead of passing.
+pass() {
+  printf 'ok - %s\n' "$1"
+  local home
+  [ -f "$HOMES_FILE" ] || return 0
+  while IFS= read -r home; do
+    [ -n "$home" ] && stop_home_processes "$home"
+  done < "$HOMES_FILE"
+  : > "$HOMES_FILE"
+}
+
 make_home() {  # <name> <attended|away|quiet> [config line]
   local home="$TMP_ROOT/$1"
   mkdir -p "$home/state" "$home/config" "$home/fakebin"

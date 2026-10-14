@@ -21,6 +21,11 @@ A failed script's duration is excluded even when its lane uploaded an artifact.
 In particular, run 36664663190's serial 5 finished in 22m15s with an assertion failure, not a timeout; treating that as a healthy whole-lane sample would hide the failure.
 Collect successful per-script measurements for every member before calculating a split.
 
+Serial hints were refreshed on 2026-10-14 from three august-agent/firstmate CI runs: the last green main run [36282974524](https://github.com/august-agent/firstmate/actions/runs/36282974524) and the red runs [38448044780](https://github.com/august-agent/firstmate/actions/runs/38448044780) and [38304875341](https://github.com/august-agent/firstmate/actions/runs/38304875341).
+Each hint is the slowest successful `duration_ms` across those runs' uploaded portable timing artifacts, never lowered from its previous value.
+This hinted eight previously unmeasured scripts and left one remaining; the native-Windows exception below is unchanged.
+`tests/fm-supervision-host.test.sh` keeps its 789123 ms hint until a green post-fix run re-measures it: the red runs never completed that script, so they bound it from below without sampling it.
+
 `tests/fm-supervision-host.test.sh` uses 789123 ms from run 36669175457, after the merged [host runtime fix](https://github.com/kunchenguid/firstmate/pull/6179), rather than its pre-fix maximum of 1065298 ms.
 That post-fix value has only one sample in this baseline, so further green runs must establish its variance.
 The native-Windows-only `tests/fm-pi-windows-shell-invocation.test.sh` retains its separate 5121 ms measurement from 2026-09-06T21:02Z instead of a portable capability skip.
