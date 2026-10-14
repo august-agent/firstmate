@@ -438,6 +438,17 @@ test_autoarm_fresh_beacon_without_watcher_is_healthy() {
   pass "fm-guard stale banner: auto-arm fresh beacon without a live watcher is healthy"
 }
 
+test_autoarm_abandoned_claim_overrides_fresh_beacon() {
+  local dir home out
+  dir=$(make_guard_case autoarm-abandoned)
+  home=$(case_home "$dir")
+  touch "$home/state/.last-watcher-beat"
+  printf 'epoch=9 owner_pid=9999999 outcome=arming updated_at=1\ndead-owner\n' > "$home/state/.claude-autoarm-epoch"
+  out=$(run_guard_case_autoarm "$dir")
+  assert_contains "$out" 'WATCHER DOWN - SUPERVISION IS OFF' "abandoned arm hid behind a fresh beat"
+  pass "fm-guard stale banner: an abandoned arming claim overrides leftover beacon grace"
+}
+
 test_autoarm_stale_beacon_alarms_with_correct_reason() {
   local dir out
   dir=$(make_guard_case autoarm-stale)
@@ -958,6 +969,7 @@ test_branch_actor_is_never_told_to_repair_the_watcher
 test_persistent_model_ignores_pi_extension_evidence
 test_extension_live_watcher_is_healthy_without_ownership_evidence
 test_autoarm_fresh_beacon_without_watcher_is_healthy
+test_autoarm_abandoned_claim_overrides_fresh_beacon
 test_autoarm_stale_beacon_alarms_with_correct_reason
 test_autoarm_stale_episode_is_stable
 test_autoarm_long_handling_turn_stays_silent

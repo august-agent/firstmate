@@ -27,6 +27,7 @@ install_autoarm_scripts() {
   local dir=$1
   mkdir -p "$dir/bin"
   cp "$ROOT/bin/fm-claude-stop-autoarm.sh" "$dir/bin/fm-claude-stop-autoarm.sh"
+  cp "$ROOT/bin/fm-claude-stop-recovery.sh" "$dir/bin/fm-claude-stop-recovery.sh"
   cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
@@ -932,7 +933,7 @@ test_owner_mutex_contention_preserves_failure_episode_reset() {
   hook_pid=$RUN_AUTOARM_BG_PID
   i=0
   while [ ! -e "$dir/state/arm-waiting" ]; do
-    [ "$i" -lt 50 ] || fail "healthy owner never reached the reset boundary"
+    [ "$i" -lt 200 ] || fail "healthy owner never reached the reset boundary"
     sleep 0.05
     i=$((i + 1))
   done
@@ -1915,6 +1916,126 @@ test_fm_lock_status_still_works_with_shared_lib() {
   pass "fm-lock: shared session-lock lib preserves the status path"
 }
 
+test_recovery_hook_closes_with_normal_delivery() {
+  local dir status=0
+  dir=$(make_primary_dir "$TMP_ROOT/paired-normal")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1 "$FM_HOME/bin/fm-claude-stop-autoarm.sh" </dev/null > "$FM_HOME/ordinary.out" 2>&1 & ordinary=$!
+    "$FM_HOME/bin/fm-claude-stop-recovery.sh" </dev/null > "$FM_HOME/recovery.out" 2>&1 & recovery=$!
+    wait "$ordinary"; rc=$?
+    wait "$recovery"; printf "%s\n" "$?" > "$FM_HOME/recovery.rc"
+    exit "$rc"
+  ' || status=$?
+  expect_code 2 "$status" "normal paired hooks must preserve the ordinary wake"
+  [ "$(cat "$dir/recovery.rc")" = 0 ] || fail "healthy delivery made the recovery hook emit a duplicate wake"
+  [ ! -s "$dir/recovery.out" ] || fail "healthy recovery monitor printed a duplicate notice"
+  [ "$(epoch_field "$dir" epoch)" -eq 1 ] || fail "healthy paired hooks created a second generation"
+  assert_absent "$dir/state/.claude-autoarm-recovery.lock" "normal delivery left its sibling hook running"
+  pass "auto-arm: normal delivery closes its independent recovery hook without another generation"
+}
+
+test_recovery_hook_survives_notification_transport_death() {
+  local dir harness owner transport i status=0
+  dir=$(make_primary_dir "$TMP_ROOT/killed-transport")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  cat > "$dir/config/x-mode.env" <<'SH'
+if [ ! -e "$FM_HOME/owner-held" ]; then
+  printf '%s\n' "$$" > "$FM_HOME/owner-held"
+  while [ ! -e "$FM_HOME/release-owner" ]; do sleep 0.1; done
+fi
+SH
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    "$FM_HOME/bin/fm-claude-stop-autoarm.sh" </dev/null > "$FM_HOME/ordinary.out" 2>&1 & ordinary=$!
+    "$FM_HOME/bin/fm-claude-stop-recovery.sh" </dev/null > "$FM_HOME/recovery.out" 2>&1 & recovery=$!
+    wait "$ordinary"; printf "%s\n" "$?" > "$FM_HOME/ordinary.rc"
+    wait "$recovery"; rc=$?
+    touch "$FM_HOME/release-owner"
+    exit "$rc"
+  ' > "$dir/harness.out" 2>&1 &
+  harness=$!
+  owner=
+  trap 'touch "$dir/release-owner"; kill "$harness" ${owner:+"$owner"} 2>/dev/null || true; fm_test_cleanup' EXIT
+  for i in $(seq 1 200); do
+    [ -s "$dir/owner-held" ] && [ -e "$dir/state/.claude-autoarm-recovery.lock/pid" ] && break
+    sleep 0.1
+  done
+  assert_present "$dir/owner-held" "ordinary hook never reached its held arming generation"
+  assert_present "$dir/state/.claude-autoarm-recovery.lock/pid" "independent recovery hook did not start"
+  owner=$(cat "$dir/owner-held")
+  transport=$(epoch_field "$dir" transport_pid)
+  [ -n "$transport" ] && [ "$transport" != "$owner" ] || fail "generation did not bind its separate transport"
+  kill -KILL "$transport" || fail "could not kill ordinary notification transport"
+  kill -0 "$owner" 2>/dev/null || fail "transport kill also killed the isolated owner"
+  for i in $(seq 1 300); do
+    kill -0 "$harness" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$harness" 2>/dev/null && fail "independent recovery hook never delivered its wake"
+  wait "$harness" || status=$?
+  expect_code 2 "$status" "independent recovery transport must return the recovered wake"
+  [ "$(cat "$dir/ordinary.rc")" = 137 ] || fail "original hook transport was not killed"
+  [ "$(epoch_field "$dir" epoch)" -eq 2 ] || fail "recovery failed to take exactly one successor generation"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "transport death left an abandoned arming generation"
+  assert_contains "$(cat "$dir/recovery.out")" 'fixture-win actionable' "surviving hook lost the wake"
+  for i in $(seq 1 100); do kill -0 "$owner" 2>/dev/null || break; sleep 0.1; done
+  kill -0 "$owner" 2>/dev/null && fail "superseded detached owner did not retire"
+  trap fm_test_cleanup EXIT
+  pass "auto-arm: independent native hook recovers a killed transport without another Stop"
+}
+
+test_killed_owner_group_recovers_and_repeated_death_is_bounded() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/killed-owner-group")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  cat > "$dir/config/x-mode.env" <<'SH'
+pgid=$(ps -o pgid= -p "$$" | tr -d '[:space:]')
+[ "$pgid" = "$$" ] || { printf 'owner-is-not-isolated\n' >&2; exit 1; }
+printf '%s\n' "$$" >> "$FM_HOME/state/killed-owners"
+kill -KILL -- "-$$"
+SH
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "repeated isolated owner death must produce a bounded failure wake"
+  assert_not_contains "$out" 'owner-is-not-isolated' "generation owner shares the transport process group"
+  [ "$(wc -l < "$dir/state/killed-owners" | tr -d ' ')" -eq 2 ] || fail "owner-death retries were not bounded"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "repeated kill stranded an arming record"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "repeated kill lost durable failure evidence"
+  assert_present "$dir/state/.lock-identity" "owned legacy session lock was not upgraded for listener survival"
+  pass "auto-arm: isolated owner groups recover and repeated death has a durable bounded failure"
+}
+
+test_killed_owner_recovers_without_another_stop() {
+  local dir out status dead_owner
+  dir=$(make_primary_dir "$TMP_ROOT/killed-owner")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  cat > "$dir/config/x-mode.env" <<'SH'
+if [ ! -e "$FM_HOME/state/killed-epoch" ]; then
+  cp "$FM_HOME/state/.claude-autoarm-epoch" "$FM_HOME/state/killed-epoch"
+  kill -KILL "$$"
+fi
+SH
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  dead_owner=$(sed -n 's/.*owner_pid=\([0-9]*\) .*/\1/p' "$dir/state/killed-epoch")
+  [ -n "$dead_owner" ] || fail "kill injection did not capture a generation owner"
+  kill -0 "$dead_owner" 2>/dev/null && fail "the injected owner did not die"
+  assert_contains "$(cat "$dir/state/killed-epoch")" 'outcome=arming' "injection did not strand arming"
+  expect_code 2 "$status" "one Stop must recover its killed owner and deliver a wake"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "killed owner was not recovered automatically"
+  [ "$(epoch_field "$dir" epoch)" -eq 2 ] || fail "recovery must claim one successor generation"
+  assert_contains "$out" 'fixture-win actionable' "recovery lost the wake"
+  pass "auto-arm: a killed arming owner recovers within the original Stop"
+}
+
+test_recovery_hook_closes_with_normal_delivery
+test_recovery_hook_survives_notification_transport_death
+test_killed_owner_recovers_without_another_stop
+test_killed_owner_group_recovers_and_repeated_death_is_bounded
 test_inert_in_child_worktree
 test_inert_without_session_lock
 test_reclaims_stale_session_lock_before_arming

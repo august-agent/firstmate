@@ -389,9 +389,11 @@ An unexpected shell exit while its generation is still `arming` uses the remaini
 This fallback disables its own EXIT trap to prevent recursive recovery; a retry attaches to an already healthy watcher and keeps following its wake instead of starting a second watcher or abandoning delivery.
 A watcher that is already healthy when an arm exits also takes that attachment path; health alone never completes an owned arm cycle.
 After a verified watcher survives a failed arm, the hook resets its old failure episode only when a retry returns an actionable close, preserving failure evidence if every attachment attempt fails.
-Untrappable termination such as SIGKILL still requires a later Stop firing to reclaim the dead generation.
+Untrappable owner death is retried within the same Stop, and an independent recovery hook covers loss of the ordinary notification transport; [watcher continuity](watcher-continuity.md#claude-stop-hook) owns that lifecycle.
+A dead or identity-mismatched owner or recorded transport never counts as an open claim, even with a fresh leftover beacon.
+The pull guard also rejects that abandoned-claim shape instead of allowing the ordinary between-turn beacon grace.
 
-The foreground arm legitimately follows a healthy watcher until its next wake.
+The supervised arm legitimately follows a healthy watcher until its next wake.
 The hook therefore catches HUP, TERM, and INT from host timeout or teardown and commits the ordinary durable failed outcome and failure-notice marker before exiting 2 for a recovery turn.
 Claude drops that exit 2 when it terminated the hook at the configured timeout itself, so a park that outlives the timeout ends without a rewake (`bin/fm-claude-stop-autoarm.sh` header).
 

@@ -21,8 +21,10 @@
 # recorded pid is reclaimed and rewritten to this session's anchor.
 #
 # state/.lock-identity is published only after an acquisition or confirmed-own
-# acquisition verifies the lock. Its two lines are that holder's pid and the
-# process-start identity from fm_pid_identity. Readers must match both; an
+# acquisition verifies the lock. Its first two lines are that holder's pid and the
+# process-start identity from fm_pid_identity. Line 3 records acquisition
+# provenance: independent when FM_PROCEVENT_IN_RUNNER is unset, otherwise
+# process-event. Readers must match the pid and identity; an
 # absent or stale sidecar adds no owner-presence evidence. Atomic replacement
 # under the claim lock keeps partial records from certifying a reused pid.
 #
@@ -156,11 +158,12 @@ publish_lock_session_or_die() {
 }
 
 publish_lock_identity() {  # <verified-holder-pid>
-  local identity tmp
+  local identity tmp provenance=process-event
+  [ "${FM_PROCEVENT_IN_RUNNER+x}" = x ] || provenance=independent
   identity=$(fm_pid_identity "$1") || return 1
   [ -n "$identity" ] || return 1
   tmp=$(mktemp "$STATE/.lock-identity.XXXXXX") || return 1
-  if ! { printf '%s\n%s\n' "$1" "$identity" > "$tmp" && mv -f "$tmp" "$STATE/.lock-identity"; }; then
+  if ! { printf '%s\n%s\n%s\n' "$1" "$identity" "$provenance" > "$tmp" && mv -f "$tmp" "$STATE/.lock-identity"; }; then
     rm -f "$tmp"
     return 1
   fi
