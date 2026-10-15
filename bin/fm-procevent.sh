@@ -72,6 +72,8 @@
 #            malformed values use the default) so their runner can autohandle
 #            first. Task-owned results bypass this grace. After it expires,
 #            unhandled results are republished even if their runner crashed.
+#            Future-dated captures are republished immediately, so a backward
+#            clock step cannot extend the grace.
 #            Start a runner for any registered source that has no live owner and
 #            no open task-owned round. This is liveness repair only - it never
 #            discovers results by
@@ -904,14 +906,15 @@ EOF
 }
 
 publish_pending() {  # [result-file-to-skip] [self-announcing-grace-seconds]
-  local skip=${1-} grace=${2:-0} result adapter published=0
+  local skip=${1-} grace=${2:-0} result adapter age published=0
   while IFS= read -r result; do
     [ -n "$result" ] || continue
     [ "$result" = "$skip" ] && continue
     # Only reconcile supplies a grace: start still owns its immediate
     # post-autohandle publish. A capture's immutable owner, not the current
     # registration, decides whether it is a built-in or task-owned round.
-    if [ "$grace" -gt 0 ] && [ "$(fm_path_age "$result")" -lt "$grace" ] \
+    if [ "$grace" -gt 0 ] && age=$(fm_path_age "$result") \
+      && [ "$age" -ge 0 ] && [ "$age" -lt "$grace" ] \
       && [ ! -e "${result%.result}.extension" ] && [ ! -L "${result%.result}.extension" ] \
       && [ -z "$(fm_procevent_result_owner_task "$result" 2>/dev/null || true)" ] \
       && adapter=$(fm_procevent_result_adapter "$result" 2>/dev/null) \

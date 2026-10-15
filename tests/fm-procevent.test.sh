@@ -608,6 +608,19 @@ assert_present "${self_race_result%.result}.handled" "released autohandle did no
 pe_adapter "$HSELFRACE" retire self-race-src >/dev/null
 pass "reconcile gives self-announcing autohandle a bounded grace and recovers overdue captures"
 
+# A backward clock step makes an already captured result look future-dated.
+# It must be recovered immediately instead of extending the handling grace.
+HSELFFUTURE="$TMP_ROOT/hselffuture"; new_home "$HSELFFUTURE"
+mkdir -p "$HSELFFUTURE/state/procevent-inbox"
+printf 'captured before clock step\n' > "$HSELFFUTURE/state/procevent-inbox/self-future-src.1.result"
+printf 'selfann\n' > "$HSELFFUTURE/state/procevent-inbox/self-future-src.1.adapter"
+fm_touch_epoch "$(( $(date +%s) + 3600 ))" "$HSELFFUTURE/state/procevent-inbox/self-future-src.1.result"
+out=$(pe_adapter "$HSELFFUTURE" reconcile)
+assert_contains "$out" "published=1" "a negative capture age extended the self-announcement grace"
+assert_contains "$(wake_payloads "$HSELFFUTURE")" 'procevent selfann self-future-src 1' \
+  "a future-dated unhandled capture lost its recovery wake"
+pass "a backward clock step cannot extend self-announcement grace"
+
 # Task-owned rounds still go straight to the owner's durable steering inbox,
 # even when their captured adapter declares self-announcement.
 HSELFTASK="$TMP_ROOT/hselftask"; new_home "$HSELFTASK"
