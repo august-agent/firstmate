@@ -66,8 +66,15 @@
 #            registered until its owner concludes it with `handled`.
 # reconcile  Idempotent liveness entry the watcher calls on its ordinary cycle:
 #            republish every durably captured result with no handled
-#            acknowledgement yet - regardless of any earlier publication - and
-#            start a runner for any registered source that has no live owner and
+#            acknowledgement yet, regardless of any earlier publication.
+#            Defer fresh self-announcing built-in results for
+#            FM_PROCEVENT_SELF_ANNOUNCE_GRACE_SECS (default 60, 0 disables;
+#            malformed values use the default) so their runner can autohandle
+#            first. Task-owned results bypass this grace. After it expires,
+#            unhandled results are republished even if their runner crashed.
+#            Future-dated captures are republished immediately, so a backward
+#            clock step cannot extend the grace.
+#            Start a runner for any registered source that has no live owner and
 #            no open task-owned round. This is liveness repair only - it never
 #            discovers results by
 #            polling the source, because the child blocks on the source itself.
@@ -176,7 +183,7 @@
 # adapter keeps the strict publish-before-apply order, because without a
 # declared downstream channel an applied-and-acknowledged result would otherwise
 # go silent. An unhandled result stays eligible for bounded re-announcement on
-# every reconcile in both modes, exactly as before.
+# every reconcile in both modes, after the startup grace described above.
 #
 # Polling again is adapter-owned through the same kind of seam. An adapter that
 # answers exit 0 to `bin/fm-procevent-<adapter>.sh relisten` keeps this runner
@@ -898,11 +905,22 @@ EOF
   return "$status"
 }
 
-publish_pending() {  # [result-file-to-skip]
-  local skip=${1-} result published=0
+publish_pending() {  # [result-file-to-skip] [self-announcing-grace-seconds]
+  local skip=${1-} grace=${2:-0} result adapter age published=0
   while IFS= read -r result; do
     [ -n "$result" ] || continue
     [ "$result" = "$skip" ] && continue
+    # Only reconcile supplies a grace: start still owns its immediate
+    # post-autohandle publish. A capture's immutable owner, not the current
+    # registration, decides whether it is a built-in or task-owned round.
+    if [ "$grace" -gt 0 ] && age=$(fm_path_age "$result") \
+      && [ "$age" -ge 0 ] && [ "$age" -lt "$grace" ] \
+      && [ ! -e "${result%.result}.extension" ] && [ ! -L "${result%.result}.extension" ] \
+      && [ -z "$(fm_procevent_result_owner_task "$result" 2>/dev/null || true)" ] \
+      && adapter=$(fm_procevent_result_adapter "$result" 2>/dev/null) \
+      && adapter_self_announcing "$adapter"; then
+      continue
+    fi
     if publish_result "$result"; then
       published=$((published + 1))
     fi
@@ -1759,14 +1777,16 @@ stranded_leaderless_detail() {  # <source-id>
 cmd_reconcile() {
   local rec id published started=0 stopped=0 uncertain=0 failed=0 claim owner pid token identity claim_state stop_state task_pending
   local launch_identity launch_stamp launch_mark unconfirmed entry
+  local self_announce_grace=${FM_PROCEVENT_SELF_ANNOUNCE_GRACE_SECS:-60}
   local -a launched=()
+  case "$self_announce_grace" in ''|*[!0-9]*) self_announce_grace=60 ;; esac
   # Rejected before anything is launched, and by name. A window this command
   # cannot use makes every launch unconfirmable, so validating it later would
   # report a fleet of perfectly healthy runners as `failed=` and blame nothing.
   fm_procevent_launch_confirm_seconds >/dev/null \
     || die "FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS must be whole seconds from $FM_PROCEVENT_LAUNCH_CONFIRM_MIN_SECONDS to $FM_PROCEVENT_LAUNCH_CONFIRM_MAX_SECONDS"
   owner_lease_refresh
-  published=$(publish_pending)
+  published=$(publish_pending '' "$self_announce_grace")
 
   # Stop a runner this home owns whose source is no longer registered. Without
   # this, unregistering a source that never completes leaves its child blocked

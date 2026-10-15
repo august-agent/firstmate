@@ -216,6 +216,9 @@ assert_grep 'done [corr=0123456789abcdef]' "$PARENT/state/ios.status" "failed re
 assert_grep 'ingested: ios appended=0' "$TMP_ROOT/handle-arm-fail.out" "failed re-arm did not replay the committed reply"
 rm -f "$PARENT/state/procevent"
 mkdir "$PARENT/state/procevent"
+# A crashed self-announcing round stays eligible for retry after its capture
+# grace, without letting reconcile race a fresh adapter application.
+fm_touch_epoch "$(( $(date +%s) - 61 ))" "$RESULT"
 reconcile_out=$(remote_env "$ROOT/bin/fm-procevent.sh" reconcile)
 assert_contains "$reconcile_out" 'published=1' "failed re-arm did not leave the result eligible for retry"
 out=$(remote_env "$ADAPTER" handle ios 1 "$RESULT")
