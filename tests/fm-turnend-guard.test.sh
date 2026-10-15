@@ -1527,6 +1527,45 @@ test_hook_claude_mode_allows_on_open_generation_claim() {
   pass "fm-turnend-guard --claude: a live open generation claim owns recovery with no lock held"
 }
 
+# Publish only after the guard has exhausted its former eight-poll window.
+# The owner stays alive throughout; poll counting makes the handoff deterministic
+# even on a loaded machine, rather than racing a wall-clock delay.
+test_hook_claude_mode_allows_recovery_startup_before_claim() {
+  local dir pid identity fakebin out status polls
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-starting-claim")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(fm_test_pid_identity "$pid") || fail "could not identify the starting arm owner"
+  printf '%s\n' "$identity" > "$dir/owner-identity"
+  fakebin=$(fm_fakebin "$TMP_ROOT/hook-claude-starting-bin")
+  cat > "$fakebin/sleep" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = 0.1 ]; then
+  polls=$(cat "$FM_CLAIM_HOME/polls" 2>/dev/null || printf 0)
+  polls=$((polls + 1))
+  printf '%s\n' "$polls" > "$FM_CLAIM_HOME/polls"
+  if [ "$polls" -eq 9 ]; then
+    printf 'epoch=1 owner_pid=%s outcome=arming updated_at=%s\n%s\n' \
+      "$FM_CLAIM_PID" "$(date +%s)" "$(cat "$FM_CLAIM_HOME/owner-identity")" \
+      > "$FM_CLAIM_HOME/state/.claude-autoarm-epoch"
+  fi
+fi
+exec /bin/sleep "$@"
+SH
+  chmod +x "$fakebin/sleep"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "claim was published before the guard evaluated"
+  out=$(unset FM_CLAUDE_AUTOARM_SYNC_WAIT_MS; PATH="$fakebin:$PATH" FM_CLAIM_HOME="$dir" FM_CLAIM_PID="$pid" run_hook_claude "$dir" false); status=$?
+  polls=$(cat "$dir/polls")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "the default bounded startup wait must observe a late verified arm claim"
+  [ "$polls" -eq 9 ] || fail "guard did not observe the ninth-poll claim: $polls polls"
+  [ -z "$out" ] || fail "recovery startup forced a continuation: $out"
+  assert_absent "$dir/state/.turnend-claude-blocks" "startup consumed a forced-continuation budget"
+  pass "fm-turnend-guard --claude: default startup wait observes a late verified generation claim"
+}
+
 test_hook_claude_mode_blocks_on_dead_generation_with_fresh_beat() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-dead-fresh")
@@ -2294,6 +2333,7 @@ test_hook_claude_mode_blocks_on_pid_reused_arming_claim
 test_hook_claude_mode_blocks_on_stuck_arming_claim
 test_hook_claude_mode_allows_on_open_generation_claim
 test_hook_claude_mode_blocks_on_stuck_generation_claim
+test_hook_claude_mode_allows_recovery_startup_before_claim
 test_hook_claude_mode_blocks_on_dead_generation_with_fresh_beat
 test_hook_claude_mode_terminal_fail_open_clears_abandoned_claim
 test_hook_claude_mode_preserves_fresh_failed_progression
