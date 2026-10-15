@@ -489,6 +489,14 @@ case "${1-}" in
   self-announcing) exit 0 ;;
   autohandle)
     [ ! -e "$FM_HOME/state/selfann-fail" ] || exit 1
+    if [ -e "$FM_HOME/state/selfann-hold" ]; then
+      printf 'ready\n' > "$FM_HOME/state/selfann-ready"
+      for ((i=0; i<600; i++)); do
+        [ -e "$FM_HOME/state/selfann-hold" ] || break
+        sleep 0.1
+      done
+      [ ! -e "$FM_HOME/state/selfann-hold" ] || exit 1
+    fi
     printf '%s %s\n' "$2" "$3" >> "$FM_HOME/state/applied"
     "$FM_PROCEVENT_UNDER_TEST" handled "$2" "$3" >/dev/null
     ;;
@@ -567,6 +575,53 @@ assert_contains "$(wake_payloads "$HSELF")" "procevent selfann self-src 2" \
   "a capture the self-announcing adapter could not apply lost its check-wake announcement"
 rm -f "$HSELF/state/selfann-fail"
 pass "a self-announcing adapter applies quietly and still publishes what it could not apply"
+
+# Reconcile can run after capture but before a self-announcing adapter finishes
+# autohandle. Hold that exact boundary rather than depending on process timing.
+HSELFRACE="$TMP_ROOT/hselfrace"; new_home "$HSELFRACE"
+fm_test_track_procevent_home "$HSELFRACE"
+pe_adapter "$HSELFRACE" register selfann self-race-src -- /bin/echo "self announced" >/dev/null
+: > "$HSELFRACE/state/selfann-hold"
+pe_adapter "$HSELFRACE" start self-race-src > "$HSELFRACE/start.out" 2>&1 &
+self_race_pid=$!
+wait_for "$HSELFRACE/state/selfann-ready" || fail "self-announcing runner never reached the captured-but-unhandled boundary"
+self_race_result=$(first_result "$HSELFRACE" self-race-src) || fail "paused autohandle has no durable capture"
+assert_present "${self_race_result%.result}.adapter" "paused autohandle has no captured adapter"
+assert_absent "${self_race_result%.result}.handled" "the race fixture already acknowledged its capture"
+out=$(unset FM_PROCEVENT_SELF_ANNOUNCE_GRACE_SECS; pe_adapter "$HSELFRACE" reconcile)
+assert_contains "$out" "published=0" "reconcile announced a fresh capture before its adapter could handle it"
+assert_not_contains "$(wake_payloads "$HSELFRACE")" "procevent selfann self-race-src 1" \
+  "reconcile woke the handler during self-announcing autohandle"
+
+# If the runner cannot finish, the same durable result must become visible
+# after the grace. Age only the capture; the still-live owner must not hide it.
+fm_touch_epoch "$(( $(date +%s) - 61 ))" "$self_race_result"
+out=$(FM_PROCEVENT_SELF_ANNOUNCE_GRACE_SECS=120 pe_adapter "$HSELFRACE" reconcile)
+assert_contains "$out" "published=0" "reconcile ignored the configured self-announcement grace"
+out=$(unset FM_PROCEVENT_SELF_ANNOUNCE_GRACE_SECS; pe_adapter "$HSELFRACE" reconcile)
+assert_contains "$out" "published=1" "an overdue self-announcing capture was not recovered"
+assert_contains "$(wake_payloads "$HSELFRACE")" "procevent selfann self-race-src 1" \
+  "an overdue unhandled capture lost its recovery wake"
+rm -f "$HSELFRACE/state/selfann-hold"
+wait "$self_race_pid" || fail "the paused self-announcing runner failed after release"
+assert_present "${self_race_result%.result}.handled" "released autohandle did not acknowledge its capture"
+pe_adapter "$HSELFRACE" retire self-race-src >/dev/null
+pass "reconcile gives self-announcing autohandle a bounded grace and recovers overdue captures"
+
+# Task-owned rounds still go straight to the owner's durable steering inbox,
+# even when their captured adapter declares self-announcement.
+HSELFTASK="$TMP_ROOT/hselftask"; new_home "$HSELFTASK"
+mkdir -p "$HSELFTASK/state/procevent-inbox"
+printf 'worker feedback\n' > "$HSELFTASK/state/procevent-inbox/self-task-src.1.result"
+printf 'selfann\n' > "$HSELFTASK/state/procevent-inbox/self-task-src.1.adapter"
+printf 'worker-race\n' > "$HSELFTASK/state/procevent-inbox/self-task-src.1.owner-task"
+out=$(pe_adapter "$HSELFTASK" reconcile)
+assert_contains "$out" "published=1" "self-announcement grace deferred task-owned feedback"
+grep -l -F 'self-task-src.1.result' "$HSELFTASK/state/worker-race.inbox"/*.msg >/dev/null \
+  || fail "fresh task-owned feedback never reached its owner's inbox"
+assert_not_contains "$(wake_payloads "$HSELFTASK")" 'procevent selfann self-task-src 1' \
+  "task-owned feedback was sent to the main wake queue"
+pass "task-owned captures bypass self-announcement grace"
 
 HTERM="$TMP_ROOT/hterm"; new_home "$HTERM"
 fm_test_track_procevent_home "$HTERM"
