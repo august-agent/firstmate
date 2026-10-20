@@ -641,10 +641,10 @@ fm_busy_muse_run_events() {  # <session-log>
 # later non-object duplicate leaves the earlier object active, so the reviver
 # below records last-string-wins and last-object-wins instead of
 # JSON.parse's last-value-wins. Row framing can never come from field
-# contents: a decoded tab or newline inside run_id or terminal would forge
-# TSV rows for the downstream fold, so those characters are dropped (the
-# walk emits raw escapes instead, and neither form occurs in vendor ids or
-# terminal enums). Corrupt lines print nothing on both sides. One accepted
+# contents: a tracked string whose raw escapes would decode to tab, newline,
+# or CR rejects the line on both engines, so decoded identities can never
+# alias distinct runs and decoded fields can never forge rows for the
+# downstream fold. Corrupt lines print nothing on both sides. One accepted
 # divergence remains: a run_id spelled with unicode escapes pairs with its
 # decoded twin here and stays distinct in the walk; vendor ids never use
 # escapes, and decoding is the JSON-correct reading.
@@ -687,6 +687,14 @@ function isEsc(c) {
 }
 function isHex(c) {
   return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
+}
+// hasFramingEsc is true when tracked-string raw escapes would decode to TSV
+// framing. Such a line is rejected outright on both engines.
+function hasFramingEsc(span) {
+  if (span.includes("\\t") || span.includes("\\n") || span.includes("\\r")) return true;
+  const low = span.toLowerCase();
+  if (low.includes("\\u0009") || low.includes("\\u000a") || low.includes("\\u000d")) return true;
+  return false;
 }
 // parseString consumes the JSON string at S[P] into sval (raw inner text)
 // and advances past its closing quote. Escapes are validated and literal
@@ -792,7 +800,11 @@ function scanMembers(objOpen, wantObj) {
       foundOpen = P;
       if (!skipValue()) return false;
     } else if (key === "kind" || key === "run_id" || key === "terminal") {
-      if (S[P] === '"' && parseString()) {
+      // A value starting with a quote is a string or the line is corrupt:
+      // falling through to skipValue with an advanced cursor would let a
+      // broken string recover as a bare literal.
+      if (S[P] === '"') {
+        if (!parseString() || hasFramingEsc(sval)) return false;
         if (key === "kind") {
           fKind = sval;
           fKindFound = true;
@@ -828,13 +840,6 @@ function trailingJunk() {
 function decode(raw) {
   return JSON.parse(`"${raw}"`);
 }
-// Row framing can never come from field contents: a decoded tab or newline
-// inside run_id or terminal would forge TSV rows for the downstream fold,
-// so those characters are dropped (the walk emits raw escapes instead, and
-// neither form occurs in vendor ids or terminal enums).
-function clean(field) {
-  return field.replace(/[\t\n\r]/g, "");
-}
 const out = [];
 // Split on LF only: a bare CR never separates vendor records, and keeping
 // it inside the line lets strict parsing reject it exactly like the walk.
@@ -863,7 +868,7 @@ for (const rawLine of text.split("\n")) {
   if (!fKindFound) continue;
   if (fKind !== "started" && fKind !== "terminal") continue;
   const terminal = fKind === "terminal" && fTerminalFound ? fTerminal : "";
-  out.push(`${clean(decode(rid))}\t${fKind}\t${clean(decode(terminal))}`);
+  out.push(`${decode(rid)}\t${fKind}\t${decode(terminal)}`);
 }
 if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`);
 NODE
@@ -888,6 +893,16 @@ fm_busy_muse_run_events_awk() {  # <session-log>
     # the span and slices once, so long prompt strings cost linear time.
     function is_esc(c) { return (c == "\"" || c == "\\" || c == "/" || c == "b" || c == "f" || c == "n" || c == "r" || c == "t" || c == "u") }
     function is_hex(c) { return ((c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")) }
+    # has_framing_esc: true when tracked-string raw escapes would decode
+    # to TSV framing. Such a line is rejected outright on both engines:
+    # decoding the identity would alias distinct runs, and decoding any
+    # field would forge rows for the downstream fold.
+    function has_framing_esc(span,    low) {
+      if (index(span, "\\t") || index(span, "\\n") || index(span, "\\r")) return 1
+      low = tolower(span)
+      if (index(low, "\\u0009") || index(low, "\\u000a") || index(low, "\\u000d")) return 1
+      return 0
+    }
     function parse_string(    c, start, esc) {
       if (substr(line, p, 1) != "\"") return 0
       p++
@@ -978,7 +993,12 @@ fm_busy_muse_run_events_awk() {  # <session-log>
           found_open = p
           if (!skip_value()) return 0
         } else if (key == "kind" || key == "run_id" || key == "terminal") {
-          if (substr(line, p, 1) == "\"" && parse_string()) {
+          # A value starting with a quote is a string or the line is corrupt:
+          # falling through to skip_value with an advanced cursor would let a
+          # broken string recover as a bare literal. Framing escapes in a
+          # tracked field reject the line for the same reason on both sides.
+          if (substr(line, p, 1) == "\"") {
+            if (!parse_string() || has_framing_esc(sval)) return 0
             if (key == "kind") { f_kind = sval; f_kind_found = 1 }
             else if (key == "run_id") { f_runid = sval; f_runid_found = 1 }
             else { f_terminal = sval; f_terminal_found = 1 }

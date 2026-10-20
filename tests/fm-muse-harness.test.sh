@@ -2102,23 +2102,73 @@ EOF
 }
 
 test_run_events_fold_rejects_forged_rows() {
-  local dir log out node_out
-  command -v node >/dev/null 2>&1 || { pass "forged-row rejection needs node, which is absent"; return 0; }
+  local dir log out
   dir="$TMP_ROOT/forged-rows"
   mkdir -p "$dir"
-  # The terminal value decodes to real TSV framing. It must not close the
-  # open run through the downstream fold on either engine.
+  # A field whose raw escapes would decode to TSV framing rejects the line.
+  # The forging record contributes nothing, so the open run stays open.
   log=$(mkengine_log "$dir" injection <<'EOF'
 {"payload":{"kind":"run","run_id":"victim","event":{"kind":"started"}}}
 {"payload":{"kind":"run","run_id":"decoy","event":{"kind":"terminal","terminal":"completed\nvictim\tterminal\tcompleted"}}}
 EOF
 )
+  assert_engines_agree "$log" "a framing-escaped field rejects its line"
   out=$(run_state "$log")
   [ "$out" = busy ] || fail "a forged terminal row settled the open run: folded '$out'"
-  node_out=$(run_events "$log")
-  [ "$(printf '%s\n' "$node_out" | grep -c . | tr -d ' ')" = 2 ] \
-    || fail "the decoded terminal forged extra rows: '$node_out'"
+  assert_engine_events "$log" "$(printf 'victim\tstarted\t')" "a framing-escaped field"
   pass "decoded framing characters inside fields never forge lifecycle rows"
+}
+
+test_run_events_fold_rejects_identity_collision() {
+  local dir log out
+  dir="$TMP_ROOT/identity-collision"
+  mkdir -p "$dir"
+  # A terminal for vic<TAB>tim must not close victim.
+  # Decoding the identity would alias the two runs, so the line is rejected.
+  log=$(mkengine_log "$dir" tab <<'EOF'
+{"payload":{"kind":"run","run_id":"victim","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"vic\ttim","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "a tab-escaped identity rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a tab-escaped identity closed the victim run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'victim\tstarted\t')" "a tab-escaped identity"
+  log=$(mkengine_log "$dir" unicode <<'EOF'
+{"payload":{"kind":"run","run_id":"victim","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"vic\u0009tim","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "a unicode-escaped identity rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a unicode-escaped identity closed the victim run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'victim\tstarted\t')" "a unicode-escaped identity"
+  pass "a framing-escaped run_id never aliases another run"
+}
+
+test_run_events_fold_rejects_malformed_tracked_string() {
+  local dir log out
+  dir="$TMP_ROOT/malformed-string"
+  mkdir -p "$dir"
+  # A tracked value starting with a quote is a string or the line is corrupt.
+  # A broken string must not recover as a bare literal and settle the run.
+  log=$(mkengine_log "$dir" tab-recovery <<'EOF'
+{"payload":{"kind":"run","run_id":"r","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"r","event":{"kind":"terminal","terminal":"completed"}},"kind":"\t0}\n' >> "$log"
+  assert_engines_agree "$log" "a tab-broken tracked string rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a tab-broken tracked string settled the open run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'r\tstarted\t')" "a tab-broken tracked string"
+  log=$(mkengine_log "$dir" cr-only <<'EOF'
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"r","event":{"kind":"terminal","terminal":"completed"}},"kind":"\r0}\n' >> "$log"
+  assert_engines_agree "$log" "a CR-broken tracked string rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = none ] || fail "a CR-broken tracked string folded past none: folded '$out'"
+  pass "a broken tracked string never recovers as a bare literal"
 }
 
 test_run_events_pairs_unicode_escaped_ids_by_decoded_value() {
@@ -2540,6 +2590,8 @@ test_corrupt_lines_fold_to_unknown_never_idle
 test_run_events_large_log_stays_fast_and_exact
 test_run_events_engines_agree_byte_for_byte
 test_run_events_fold_rejects_forged_rows
+test_run_events_fold_rejects_identity_collision
+test_run_events_fold_rejects_malformed_tracked_string
 test_run_events_pairs_unicode_escaped_ids_by_decoded_value
 test_run_events_survives_broken_node
 test_1_3_session_classifies_busy_then_idle
