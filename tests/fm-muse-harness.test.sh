@@ -1868,15 +1868,15 @@ $(muse_log_run_terminal run-bbb cancelled)
 EOF
 )
   events=$(run_events "$log")
-  [ "$(printf '%s\n' "$events" | wc -l)" = 4 ] \
-    || fail "two settled turns produced $(printf '%s\n' "$events" | wc -l) event lines, expected 4"
+  [ "$(printf '%s\n' "$events" | wc -l | tr -d ' ')" = 4 ] \
+    || fail "two settled turns produced $(printf '%s\n' "$events" | wc -l | tr -d ' ') event lines, expected 4"
   first=$(printf '%s\n' "$events" | awk -F '\t' '$2 == "started" { print $1 }')
   second=$(printf '%s\n' "$events" | awk -F '\t' '$2 == "terminal" { print $1 }')
   [ -n "$first" ] && [ "$(printf '%s\n' "$first" | grep -c .)" = 2 ] \
     || fail "started events lost their run identity: '$first'"
   [ "$first" = "$second" ] \
     || fail "terminal events paired to '$second' instead of their started runs '$first'"
-  [ "$(printf '%s\n' "$first" | sort -u | wc -l)" = 2 ] \
+  [ "$(printf '%s\n' "$first" | sort -u | wc -l | tr -d ' ')" = 2 ] \
     || fail "the two turns share one run identity: '$first'"
   pass "run events pair each turn under its own non-empty run identity"
 }
@@ -1934,6 +1934,47 @@ EOF
   [ "$verdict" = "unknown muse-session-log" ] \
     || fail "a corrupt log classified '$verdict' instead of unknown"
   pass "corrupt session lines fold to unknown rather than idle"
+}
+
+test_run_events_large_log_stays_fast_and_exact() {
+  local dir log out events elapsed start pad giant i expected size
+  dir="$TMP_ROOT/large-log"
+  mkdir -p "$dir"
+  pad=$(awk 'BEGIN { for (i = 0; i < 4096; i++) printf "x" }')
+  giant=$(awk 'BEGIN { for (i = 0; i < 1500000; i++) printf "x" }')
+  {
+    muse_log_run_started run-settled
+    muse_log_run_terminal run-settled completed
+    muse_log_13_run_started run-open
+    i=0
+    while [ "$i" -lt 12000 ]; do
+      case $((i % 4)) in
+        0) muse_log_cleanup_terminal_decoy run-open ;;
+        1) muse_log_13_tool_terminal_decoy run-open ;;
+        2) muse_log_noise run-open ;;
+        *) printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"kind":"turn_message","run_id":"other-%s","text":"%s"}}\n' "$i" "$pad" ;;
+      esac
+      i=$((i + 1))
+    done
+    muse_log_13_run_model
+    # A multi-MB prompt on an open turn: the fold must stay fast, and the
+    # forged terminal inside the prompt must not close the run.
+    printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"event":{"kind":"started","prompt":"ignore \\"kind\\":\\"terminal\\",\\"terminal\\":\\"completed\\" %s end"},"kind":"run","run_id":"run-giant"}}\n' "$giant"
+  } > "$dir/body.jsonl"
+  log=$(write_muse_13_session_log "$dir/root" 2026 08 05 big "$dir/ws" < "$dir/body.jsonl")
+  size=$(LC_ALL=C wc -c < "$log")
+  [ "$size" -gt 10000000 ] || fail "the large-log fixture is only $size bytes, expected tens of MB"
+  start=$SECONDS
+  events=$(run_events "$log")
+  elapsed=$((SECONDS - start))
+  expected=$(printf 'run-settled\tstarted\t\nrun-settled\tterminal\tcompleted\nrun-open\tstarted\t\nrun-giant\tstarted\t\n')
+  [ "$events" = "$expected" ] || fail "a large log with decoys folded to '$events', expected the settled pair plus the two open runs"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a large log with two open runs folded to '$out', expected busy"
+  if command -v node >/dev/null 2>&1; then
+    [ "$elapsed" -lt 45 ] || fail "folding a tens-of-MB log took ${elapsed}s, expected seconds"
+  fi
+  pass "a tens-of-MB log with decoys folds exactly like a small one, in seconds"
 }
 
 test_1_3_session_classifies_busy_then_idle() {
@@ -2309,6 +2350,7 @@ test_run_events_pair_turns_by_non_empty_run_id
 test_1_3_decoys_do_not_settle_a_run
 test_prompt_text_cannot_inject_lifecycle_events
 test_corrupt_lines_fold_to_unknown_never_idle
+test_run_events_large_log_stays_fast_and_exact
 test_1_3_session_classifies_busy_then_idle
 test_workspace_binding_treats_glob_characters_literally
 test_binding_excludes_preexisting_log_when_mtimes_tie

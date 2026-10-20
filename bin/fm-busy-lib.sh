@@ -606,10 +606,78 @@ EOF
 # decoys (cleanup effects on 0.1.0, tool batch effects on 1.3.0) and the
 # run_model records whose nested run_stream carries kind "run": none of them
 # is a top-level run. Prompt text cannot inject a lifecycle event either,
-# because it sits inside the event's prompt string, which the walk skips as
+# because it sits inside the event's prompt string, which parsing skips as
 # one opaque value. A line that fails to parse contributes nothing, so a
 # corrupt log folds to none (unknown), never to idle.
+# Two engines print this contract: the node fold below, used whenever node
+# exists (the session binding above already requires it, so this adds no new
+# dependency), and the awk reference beside it. The awk walk is
+# character-by-character, so one multi-MB prompt line costs it minutes on a
+# grown log; the node fold pre-filters to candidate lines and parses only
+# those at native speed instead.
 fm_busy_muse_run_events() {  # <session-log>
+  local out
+  # Prefer the fast fold, but a node that exists yet fails (a poisoned PATH,
+  # a broken runtime) must degrade to the reference instead of folding to
+  # none: the cached binding path classifies without any other node use, so
+  # the fold cannot be the one thing that needs a working node. The node
+  # fold only ever writes on success, and the capture keeps even a partial
+  # write from escaping, so the fallback always folds the whole log.
+  if command -v node >/dev/null 2>&1 && out=$(fm_busy_muse_run_events_node "$1"); then
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
+  fi
+  fm_busy_muse_run_events_awk "$1"
+}
+
+# fm_busy_muse_run_events_node: the fast run_events fold. A fixed-string
+# pre-filter passes only lines carrying every lifecycle marker (the same
+# three substrings the awk reference scans for, so the candidate set is
+# identical), and node parses just those lines. The field checks mirror the
+# reference exactly: a top-level payload object with string kind "run" and a
+# non-empty string run_id, an object event with string kind started or
+# terminal, and the terminal value only when it is a string. Later duplicate
+# keys win on both sides, and corrupt lines print nothing on both sides.
+fm_busy_muse_run_events_node() {  # <session-log>
+  [ -f "$1" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  node - "$1" <<'NODE'
+const fs = require("fs");
+const readline = require("readline");
+const input = fs.createReadStream(process.argv[2]);
+input.on("error", () => process.exit(1));
+const out = [];
+readline.createInterface({ input, crlfDelay: Infinity })
+  .on("line", (line) => {
+    if (!line.includes('"run_id"')) return;
+    if (!line.includes('"run"')) return;
+    if (!line.includes('"started"') && !line.includes('"terminal"')) return;
+    let top;
+    try {
+      top = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (top === null || typeof top !== "object" || Array.isArray(top)) return;
+    const payload = top.payload;
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return;
+    if (payload.kind !== "run") return;
+    if (typeof payload.run_id !== "string" || payload.run_id === "") return;
+    const event = payload.event;
+    if (event === null || typeof event !== "object" || Array.isArray(event)) return;
+    if (event.kind !== "started" && event.kind !== "terminal") return;
+    const terminal = event.kind === "terminal" && typeof event.terminal === "string" ? event.terminal : "";
+    out.push(`${payload.run_id}\t${event.kind}\t${terminal}`);
+  })
+  .on("close", () => {
+    if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`);
+  });
+NODE
+}
+
+# fm_busy_muse_run_events_awk: the reference run_events fold, kept for nodes
+# without node. It prints the same contract as the node fold above.
+fm_busy_muse_run_events_awk() {  # <session-log>
   [ -f "$1" ] || return 1
   LC_ALL=C awk '
     BEGIN { OFS = "\t" }
