@@ -633,45 +633,239 @@ fm_busy_muse_run_events() {  # <session-log>
 # fm_busy_muse_run_events_node: the fast run_events fold. A fixed-string
 # pre-filter passes only lines carrying every lifecycle marker (the same
 # three substrings the awk reference scans for, so the candidate set is
-# identical), and node parses just those lines. The field checks mirror the
+# identical), and node parses just those lines. The field rules mirror the
 # reference exactly: a top-level payload object with string kind "run" and a
 # non-empty string run_id, an object event with string kind started or
-# terminal, and the terminal value only when it is a string. Later duplicate
-# keys win on both sides, and corrupt lines print nothing on both sides.
+# terminal, and the terminal value only when it is a string. A later
+# non-string duplicate leaves the earlier string active on both sides, and a
+# later non-object duplicate leaves the earlier object active, so the reviver
+# below records last-string-wins and last-object-wins instead of
+# JSON.parse's last-value-wins. Row framing can never come from field
+# contents: a decoded tab or newline inside run_id or terminal would forge
+# TSV rows for the downstream fold, so those characters are dropped (the
+# walk emits raw escapes instead, and neither form occurs in vendor ids or
+# terminal enums). Corrupt lines print nothing on both sides. One accepted
+# divergence remains: a run_id spelled with unicode escapes pairs with its
+# decoded twin here and stays distinct in the walk; vendor ids never use
+# escapes, and decoding is the JSON-correct reading.
 fm_busy_muse_run_events_node() {  # <session-log>
   [ -f "$1" ] || return 1
   command -v node >/dev/null 2>&1 || return 1
   node - "$1" <<'NODE'
 const fs = require("fs");
-const readline = require("readline");
-const input = fs.createReadStream(process.argv[2]);
-input.on("error", () => process.exit(1));
-const out = [];
-readline.createInterface({ input, crlfDelay: Infinity })
-  .on("line", (line) => {
-    if (!line.includes('"run_id"')) return;
-    if (!line.includes('"run"')) return;
-    if (!line.includes('"started"') && !line.includes('"terminal"')) return;
-    let top;
-    try {
-      top = JSON.parse(line);
-    } catch {
-      return;
+let text;
+try {
+  text = fs.readFileSync(process.argv[2], "utf8");
+} catch {
+  process.exit(1);
+}
+// Direct port of the awk reference walk below: same states, same
+// acceptance, native speed. S is the line, N its length, P the cursor.
+// WS is space, tab, CR (never LF: lines arrive split on LF already).
+// Field slots keep RAW inner text: comparisons run against raw spans, and
+// only emitted fields are decoded, so escape spellings behave exactly like
+// the walk except for the documented pairing divergence.
+let S = "";
+let N = 0;
+let P = 0;
+let sval = "";
+let foundOpen = 0;
+let fKind = "";
+let fKindFound = false;
+let fRunid = "";
+let fRunidFound = false;
+let fTerminal = "";
+let fTerminalFound = false;
+function isWs(c) {
+  return c === " " || c === "\t" || c === "\r";
+}
+function skipWs() {
+  while (P < N && isWs(S[P])) P++;
+}
+function isEsc(c) {
+  return c === '"' || c === "\\" || c === "/" || c === "b" || c === "f" || c === "n" || c === "r" || c === "t" || c === "u";
+}
+function isHex(c) {
+  return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
+}
+// parseString consumes the JSON string at S[P] into sval (raw inner text)
+// and advances past its closing quote. Escapes are validated and literal
+// control characters rejected, exactly like the walk.
+function parseString() {
+  if (S[P] !== '"') return false;
+  P++;
+  const start = P;
+  while (P < N) {
+    const c = S[P];
+    if (c === "\\") {
+      const esc = S[P + 1];
+      if (!isEsc(esc)) return false;
+      if (esc === "u") {
+        if (!isHex(S[P + 2]) || !isHex(S[P + 3]) || !isHex(S[P + 4]) || !isHex(S[P + 5])) return false;
+        P += 6;
+      } else {
+        P += 2;
+      }
+      continue;
     }
-    if (top === null || typeof top !== "object" || Array.isArray(top)) return;
-    const payload = top.payload;
-    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return;
-    if (payload.kind !== "run") return;
-    if (typeof payload.run_id !== "string" || payload.run_id === "") return;
-    const event = payload.event;
-    if (event === null || typeof event !== "object" || Array.isArray(event)) return;
-    if (event.kind !== "started" && event.kind !== "terminal") return;
-    const terminal = event.kind === "terminal" && typeof event.terminal === "string" ? event.terminal : "";
-    out.push(`${payload.run_id}\t${event.kind}\t${terminal}`);
-  })
-  .on("close", () => {
-    if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`);
-  });
+    if (c === '"') {
+      sval = S.slice(start, P);
+      P++;
+      return true;
+    }
+    if (c < " ") return false;
+    P++;
+  }
+  return false;
+}
+// skipValue consumes one JSON value at S[P], past any whitespace. Strings
+// are validated, bare literals must be true, false, null, or a JSON
+// number, and object/array interiors skip non-string bytes blindly, all
+// exactly like the walk.
+function skipValue() {
+  skipWs();
+  if (P >= N) return false;
+  const c = S[P];
+  if (c === '"') return parseString();
+  if (c === "{" || c === "[") {
+    let depth = 0;
+    let instr = false;
+    let esc = 0;
+    while (P < N) {
+      const d = S[P];
+      if (instr) {
+        if (esc > 0) {
+          if (esc === 1) {
+            if (!isEsc(d)) return false;
+            esc = d === "u" ? 5 : 0;
+          } else {
+            if (!isHex(d)) return false;
+            esc--;
+            if (esc === 1) esc = 0;
+          }
+        } else if (d === "\\") esc = 1;
+        else if (d === '"') instr = false;
+        else if (d < " ") return false;
+      } else if (d === '"') instr = true;
+      else if (d === "{" || d === "[") depth++;
+      else if (d === "}" || d === "]") {
+        depth--;
+        if (depth === 0) {
+          P++;
+          return true;
+        }
+      }
+      P++;
+    }
+    return false;
+  }
+  const start = P;
+  while (P < N) {
+    const d = S[P];
+    if (d === "," || d === "}" || d === "]" || isWs(d)) break;
+    P++;
+  }
+  const tok = S.slice(start, P);
+  if (tok === "true" || tok === "false" || tok === "null") return true;
+  if (/^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/.test(tok)) return true;
+  return false;
+}
+// scanMembers walks the members of the object at objOpen in one pass,
+// collecting top-level fields into the shared slots (each with a found
+// flag) and the nested object named by wantObj into foundOpen. A later
+// duplicate overwrites only a matching type: a later string replaces an
+// earlier string, and a later object replaces an earlier object, while a
+// later value of another type leaves the earlier value active.
+function scanMembers(objOpen, wantObj) {
+  P = objOpen + 1;
+  skipWs();
+  if (S[P] === "}") return true;
+  while (P < N) {
+    skipWs();
+    if (!parseString()) return false;
+    const key = sval;
+    skipWs();
+    if (S[P] !== ":") return false;
+    P++;
+    skipWs();
+    if (key === wantObj && S[P] === "{") {
+      foundOpen = P;
+      if (!skipValue()) return false;
+    } else if (key === "kind" || key === "run_id" || key === "terminal") {
+      if (S[P] === '"' && parseString()) {
+        if (key === "kind") {
+          fKind = sval;
+          fKindFound = true;
+        } else if (key === "run_id") {
+          fRunid = sval;
+          fRunidFound = true;
+        } else {
+          fTerminal = sval;
+          fTerminalFound = true;
+        }
+      } else if (!skipValue()) return false;
+    } else if (!skipValue()) return false;
+    skipWs();
+    const c = S[P];
+    if (c === "}") return true;
+    if (c !== ",") return false;
+    P++;
+  }
+  return false;
+}
+function resetSlots() {
+  fKind = "";
+  fKindFound = false;
+  fRunid = "";
+  fRunidFound = false;
+  fTerminal = "";
+  fTerminalFound = false;
+  foundOpen = 0;
+}
+function trailingJunk() {
+  return /[^ \t\r]/.test(S.slice(P + 1));
+}
+function decode(raw) {
+  return JSON.parse(`"${raw}"`);
+}
+// Row framing can never come from field contents: a decoded tab or newline
+// inside run_id or terminal would forge TSV rows for the downstream fold,
+// so those characters are dropped (the walk emits raw escapes instead, and
+// neither form occurs in vendor ids or terminal enums).
+function clean(field) {
+  return field.replace(/[\t\n\r]/g, "");
+}
+const out = [];
+// Split on LF only: a bare CR never separates vendor records, and keeping
+// it inside the line lets strict parsing reject it exactly like the walk.
+for (const rawLine of text.split("\n")) {
+  S = rawLine;
+  if (!S.includes('"run_id"')) continue;
+  if (!S.includes('"run"')) continue;
+  if (!S.includes('"started"') && !S.includes('"terminal"')) continue;
+  N = S.length;
+  P = 0;
+  skipWs();
+  if (S[P] !== "{") continue;
+  resetSlots();
+  if (!scanMembers(P, "payload") || foundOpen === 0) continue;
+  if (trailingJunk()) continue;
+  const payloadOpen = foundOpen;
+  resetSlots();
+  if (!scanMembers(payloadOpen, "event")) continue;
+  if (!fKindFound || fKind !== "run") continue;
+  if (!fRunidFound || fRunid === "") continue;
+  if (foundOpen === 0) continue;
+  const rid = fRunid;
+  const eventOpen = foundOpen;
+  resetSlots();
+  if (!scanMembers(eventOpen, "")) continue;
+  if (!fKindFound) continue;
+  if (fKind !== "started" && fKind !== "terminal") continue;
+  const terminal = fKind === "terminal" && fTerminalFound ? fTerminal : "";
+  out.push(`${clean(decode(rid))}\t${fKind}\t${clean(decode(terminal))}`);
+}
+if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`);
 NODE
 }
 
@@ -692,20 +886,31 @@ fm_busy_muse_run_events_awk() {  # <session-log>
     # parse_string consumes the JSON string at line[p] into sval (raw inner
     # text, escapes intact) and advances past its closing quote. It records
     # the span and slices once, so long prompt strings cost linear time.
-    function parse_string(    c, start) {
+    function is_esc(c) { return (c == "\"" || c == "\\" || c == "/" || c == "b" || c == "f" || c == "n" || c == "r" || c == "t" || c == "u") }
+    function is_hex(c) { return ((c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")) }
+    function parse_string(    c, start, esc) {
       if (substr(line, p, 1) != "\"") return 0
       p++
       start = p
       while (p <= n) {
         c = substr(line, p, 1)
-        if (c == "\\") { p += 2; continue }
+        if (c == "\\") {
+          esc = substr(line, p + 1, 1)
+          if (!is_esc(esc)) return 0
+          if (esc == "u") {
+            if (!is_hex(substr(line, p + 2, 1)) || !is_hex(substr(line, p + 3, 1)) || !is_hex(substr(line, p + 4, 1)) || !is_hex(substr(line, p + 5, 1))) return 0
+            p += 6
+          } else p += 2
+          continue
+        }
         if (c == "\"") { sval = substr(line, start, p - start); p++; return 1 }
+        if (c < " ") return 0
         p++
       }
       return 0
     }
     # skip_value consumes one JSON value at line[p], past any whitespace.
-    function skip_value(    c, depth, instr, esc) {
+    function skip_value(    c, depth, instr, esc, start, tok) {
       skip_ws()
       if (p > n) return 0
       c = substr(line, p, 1)
@@ -715,9 +920,18 @@ fm_busy_muse_run_events_awk() {  # <session-log>
         while (p <= n) {
           c = substr(line, p, 1)
           if (instr) {
-            if (esc) esc = 0
-            else if (c == "\\") esc = 1
+            if (esc > 0) {
+              if (esc == 1) {
+                if (!is_esc(c)) return 0
+                esc = (c == "u") ? 5 : 0
+              } else {
+                if (!is_hex(c)) return 0
+                esc--
+                if (esc == 1) esc = 0
+              }
+            } else if (c == "\\") esc = 1
             else if (c == "\"") instr = 0
+            else if (c < " ") return 0
           } else if (c == "\"") instr = 1
           else if (c == "{" || c == "[") depth++
           else if (c == "}" || c == "]") {
@@ -728,19 +942,26 @@ fm_busy_muse_run_events_awk() {  # <session-log>
         }
         return 0
       }
+      start = p
       while (p <= n) {
         c = substr(line, p, 1)
         if (c == "," || c == "}" || c == "]" || is_ws(c)) break
         p++
       }
-      return 1
+      tok = substr(line, start, p - start)
+      if (tok == "true" || tok == "false" || tok == "null") return 1
+      if (tok ~ /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) return 1
+      return 0
     }
     # scan_members walks the members of the object at obj_open in one pass,
     # collecting top-level fields into the shared f_ slots (each with a
     # found flag) and the nested object named by want_obj into found_open.
     # A non-object or missing value leaves its slot unset rather than
     # failing the line: a record whose kind is not a string is simply not a
-    # run lifecycle record. Later duplicate keys overwrite earlier ones.
+    # run lifecycle record. A later duplicate overwrites only a matching
+    # type: a later string replaces an earlier string, and a later object
+    # replaces an earlier object, while a later value of another type leaves
+    # the earlier value active.
     function scan_members(obj_open, want_obj,    key, c) {
       p = obj_open + 1
       skip_ws()
@@ -771,6 +992,11 @@ fm_busy_muse_run_events_awk() {  # <session-log>
       }
       return 0
     }
+    function trailing_junk(    rest) {
+      rest = substr(line, p + 1)
+      gsub(/[ \t\r]/, "", rest)
+      return (rest != "")
+    }
     function reset_slots() {
       f_kind = ""; f_kind_found = 0
       f_runid = ""; f_runid_found = 0
@@ -790,6 +1016,7 @@ fm_busy_muse_run_events_awk() {  # <session-log>
       if (substr(line, p, 1) != "{") next
       reset_slots()
       if (!scan_members(p, "payload") || found_open == 0) next
+      if (trailing_junk()) next
       payload_open = found_open
       reset_slots()
       if (!scan_members(payload_open, "event")) next
