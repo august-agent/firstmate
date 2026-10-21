@@ -2236,6 +2236,45 @@ EOF
   pass "a NUL byte never changes the folded events"
 }
 
+test_run_events_preserves_bytes_end_to_end() {
+  local dir log out
+  dir="$TMP_ROOT/raw-bytes"
+  mkdir -p "$dir"
+  # The node fold reads and writes bytes (latin1 in, latin1 out), exactly
+  # like the walk under LC_ALL=C: invalid UTF-8 bytes stay distinct instead
+  # of merging into U+FFFD, and valid multibyte sequences pass through
+  # untouched. Byte 377 versus 376 must not settle, while identical bytes
+  # pair and settle.
+  log=$(mkengine_log "$dir" distinct <<'EOF'
+{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n' >> "$log"
+  printf '{"payload":{"kind":"run","run_id":"A\376B","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  assert_engines_agree "$log" "distinct invalid bytes stay distinct"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "distinct invalid bytes settled a run: folded '$out'"
+  log=$(mkengine_log "$dir" paired <<'EOF'
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n' >> "$log"
+  printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  assert_engines_agree "$log" "identical invalid bytes pair"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "identical invalid bytes failed to settle: folded '$out'"
+  log=$(mkengine_log "$dir" multibyte <<'EOF'
+{"payload":{"kind":"run","run_id":"caf\u00e9","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"caf\u00e9","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"started"}}}\n' >> "$log"
+  printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  assert_engines_agree "$log" "valid multibyte sequences pass through"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "valid multibyte sequences failed to settle: folded '$out'"
+  pass "bytes survive the fold intact on both engines"
+}
+
 test_run_events_survives_broken_node() {
   local dir log expected out fakebin
   dir="$TMP_ROOT/broken-node"
@@ -2642,6 +2681,7 @@ test_run_events_fold_rejects_malformed_tracked_string
 test_run_events_keeps_escaped_spellings_distinct
 test_run_events_accepts_escaped_backslash_identity
 test_run_events_fold_survives_nul_bytes
+test_run_events_preserves_bytes_end_to_end
 test_run_events_survives_broken_node
 test_1_3_session_classifies_busy_then_idle
 test_workspace_binding_treats_glob_characters_literally

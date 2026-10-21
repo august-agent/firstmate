@@ -667,7 +667,10 @@ fm_busy_muse_run_events_node() {  # <session-log>
 const fs = require("fs");
 let text;
 try {
-  text = fs.readFileSync(process.argv[2], "utf8");
+  // latin1 maps every byte to one code point, so invalid UTF-8 bytes survive
+  // intact instead of merging into U+FFFD: distinct raw identities stay
+  // distinct exactly like the walk, which reads bytes under LC_ALL=C.
+  text = fs.readFileSync(process.argv[2], "latin1");
 } catch {
   process.exit(1);
 }
@@ -891,7 +894,9 @@ for (const rawLine of text.split("\n")) {
   const terminal = fKind === "terminal" && fTerminalFound ? fTerminal : "";
   out.push(`${rid}\t${fKind}\t${terminal}`);
 }
-if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`);
+// latin1 out: the fold reads bytes (see the read above) and must write bytes,
+// so code points 0x80-0xFF leave as single bytes exactly like the walk.
+if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`, "latin1");
 NODE
 }
 
