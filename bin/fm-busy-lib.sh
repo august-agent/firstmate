@@ -681,7 +681,7 @@ if (!logPath) process.exit(1);
 // pack many chunk boundaries into a modest fixture. Unset in production,
 // where the default 64 KiB chunk applies.
 const chunkEnv = Number(process.env.FM_MUSE_FOLD_CHUNK);
-const streamOpts = Number.isInteger(chunkEnv) && chunkEnv > 0 ? { highWaterMark: chunkEnv } : {};
+const streamOpts = Number.isSafeInteger(chunkEnv) && chunkEnv > 0 ? { highWaterMark: chunkEnv } : {};
 // Streaming read: grown logs exceed V8's ~512MiB string limit and buffering
 // the whole file wastes memory, so the fold streams chunks and folds one
 // line at a time. Bytes split on LF only; each line decodes as latin1, so
