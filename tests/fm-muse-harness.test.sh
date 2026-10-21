@@ -2345,22 +2345,28 @@ EOF
 }
 
 test_run_events_large_noncandidate_line_stays_fast() {
-  local dir log out pad
+  local dir log out pad start elapsed
   dir="$TMP_ROOT/large-noncandidate"
   mkdir -p "$dir"
-  # A noncandidate line wider than one stream chunk exercises the carry
+  # A noncandidate line far wider than one stream chunk exercises the carry
   # path: it is skipped at the byte level without decoding, so the open
-  # run beside it folds exactly and fast on both engines.
-  pad=$(awk 'BEGIN { for (i = 0; i < 70000; i++) printf "y" }')
+  # run beside it folds exactly and fast on both engines. A tiny forced
+  # chunk packs tens of thousands of chunk boundaries into a modest line:
+  # a per-chunk re-scan of the unfinished line costs quadratic work (about
+  # a minute at 2MB), while the linear fold stays near a second.
+  pad=$(awk 'BEGIN { for (i = 0; i < 2000000; i++) printf "y" }')
   log=$(mkengine_log "$dir" root <<EOF
 {"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
 {"payload":{"kind":"turn_message","text":"$pad"}}
 EOF
 )
-  assert_engines_agree "$log" "a chunk-spanning noncandidate line"
-  assert_engine_events "$log" "$(printf 'open\tstarted\t')" "a chunk-spanning noncandidate line"
-  out=$(run_state "$log")
+  FM_MUSE_FOLD_CHUNK=64 assert_engines_agree "$log" "a chunk-spanning noncandidate line"
+  start=$SECONDS
+  out=$(FM_MUSE_FOLD_CHUNK=64 run_state "$log")
+  elapsed=$((SECONDS - start))
   [ "$out" = busy ] || fail "a large noncandidate line hid the open run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'open\tstarted\t')" "a chunk-spanning noncandidate line"
+  [ "$elapsed" -lt 30 ] || fail "folding a 2MB noncandidate line at 64-byte chunks took ${elapsed}s"
   pass "a chunk-spanning noncandidate line never folds"
 }
 

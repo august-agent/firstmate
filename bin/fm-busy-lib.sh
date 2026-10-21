@@ -677,6 +677,11 @@ fm_busy_muse_run_events_node() {  # <session-log>
 const fs = require("fs");
 const logPath = process.argv[2];
 if (!logPath) process.exit(1);
+// Test seam: FM_MUSE_FOLD_CHUNK forces a small stream chunk so tests can
+// pack many chunk boundaries into a modest fixture. Unset in production,
+// where the default 64 KiB chunk applies.
+const chunkEnv = Number(process.env.FM_MUSE_FOLD_CHUNK);
+const streamOpts = Number.isInteger(chunkEnv) && chunkEnv > 0 ? { highWaterMark: chunkEnv } : {};
 // Streaming read: grown logs exceed V8's ~512MiB string limit and buffering
 // the whole file wastes memory, so the fold streams chunks and folds one
 // line at a time. Bytes split on LF only; each line decodes as latin1, so
@@ -917,7 +922,7 @@ function foldLine(rawLine) {
 (async () => {
   let stream;
   try {
-    stream = fs.createReadStream(logPath);
+    stream = fs.createReadStream(logPath, streamOpts);
   } catch {
     process.exit(1);
   }
