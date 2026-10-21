@@ -2436,6 +2436,32 @@ test_run_events_node_tier_folds_bulk_cr_records() {
   pass "the node tier folds bulk CR-prefixed records on every fold"
 }
 
+test_run_events_nul_copy_failure_is_unknown_never_idle() {
+  local dir log out st fakebin
+  dir="$TMP_ROOT/nul-copy-failure"
+  mkdir -p "$dir/tmp"
+  # An open run followed by a NUL-bearing record: folding a truncated copy
+  # prefix could drop the trailing open run and read a busy session as
+  # settled, so a failed NUL-normalisation copy must fail closed to
+  # unknown instead of parsing whatever survived.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"q","event":{"kind":"started","prompt":"ab\000cd"}}}\n' >> "$log"
+  grep -q open "$log" || fail "the open-run fixture lost its started record"
+  fakebin=$(fm_fakebin "$dir/fake-tr")
+  printf '#!/usr/bin/env bash\nexit 97\n' > "$fakebin/tr"
+  chmod +x "$fakebin/tr"
+  out=$(TMPDIR="$dir/tmp" PATH="$fakebin:$PATH" run_events "$log"); st=$?
+  [ "$st" -ne 0 ] || fail "a failed NUL copy reported success"
+  [ -z "$out" ] || fail "a failed NUL copy folded '$out' instead of nothing"
+  out=$(TMPDIR="$dir/tmp" PATH="$fakebin:$PATH" run_state "$log")
+  [ "$out" = none ] || fail "a failed NUL copy folded to '$out', expected unknown (none)"
+  [ -z "$(ls -A "$dir/tmp")" ] || fail "a failed NUL copy leaked its temp file"
+  pass "a failed NUL copy fails closed to unknown with no temp leak"
+}
+
 test_run_events_survives_broken_node() {
   local dir log expected out fakebin
   dir="$TMP_ROOT/broken-node"
@@ -2850,6 +2876,7 @@ test_run_events_unterminated_final_record_folds
 test_run_events_large_noncandidate_line_stays_fast
 test_run_events_preserves_bytes_end_to_end
 test_run_events_node_tier_folds_bulk_cr_records
+test_run_events_nul_copy_failure_is_unknown_never_idle
 test_run_events_survives_broken_node
 test_1_3_session_classifies_busy_then_idle
 test_workspace_binding_treats_glob_characters_literally

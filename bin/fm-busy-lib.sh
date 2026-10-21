@@ -629,7 +629,13 @@ fm_busy_muse_run_events() {  # <session-log>
   # shellcheck disable=SC2094 # tr reads the log into the pipe; nothing writes back to it.
   if [ -f "$log" ] && ! LC_ALL=C tr -d '\000' < "$log" | LC_ALL=C cmp -s - "$log"; then
     tmp=$(mktemp "${TMPDIR:-/tmp}/fm-busy-muse-nul.XXXXXX") || return 1
-    LC_ALL=C tr '\000' '\001' < "$log" > "$tmp"
+    # A failed copy (a full disk) must never fold its truncated prefix: the
+    # surviving head can drop a trailing open run and read a busy session
+    # as idle. Remove the temp copy and fail closed to unknown instead.
+    if ! LC_ALL=C tr '\000' '\001' < "$log" > "$tmp"; then
+      rm -f "$tmp"
+      return 1
+    fi
     log=$tmp
   fi
   # Prefer the fast fold, but a node that exists yet fails (a poisoned PATH,
