@@ -616,7 +616,7 @@ EOF
 # grown log; the node fold pre-filters to candidate lines and parses only
 # those at native speed instead.
 fm_busy_muse_run_events() {  # <session-log>
-  local out log tmp st
+  local out log tmp="" st=""
   log=$1
   # NUL bytes are never valid in JSONL, but the two readers meet them
   # differently: awk record splitting is blind to NUL (C-string truncation)
@@ -922,27 +922,38 @@ function foldLine(rawLine) {
     process.exit(1);
   }
   stream.on("error", () => process.exit(1));
-  let carry = Buffer.alloc(0);
+  // Fragments of the one unfinished line. Each byte is scanned once, in the
+  // chunk that delivers it, and a completed line joins its fragments a single
+  // time, so a multi-megabyte prompt line costs linear work instead of a
+  // re-scan and re-copy of the whole unfinished line per chunk.
+  let parts = [];
   for await (const chunk of stream) {
-    const buf = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
-    carry = Buffer.alloc(0);
     let start = 0;
-    for (let i = 0; i < buf.length; i++) {
-      if (buf[i] !== 10) continue;
-      const lineBuf = buf.subarray(start, i);
+    for (let i = 0; i < chunk.length; i++) {
+      if (chunk[i] !== 10) continue;
+      const slice = chunk.subarray(start, i);
       start = i + 1;
+      let lineBuf;
+      if (parts.length === 0) {
+        lineBuf = slice;
+      } else {
+        parts.push(slice);
+        lineBuf = Buffer.concat(parts);
+        parts = [];
+      }
       // Byte-level pre-filter: the same three substrings the awk reference
       // scans for, so the candidate set is identical without decoding every
-      // line. Markers are ASCII, so byte search equals code-point search.
+      // line. Markers are ASCII, so byte search equals code-point search,
+      // and joining before filtering keeps markers split across chunks.
       if (lineBuf.indexOf('"run_id"') === -1) continue;
       if (lineBuf.indexOf('"run"') === -1) continue;
       if (lineBuf.indexOf('"started"') === -1 && lineBuf.indexOf('"terminal"') === -1) continue;
       foldLine(lineBuf.toString("latin1"));
     }
-    if (start < buf.length) carry = Buffer.from(buf.subarray(start));
+    if (start < chunk.length) parts.push(Buffer.from(chunk.subarray(start)));
   }
-  if (carry.length > 0) {
-    const lineBuf = carry;
+  if (parts.length > 0) {
+    const lineBuf = Buffer.concat(parts);
     if (lineBuf.indexOf('"run_id"') !== -1 && lineBuf.indexOf('"run"') !== -1 && (lineBuf.indexOf('"started"') !== -1 || lineBuf.indexOf('"terminal"') !== -1)) foldLine(lineBuf.toString("latin1"));
   }
   flush();

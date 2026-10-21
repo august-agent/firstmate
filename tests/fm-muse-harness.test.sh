@@ -2290,6 +2290,80 @@ EOF
   pass "the awk fallback without node reports success"
 }
 
+test_run_events_nul_inside_nested_string_is_rejected() {
+  local dir log out
+  dir="$TMP_ROOT/nul-nested-string"
+  mkdir -p "$dir"
+  # A NUL smuggled inside a nested prompt string is still a NUL-bearing
+  # record: the mapped SOH is a literal control byte the string parser
+  # rejects, so the whole record contributes nothing on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"ok","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"q","event":{"kind":"started","prompt":"ab\000cd"}}}\n' >> "$log"
+  assert_engine_events "$log" "$(printf 'ok\tstarted\t')" "a NUL inside a nested string"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a NUL-bearing prompt hid the open run: folded '$out'"
+  pass "a NUL inside a nested string never folds"
+}
+
+test_run_events_nul_between_tokens_is_rejected() {
+  local dir log out
+  dir="$TMP_ROOT/nul-between-tokens"
+  mkdir -p "$dir"
+  # A NUL standing where a comma belongs is a NUL-bearing record too: the
+  # mapped SOH is neither whitespace nor framing, so member parsing fails
+  # and the record contributes nothing on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"ok","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run"\000,"run_id":"w","event":{"kind":"started"}}}\n' >> "$log"
+  assert_engine_events "$log" "$(printf 'ok\tstarted\t')" "a NUL between tokens"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a NUL between tokens hid the open run: folded '$out'"
+  pass "a NUL between tokens never folds"
+}
+
+test_run_events_unterminated_final_record_folds() {
+  local dir log out
+  dir="$TMP_ROOT/unterminated"
+  mkdir -p "$dir"
+  # The stream carries the final line without a trailing newline: a valid
+  # terminal there still settles the run on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"u","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"u","event":{"kind":"terminal","terminal":"completed"}}}' >> "$log"
+  assert_engines_agree "$log" "an unterminated final record"
+  assert_engine_events "$log" "$(printf 'u\tstarted\t\nu\tterminal\tcompleted')" "an unterminated final record"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "an unterminated terminal left the run open: folded '$out'"
+  pass "an unterminated final record still folds"
+}
+
+test_run_events_large_noncandidate_line_stays_fast() {
+  local dir log out pad
+  dir="$TMP_ROOT/large-noncandidate"
+  mkdir -p "$dir"
+  # A noncandidate line wider than one stream chunk exercises the carry
+  # path: it is skipped at the byte level without decoding, so the open
+  # run beside it folds exactly and fast on both engines.
+  pad=$(awk 'BEGIN { for (i = 0; i < 70000; i++) printf "y" }')
+  log=$(mkengine_log "$dir" root <<EOF
+{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
+{"payload":{"kind":"turn_message","text":"$pad"}}
+EOF
+)
+  assert_engines_agree "$log" "a chunk-spanning noncandidate line"
+  assert_engine_events "$log" "$(printf 'open\tstarted\t')" "a chunk-spanning noncandidate line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a large noncandidate line hid the open run: folded '$out'"
+  pass "a chunk-spanning noncandidate line never folds"
+}
+
 test_run_events_preserves_bytes_end_to_end() {
   local dir log out
   dir="$TMP_ROOT/raw-bytes"
@@ -2764,6 +2838,10 @@ test_run_events_accepts_escaped_backslash_identity
 test_run_events_fold_survives_nul_bytes
 test_run_events_nul_never_repairs_a_terminal
 test_run_events_without_node_reports_success
+test_run_events_nul_inside_nested_string_is_rejected
+test_run_events_nul_between_tokens_is_rejected
+test_run_events_unterminated_final_record_folds
+test_run_events_large_noncandidate_line_stays_fast
 test_run_events_preserves_bytes_end_to_end
 test_run_events_node_tier_folds_bulk_cr_records
 test_run_events_survives_broken_node
