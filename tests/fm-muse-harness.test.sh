@@ -1641,6 +1641,63 @@ run_events() {  # <log>
   )
 }
 
+run_events_node() {  # <log> - the fast engine plus a framing sentinel, so a
+  (                  # trailing-newline difference cannot hide in $()
+    # shellcheck source=bin/fm-busy-lib.sh
+    . "$ROOT/bin/fm-busy-lib.sh"
+    fm_busy_muse_run_events_node "$1"
+    printf '.\n'
+  )
+}
+
+run_events_awk() {  # <log> - the reference engine plus the same sentinel
+  (
+    # shellcheck source=bin/fm-busy-lib.sh
+    . "$ROOT/bin/fm-busy-lib.sh"
+    fm_busy_muse_run_events_awk "$1"
+    printf '.\n'
+  )
+}
+
+run_state_node() {  # <log> - fold the fast engine's stream only
+  (
+    # shellcheck source=bin/fm-busy-lib.sh
+    . "$ROOT/bin/fm-busy-lib.sh"
+    fm_busy_muse_run_events_node "$1" | LC_ALL=C awk -F '\t' '
+      $2 == "started" { open[$1] = 1; seen = 1 }
+      $2 == "terminal" { open[$1] = 0 }
+      END {
+        if (!seen) { print "none"; exit }
+        for (rid in open) if (open[rid] == 1) { print "busy"; exit }
+        print "settled"
+      }
+    '
+  )
+}
+
+mkengine_log() {  # <dir> <name> - start a session log reading body from stdin
+  local dir=$1 name=$2 path
+  path="$dir/$name/session.jsonl"
+  mkdir -p "$dir/$name"
+  muse_log_metadata "$dir/ws" > "$path"
+  cat >> "$path"
+  printf '%s\n' "$path"
+}
+
+assert_engines_agree() {  # <log> <label>
+  local node_out awk_out
+  node_out=$(run_events_node "$1")
+  awk_out=$(run_events_awk "$1")
+  [ "$node_out" = "$awk_out" ] \
+    || fail "engines disagree on $2: node='$node_out' awk='$awk_out'"
+}
+assert_engine_events() {  # <log> <expected> <label> - the agreed stream must
+  local out                       # also equal the hand-written expectation,
+  out=$(run_events "$1")          # so two agreeing-but-wrong engines fail
+  [ "$out" = "$2" ] \
+    || fail "engines folded $3 to '$out', expected '$2'"
+}
+
 test_run_fold_tracks_open_and_settled_turns() {
   local dir log out
   dir="$TMP_ROOT/fold"
@@ -1868,15 +1925,15 @@ $(muse_log_run_terminal run-bbb cancelled)
 EOF
 )
   events=$(run_events "$log")
-  [ "$(printf '%s\n' "$events" | wc -l)" = 4 ] \
-    || fail "two settled turns produced $(printf '%s\n' "$events" | wc -l) event lines, expected 4"
+  [ "$(printf '%s\n' "$events" | wc -l | tr -d ' ')" = 4 ] \
+    || fail "two settled turns produced $(printf '%s\n' "$events" | wc -l | tr -d ' ') event lines, expected 4"
   first=$(printf '%s\n' "$events" | awk -F '\t' '$2 == "started" { print $1 }')
   second=$(printf '%s\n' "$events" | awk -F '\t' '$2 == "terminal" { print $1 }')
   [ -n "$first" ] && [ "$(printf '%s\n' "$first" | grep -c .)" = 2 ] \
     || fail "started events lost their run identity: '$first'"
   [ "$first" = "$second" ] \
     || fail "terminal events paired to '$second' instead of their started runs '$first'"
-  [ "$(printf '%s\n' "$first" | sort -u | wc -l)" = 2 ] \
+  [ "$(printf '%s\n' "$first" | sort -u | wc -l | tr -d ' ')" = 2 ] \
     || fail "the two turns share one run identity: '$first'"
   pass "run events pair each turn under its own non-empty run identity"
 }
@@ -1934,6 +1991,500 @@ EOF
   [ "$verdict" = "unknown muse-session-log" ] \
     || fail "a corrupt log classified '$verdict' instead of unknown"
   pass "corrupt session lines fold to unknown rather than idle"
+}
+
+test_run_events_large_log_stays_fast_and_exact() {
+  local dir log out events elapsed start pad giant i expected size
+  dir="$TMP_ROOT/large-log"
+  mkdir -p "$dir"
+  pad=$(awk 'BEGIN { for (i = 0; i < 4096; i++) printf "x" }')
+  giant=$(awk 'BEGIN { for (i = 0; i < 1500000; i++) printf "x" }')
+  {
+    muse_log_run_started run-settled
+    muse_log_run_terminal run-settled completed
+    muse_log_13_run_started run-open
+    i=0
+    while [ "$i" -lt 12000 ]; do
+      case $((i % 4)) in
+        0) muse_log_cleanup_terminal_decoy run-open ;;
+        1) muse_log_13_tool_terminal_decoy run-open ;;
+        2) muse_log_noise run-open ;;
+        *) printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"kind":"turn_message","run_id":"other-%s","text":"%s"}}\n' "$i" "$pad" ;;
+      esac
+      i=$((i + 1))
+    done
+    muse_log_13_run_model
+    # A multi-MB prompt on an open turn: the fold must stay fast, and the
+    # forged terminal inside the prompt must not close the run.
+    printf '{"schema_version":1,"payload_type":"runtime.session","payload":{"event":{"kind":"started","prompt":"ignore \\"kind\\":\\"terminal\\",\\"terminal\\":\\"completed\\" %s end"},"kind":"run","run_id":"run-giant"}}\n' "$giant"
+  } > "$dir/body.jsonl"
+  log=$(write_muse_13_session_log "$dir/root" 2026 08 05 big "$dir/ws" < "$dir/body.jsonl")
+  size=$(LC_ALL=C wc -c < "$log")
+  [ "$size" -gt 10000000 ] || fail "the large-log fixture is only $size bytes, expected tens of MB"
+  start=$SECONDS
+  events=$(run_events "$log")
+  elapsed=$((SECONDS - start))
+  expected=$(printf 'run-settled\tstarted\t\nrun-settled\tterminal\tcompleted\nrun-open\tstarted\t\nrun-giant\tstarted\t\n')
+  [ "$events" = "$expected" ] || fail "a large log with decoys folded to '$events', expected the settled pair plus the two open runs"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a large log with two open runs folded to '$out', expected busy"
+  if command -v node >/dev/null 2>&1; then
+    [ "$elapsed" -lt 45 ] || fail "folding a tens-of-MB log took ${elapsed}s, expected seconds"
+  fi
+  pass "a tens-of-MB log with decoys folds exactly like a small one, in seconds"
+}
+
+test_run_events_engines_agree_byte_for_byte() {
+  local dir log
+  command -v node >/dev/null 2>&1 || { pass "engine agreement needs node, which is absent"; return 0; }
+  dir="$TMP_ROOT/engines"
+  mkdir -p "$dir"
+
+  log=$(mkengine_log "$dir" both-shapes <<'EOF'
+{"schema_version":1,"payload_type":"runtime.session","payload":{"kind":"run","run_id":"run-aaa","event":{"kind":"started","prompt":"hi"}}}
+{"schema_version":1,"payload_type":"runtime.session","payload":{"event":{"eot_gate_ms":1,"kind":"terminal","terminal":"completed"},"kind":"run","run_id":"run-aaa"}}
+EOF
+)
+  assert_engines_agree "$log" "both record shapes"
+  assert_engine_events "$log" "$(printf 'run-aaa\tstarted\t\nrun-aaa\tterminal\tcompleted')" "both record shapes"
+
+  log=$(mkengine_log "$dir" dup-same-type <<'EOF'
+{"payload":{"kind":"run","kind":"run","run_id":"a","run_id":"b","event":{"kind":"started","kind":"started"}}}
+EOF
+)
+  assert_engines_agree "$log" "same-type duplicates keep the last value"
+  assert_engine_events "$log" "$(printf 'b\tstarted\t')" "same-type duplicates"
+
+  log=$(mkengine_log "$dir" dup-cross-type <<'EOF'
+{"payload":{"kind":"run","kind":null,"run_id":"r","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"s","event":{"kind":"started"}},"payload":null}
+{"payload":{"kind":"task","run_id":"t","event":{"kind":"started"}}}
+{"payload":{"kind":"run_model","record":{"run_stream":{"kind":"run"}}}}
+{"payload":"nope","kind":"run","run_id":"u","event":{"kind":"started"}}
+EOF
+)
+  assert_engines_agree "$log" "cross-type duplicates keep the earlier typed value"
+  assert_engine_events "$log" "$(printf 'r\tstarted\t\ns\tstarted\t')" "cross-type duplicates"
+
+  log=$(mkengine_log "$dir" corrupt-lines <<'EOF'
+this is not json
+{"payload":{"kind":"run","run_id":"r","event":{"kind":"started"}} junk
+{"payload":{"kind":"run","run_id":"r\q","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"n","event":{"kind":"started"}},"depth":01}
+[1,2]
+"just a string"
+{"payload":{"kind":"run","run_id":"","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":7,"event":{"kind":"started"}}}
+EOF
+)
+  assert_engines_agree "$log" "corrupt lines print nothing on both sides"
+  [ "$(run_state "$log")" = none ] || fail "corrupt lines folded past none"
+
+  path="$dir/crlf/session.jsonl"
+  mkdir -p "$dir/crlf"
+  muse_log_metadata "$dir/ws" > "$path"
+  {
+    printf '{"payload":{"kind":"run","run_id":"crlf","event":{"kind":"started"}}}\r\n'
+    printf '{"payload":{"kind":"run","run_id":"crlf","event":{"kind":"terminal","terminal":"cancelled"}}}\r\n'
+  } >> "$path"
+  log=$path
+  assert_engines_agree "$log" "CRLF records fold like LF ones"
+  assert_engine_events "$log" "$(printf 'crlf\tstarted\t\ncrlf\tterminal\tcancelled')" "CRLF records"
+
+  printf '{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}' > "$dir/barecr.jsonl"
+  {
+    printf '\r'
+    printf '{"payload":{"kind":"run","run_id":"open","event":{"kind":"terminal","terminal":"completed"}}}'
+    printf '\n'
+  } >> "$dir/barecr.jsonl"
+  assert_engines_agree "$dir/barecr.jsonl" "a bare CR never separates records"
+
+  printf '{"payload":{"kind":"run","run_id":"tail","event":{"kind":"started"}}}' > "$dir/unterminated.jsonl"
+  assert_engines_agree "$dir/unterminated.jsonl" "an unterminated final record still folds"
+  assert_engine_events "$dir/unterminated.jsonl" "$(printf 'tail\tstarted\t')" "an unterminated final record"
+  pass "both engines print byte-identical streams across shapes, duplicates, corrupt lines, and framing"
+}
+
+test_run_events_fold_rejects_forged_rows() {
+  local dir log out
+  dir="$TMP_ROOT/forged-rows"
+  mkdir -p "$dir"
+  # A field whose raw escapes would decode to TSV framing rejects the line.
+  # The forging record contributes nothing, so the open run stays open.
+  log=$(mkengine_log "$dir" injection <<'EOF'
+{"payload":{"kind":"run","run_id":"victim","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"decoy","event":{"kind":"terminal","terminal":"completed\nvictim\tterminal\tcompleted"}}}
+EOF
+)
+  assert_engines_agree "$log" "a framing-escaped field rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a forged terminal row settled the open run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'victim\tstarted\t')" "a framing-escaped field"
+  pass "decoded framing characters inside fields never forge lifecycle rows"
+}
+
+test_run_events_fold_rejects_identity_collision() {
+  local dir log out
+  dir="$TMP_ROOT/identity-collision"
+  mkdir -p "$dir"
+  # A terminal for vic<TAB>tim must not close victim.
+  # Decoding the identity would alias the two runs, so the line is rejected.
+  log=$(mkengine_log "$dir" tab <<'EOF'
+{"payload":{"kind":"run","run_id":"victim","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"vic\ttim","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "a tab-escaped identity rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a tab-escaped identity closed the victim run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'victim\tstarted\t')" "a tab-escaped identity"
+  log=$(mkengine_log "$dir" unicode <<'EOF'
+{"payload":{"kind":"run","run_id":"victim","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"vic\u0009tim","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "a unicode-escaped identity rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a unicode-escaped identity closed the victim run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'victim\tstarted\t')" "a unicode-escaped identity"
+  pass "a framing-escaped run_id never aliases another run"
+}
+
+test_run_events_fold_rejects_malformed_tracked_string() {
+  local dir log out
+  dir="$TMP_ROOT/malformed-string"
+  mkdir -p "$dir"
+  # A tracked value starting with a quote is a string or the line is corrupt.
+  # A broken string must not recover as a bare literal and settle the run.
+  log=$(mkengine_log "$dir" tab-recovery <<'EOF'
+{"payload":{"kind":"run","run_id":"r","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"r","event":{"kind":"terminal","terminal":"completed"}},"kind":"\t0}\n' >> "$log"
+  assert_engines_agree "$log" "a tab-broken tracked string rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a tab-broken tracked string settled the open run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'r\tstarted\t')" "a tab-broken tracked string"
+  log=$(mkengine_log "$dir" cr-only <<'EOF'
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"r","event":{"kind":"terminal","terminal":"completed"}},"kind":"\r0}\n' >> "$log"
+  assert_engines_agree "$log" "a CR-broken tracked string rejects its line"
+  out=$(run_state "$log")
+  [ "$out" = none ] || fail "a CR-broken tracked string folded past none: folded '$out'"
+  pass "a broken tracked string never recovers as a bare literal"
+}
+
+test_run_events_keeps_escaped_spellings_distinct() {
+  local dir log out
+  dir="$TMP_ROOT/escaped-spelling"
+  mkdir -p "$dir"
+  # Both engines emit raw spans, so an escaped spelling never pairs with
+  # its decoded twin on either side. Vendor ids never use escapes.
+  log=$(mkengine_log "$dir" unicode <<'EOF'
+{"payload":{"kind":"run","run_id":"r\u002d1","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"r-1","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "a unicode-escaped identity stays distinct"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a unicode-escaped identity paired with its twin: folded '$out'"
+  log=$(mkengine_log "$dir" slash <<'EOF'
+{"payload":{"kind":"run","run_id":"a\/b","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"a/b","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "a slash-escaped identity stays distinct"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a slash-escaped identity paired with its twin: folded '$out'"
+  assert_engine_events "$log" "$(printf 'a\\/b\tstarted\t\na/b\tterminal\tcompleted')" "slash-escaped identities"
+  pass "an escaped run_id spelling never pairs with its decoded twin"
+}
+
+test_run_events_accepts_escaped_backslash_identity() {
+  local dir log out
+  dir="$TMP_ROOT/escaped-backslash"
+  mkdir -p "$dir"
+  # An escaped backslash is a literal backslash, not framing: the escape
+  # walk consumes the pair, so the text after it can never pose as an
+  # escape. The run pairs and settles on both engines.
+  log=$(mkengine_log "$dir" pair <<'EOF'
+{"payload":{"kind":"run","run_id":"path\\team","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"path\\team","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "an escaped backslash accepts its line"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "an escaped-backslash run failed to settle: folded '$out'"
+  assert_engine_events "$log" "$(printf 'path\\\\team\tstarted\t\npath\\\\team\tterminal\tcompleted')" "an escaped backslash"
+  pass "an escaped backslash never marks a line as framing"
+}
+
+test_run_events_fold_survives_nul_bytes() {
+  local dir log out
+  dir="$TMP_ROOT/nul-bytes"
+  mkdir -p "$dir"
+  # NUL bytes are never valid in JSONL, and the readers meet them
+  # differently (awk record splitting is blind to NUL while node reads it
+  # intact), so the shared wrapper maps NULs to SOH before either engine
+  # folds. SOH is a literal control byte the strict parsers reject, so a
+  # NUL-bearing record contributes nothing instead of being repaired. The
+  # direct engine entry points assume NUL-free input; this case folds
+  # through the wrapper like production does.
+  log=$(mkengine_log "$dir" trailing <<'EOF'
+{"payload":{"kind":"run","run_id":"n","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"m","event":{"kind":"started"}}}\000\n' >> "$log"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a trailing NUL settled or hid open runs: folded '$out'"
+  assert_engine_events "$log" "$(printf 'n\tstarted\t')" "a trailing NUL is rejected"
+  pass "a NUL-bearing record contributes nothing"
+}
+
+test_run_events_nul_never_repairs_a_terminal() {
+  local dir log out
+  dir="$TMP_ROOT/nul-terminal"
+  mkdir -p "$dir"
+  # Stripping a NUL would turn a corrupt terminal for run r into a valid
+  # terminal for the open run r, flipping busy to settled. Rejecting the
+  # NUL-bearing record keeps the turn open on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"r","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"r\000","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  assert_engine_events "$log" "$(printf 'r\tstarted\t')" "a NUL-bearing terminal"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a corrupt NUL terminal settled the run: folded '$out'"
+  pass "a NUL-bearing terminal never settles its run"
+}
+
+test_run_events_without_node_reports_success() {
+  local dir log out st shim tool target
+  dir="$TMP_ROOT/no-node-status"
+  mkdir -p "$dir"
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  # The awk fallback used to leak the cleanup test as its exit status: with
+  # no temp copy the trailing '[ -n "$tmp" ]' failed and overrode awk's
+  # success, so callers with pipefail saw failure on a good fold.
+  shim="$dir/shim"
+  mkdir -p "$shim"
+  for tool in awk tr cmp mktemp rm; do
+    target=$(command -v "$tool") || continue
+    ln -sf "$target" "$shim/$tool"
+  done
+  out=$(PATH="$shim" run_events "$log"); st=$?
+  [ "$st" = 0 ] || fail "the awk fallback without node exited $st"
+  [ "$out" = "$(printf 'run-1\tstarted\t\nrun-1\tterminal\tcompleted')" ] \
+    || fail "the awk fallback without node folded '$out'"
+  set -o pipefail
+  PATH="$shim" run_events "$log" | LC_ALL=C grep -q run-1
+  st=$?
+  set +o pipefail
+  [ "$st" = 0 ] || fail "the awk fallback pipeline without node exited $st"
+  pass "the awk fallback without node reports success"
+}
+
+test_run_events_nul_inside_nested_string_is_rejected() {
+  local dir log out
+  dir="$TMP_ROOT/nul-nested-string"
+  mkdir -p "$dir"
+  # A NUL smuggled inside a nested prompt string is still a NUL-bearing
+  # record: the mapped SOH is a literal control byte the string parser
+  # rejects, so the whole record contributes nothing on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"ok","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"q","event":{"kind":"started","prompt":"ab\000cd"}}}\n' >> "$log"
+  assert_engine_events "$log" "$(printf 'ok\tstarted\t')" "a NUL inside a nested string"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a NUL-bearing prompt hid the open run: folded '$out'"
+  pass "a NUL inside a nested string never folds"
+}
+
+test_run_events_nul_between_tokens_is_rejected() {
+  local dir log out
+  dir="$TMP_ROOT/nul-between-tokens"
+  mkdir -p "$dir"
+  # A NUL standing where a comma belongs is a NUL-bearing record too: the
+  # mapped SOH is neither whitespace nor framing, so member parsing fails
+  # and the record contributes nothing on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"ok","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run"\000,"run_id":"w","event":{"kind":"started"}}}\n' >> "$log"
+  assert_engine_events "$log" "$(printf 'ok\tstarted\t')" "a NUL between tokens"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a NUL between tokens hid the open run: folded '$out'"
+  pass "a NUL between tokens never folds"
+}
+
+test_run_events_unterminated_final_record_folds() {
+  local dir log out
+  dir="$TMP_ROOT/unterminated"
+  mkdir -p "$dir"
+  # The stream carries the final line without a trailing newline: a valid
+  # terminal there still settles the run on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"u","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"u","event":{"kind":"terminal","terminal":"completed"}}}' >> "$log"
+  assert_engines_agree "$log" "an unterminated final record"
+  assert_engine_events "$log" "$(printf 'u\tstarted\t\nu\tterminal\tcompleted')" "an unterminated final record"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "an unterminated terminal left the run open: folded '$out'"
+  pass "an unterminated final record still folds"
+}
+
+test_run_events_large_noncandidate_line_stays_fast() {
+  local dir log out pad start elapsed
+  dir="$TMP_ROOT/large-noncandidate"
+  mkdir -p "$dir"
+  # A noncandidate line far wider than one stream chunk exercises the carry
+  # path: it is skipped at the byte level without decoding, so the open
+  # run beside it folds exactly and fast on both engines. A tiny forced
+  # chunk packs tens of thousands of chunk boundaries into a modest line:
+  # a per-chunk re-scan of the unfinished line costs quadratic work (about
+  # a minute at 2MB), while the linear fold stays near a second.
+  pad=$(awk 'BEGIN { for (i = 0; i < 2000000; i++) printf "y" }')
+  log=$(mkengine_log "$dir" root <<EOF
+{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
+{"payload":{"kind":"turn_message","text":"$pad"}}
+EOF
+)
+  FM_MUSE_FOLD_CHUNK=64 assert_engines_agree "$log" "a chunk-spanning noncandidate line"
+  start=$SECONDS
+  out=$(FM_MUSE_FOLD_CHUNK=64 run_state "$log")
+  elapsed=$((SECONDS - start))
+  [ "$out" = busy ] || fail "a large noncandidate line hid the open run: folded '$out'"
+  assert_engine_events "$log" "$(printf 'open\tstarted\t')" "a chunk-spanning noncandidate line"
+  [ "$elapsed" -lt 30 ] || fail "folding a 2MB noncandidate line at 64-byte chunks took ${elapsed}s"
+  pass "a chunk-spanning noncandidate line never folds"
+}
+
+test_run_events_preserves_bytes_end_to_end() {
+  local dir log out
+  dir="$TMP_ROOT/raw-bytes"
+  mkdir -p "$dir"
+  # The node fold reads and writes bytes (latin1 in, latin1 out), exactly
+  # like the walk under LC_ALL=C: invalid UTF-8 bytes stay distinct instead
+  # of merging into U+FFFD, and valid multibyte sequences pass through
+  # untouched. Byte 377 versus 376 must not settle, while identical bytes
+  # pair and settle.
+  log=$(mkengine_log "$dir" distinct <<'EOF'
+{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
+EOF
+)
+  {
+    printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n'
+    printf '{"payload":{"kind":"run","run_id":"A\376B","event":{"kind":"terminal","terminal":"completed"}}}\n'
+  } >> "$log"
+  assert_engines_agree "$log" "distinct invalid bytes stay distinct"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "distinct invalid bytes settled a run: folded '$out'"
+  log=$(mkengine_log "$dir" paired <<'EOF'
+EOF
+)
+  {
+    printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n'
+    printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"terminal","terminal":"completed"}}}\n'
+  } >> "$log"
+  assert_engines_agree "$log" "identical invalid bytes pair"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "identical invalid bytes failed to settle: folded '$out'"
+  log=$(mkengine_log "$dir" multibyte <<'EOF'
+{"payload":{"kind":"run","run_id":"caf\u00e9","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"caf\u00e9","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  {
+    printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"started"}}}\n'
+    printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"terminal","terminal":"completed"}}}\n'
+  } >> "$log"
+  assert_engines_agree "$log" "valid multibyte sequences pass through"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "valid multibyte sequences failed to settle: folded '$out'"
+  pass "bytes survive the fold intact on both engines"
+}
+
+test_run_events_node_tier_folds_bulk_cr_records() {
+  local dir log out count i
+  dir="$TMP_ROOT/bulk-cr"
+  mkdir -p "$dir"
+  # Node's optimizing compiler intermittently dropped records when the fold
+  # script arrived on stdin: a 5001-line CR-prefixed log folded to ~1700
+  # events instead of 5001, varying run to run. The fold runs with --no-opt,
+  # so five thousand and one distinct CR-prefixed started records must fold
+  # to exactly that many events on every fold, with both engines agreeing.
+  log="$dir/session.jsonl"
+  muse_log_metadata "$dir/ws" > "$log"
+  awk 'BEGIN { for (i = 1; i <= 5001; i++) printf "\r{\"payload\":{\"kind\":\"run\",\"run_id\":\"bulk%d\",\"event\":{\"kind\":\"started\"}}}\n", i }' >> "$log"
+  assert_engines_agree "$log" "bulk CR-prefixed records"
+  for i in 1 2 3 4 5; do
+    out=$(run_events "$log")
+    count=$(printf '%s\n' "$out" | LC_ALL=C grep -c .)
+    [ "$count" = 5001 ] || fail "bulk fold $i kept $count of 5001 events"
+  done
+  pass "the node tier folds bulk CR-prefixed records on every fold"
+}
+
+test_run_events_nul_copy_failure_is_unknown_never_idle() {
+  local dir log out st fakebin
+  dir="$TMP_ROOT/nul-copy-failure"
+  mkdir -p "$dir/tmp"
+  # An open run followed by a NUL-bearing record: folding a truncated copy
+  # prefix could drop the trailing open run and read a busy session as
+  # settled, so a failed NUL-normalisation copy must fail closed to
+  # unknown instead of parsing whatever survived.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"q","event":{"kind":"started","prompt":"ab\000cd"}}}\n' >> "$log"
+  grep -q open "$log" || fail "the open-run fixture lost its started record"
+  fakebin=$(fm_fakebin "$dir/fake-tr")
+  printf '#!/usr/bin/env bash\nexit 97\n' > "$fakebin/tr"
+  chmod +x "$fakebin/tr"
+  out=$(TMPDIR="$dir/tmp" PATH="$fakebin:$PATH" run_events "$log"); st=$?
+  [ "$st" -ne 0 ] || fail "a failed NUL copy reported success"
+  [ -z "$out" ] || fail "a failed NUL copy folded '$out' instead of nothing"
+  out=$(TMPDIR="$dir/tmp" PATH="$fakebin:$PATH" run_state "$log")
+  [ "$out" = none ] || fail "a failed NUL copy folded to '$out', expected unknown (none)"
+  [ -z "$(ls -A "$dir/tmp")" ] || fail "a failed NUL copy leaked its temp file"
+  pass "a failed NUL copy fails closed to unknown with no temp leak"
+}
+
+test_run_events_survives_broken_node() {
+  local dir log expected out fakebin
+  dir="$TMP_ROOT/broken-node"
+  mkdir -p "$dir"
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  expected=$(run_events_awk "$log")
+  fakebin=$(fm_fakebin "$dir/fake-silent")
+  printf '#!/usr/bin/env bash\nexit 97\n' > "$fakebin/node"
+  chmod +x "$fakebin/node"
+  out=$(PATH="$fakebin:$PATH" run_events "$log")
+  [ "$out" = "$(printf '%s' "$expected" | sed 's/\.$//')" ] \
+    || fail "a poisoned node did not degrade to the reference fold: got '$out'"
+  fakebin=$(fm_fakebin "$dir/fake-partial")
+  printf '#!/usr/bin/env bash\nprintf "forged\\tstarted\\t\\n"\nexit 3\n' > "$fakebin/node"
+  chmod +x "$fakebin/node"
+  out=$(PATH="$fakebin:$PATH" run_events "$log")
+  [ "$out" = "$(printf '%s' "$expected" | sed 's/\.$//')" ] \
+    || fail "a partial node stream escaped the fallback: got '$out'"
+  pass "a failing node degrades to the reference fold with no partial output"
 }
 
 test_1_3_session_classifies_busy_then_idle() {
@@ -2309,6 +2860,24 @@ test_run_events_pair_turns_by_non_empty_run_id
 test_1_3_decoys_do_not_settle_a_run
 test_prompt_text_cannot_inject_lifecycle_events
 test_corrupt_lines_fold_to_unknown_never_idle
+test_run_events_large_log_stays_fast_and_exact
+test_run_events_engines_agree_byte_for_byte
+test_run_events_fold_rejects_forged_rows
+test_run_events_fold_rejects_identity_collision
+test_run_events_fold_rejects_malformed_tracked_string
+test_run_events_keeps_escaped_spellings_distinct
+test_run_events_accepts_escaped_backslash_identity
+test_run_events_fold_survives_nul_bytes
+test_run_events_nul_never_repairs_a_terminal
+test_run_events_without_node_reports_success
+test_run_events_nul_inside_nested_string_is_rejected
+test_run_events_nul_between_tokens_is_rejected
+test_run_events_unterminated_final_record_folds
+test_run_events_large_noncandidate_line_stays_fast
+test_run_events_preserves_bytes_end_to_end
+test_run_events_node_tier_folds_bulk_cr_records
+test_run_events_nul_copy_failure_is_unknown_never_idle
+test_run_events_survives_broken_node
 test_1_3_session_classifies_busy_then_idle
 test_workspace_binding_treats_glob_characters_literally
 test_binding_excludes_preexisting_log_when_mtimes_tie
