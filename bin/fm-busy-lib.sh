@@ -616,18 +616,31 @@ EOF
 # grown log; the node fold pre-filters to candidate lines and parses only
 # those at native speed instead.
 fm_busy_muse_run_events() {  # <session-log>
-  local out
+  local out log=$1 tmp=
+  # NUL bytes are never valid in JSONL, but the two readers meet them
+  # differently: awk record splitting is blind to NUL (C-string truncation)
+  # while node reads them intact, so one NUL would fold differently per
+  # engine. Strip NULs through a temp copy so both engines fold identical
+  # bytes. The copy exists only when the log actually holds a NUL.
+  # shellcheck disable=SC2094 # tr reads the log into the pipe; nothing writes back to it.
+  if [ -f "$log" ] && ! LC_ALL=C tr -d '\000' < "$log" | LC_ALL=C cmp -s - "$log"; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/fm-busy-muse-nul.XXXXXX") || return 1
+    LC_ALL=C tr -d '\000' < "$log" > "$tmp"
+    log=$tmp
+  fi
   # Prefer the fast fold, but a node that exists yet fails (a poisoned PATH,
   # a broken runtime) must degrade to the reference instead of folding to
   # none: the cached binding path classifies without any other node use, so
   # the fold cannot be the one thing that needs a working node. The node
   # fold only ever writes on success, and the capture keeps even a partial
   # write from escaping, so the fallback always folds the whole log.
-  if command -v node >/dev/null 2>&1 && out=$(fm_busy_muse_run_events_node "$1"); then
+  if command -v node >/dev/null 2>&1 && out=$(fm_busy_muse_run_events_node "$log"); then
     [ -n "$out" ] && printf '%s\n' "$out"
+    [ -n "$tmp" ] && rm -f "$tmp"
     return 0
   fi
-  fm_busy_muse_run_events_awk "$1"
+  fm_busy_muse_run_events_awk "$log"
+  [ -n "$tmp" ] && rm -f "$tmp"
 }
 
 # fm_busy_muse_run_events_node: the fast run_events fold. A fixed-string
@@ -642,12 +655,11 @@ fm_busy_muse_run_events() {  # <session-log>
 # below records last-string-wins and last-object-wins instead of
 # JSON.parse's last-value-wins. Row framing can never come from field
 # contents: a tracked string whose raw escapes would decode to tab, newline,
-# or CR rejects the line on both engines, so decoded identities can never
-# alias distinct runs and decoded fields can never forge rows for the
-# downstream fold. Corrupt lines print nothing on both sides. One accepted
-# divergence remains: a run_id spelled with unicode escapes pairs with its
-# decoded twin here and stays distinct in the walk; vendor ids never use
-# escapes, and decoding is the JSON-correct reading.
+# or CR rejects the line on both engines, so field contents can never alias
+# distinct runs or forge rows for the downstream fold. Both engines emit the
+# raw spans, so escape spellings stay distinct in both; vendor ids and
+# terminal enums never use escapes, so the spelling never matters in
+# practice. Corrupt lines print nothing on both sides.
 fm_busy_muse_run_events_node() {  # <session-log>
   [ -f "$1" ] || return 1
   command -v node >/dev/null 2>&1 || return 1
@@ -662,9 +674,9 @@ try {
 // Direct port of the awk reference walk below: same states, same
 // acceptance, native speed. S is the line, N its length, P the cursor.
 // WS is space, tab, CR (never LF: lines arrive split on LF already).
-// Field slots keep RAW inner text: comparisons run against raw spans, and
-// only emitted fields are decoded, so escape spellings behave exactly like
-// the walk except for the documented pairing divergence.
+// Field slots keep RAW inner text: comparisons run against raw spans and
+// emission prints the raw spans, exactly like the walk, so escape
+// spellings behave identically on both sides.
 let S = "";
 let N = 0;
 let P = 0;
@@ -689,11 +701,23 @@ function isHex(c) {
   return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
 }
 // hasFramingEsc is true when tracked-string raw escapes would decode to TSV
-// framing. Such a line is rejected outright on both engines.
+// framing. Such a line is rejected outright on both engines. The span is
+// walked escape by escape: an escaped backslash (\\) consumes itself, so
+// the literal text after it can never pose as an escape. Only a real \t,
+// \n, \r, or \u0009/000a/000d escape framing-marks the line.
 function hasFramingEsc(span) {
-  if (span.includes("\\t") || span.includes("\\n") || span.includes("\\r")) return true;
-  const low = span.toLowerCase();
-  if (low.includes("\\u0009") || low.includes("\\u000a") || low.includes("\\u000d")) return true;
+  for (let i = 0; i < span.length; i++) {
+    if (span[i] !== "\\") continue;
+    const e = span[i + 1];
+    if (e === "t" || e === "n" || e === "r") return true;
+    if (e === "u") {
+      const hex = span.slice(i + 2, i + 6).toLowerCase();
+      if (hex === "0009" || hex === "000a" || hex === "000d") return true;
+      i += 5;
+    } else {
+      i += 1;
+    }
+  }
   return false;
 }
 // parseString consumes the JSON string at S[P] into sval (raw inner text)
@@ -837,9 +861,6 @@ function resetSlots() {
 function trailingJunk() {
   return /[^ \t\r]/.test(S.slice(P + 1));
 }
-function decode(raw) {
-  return JSON.parse(`"${raw}"`);
-}
 const out = [];
 // Split on LF only: a bare CR never separates vendor records, and keeping
 // it inside the line lets strict parsing reject it exactly like the walk.
@@ -868,7 +889,7 @@ for (const rawLine of text.split("\n")) {
   if (!fKindFound) continue;
   if (fKind !== "started" && fKind !== "terminal") continue;
   const terminal = fKind === "terminal" && fTerminalFound ? fTerminal : "";
-  out.push(`${decode(rid)}\t${fKind}\t${decode(terminal)}`);
+  out.push(`${rid}\t${fKind}\t${terminal}`);
 }
 if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`);
 NODE
@@ -895,12 +916,21 @@ fm_busy_muse_run_events_awk() {  # <session-log>
     function is_hex(c) { return ((c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")) }
     # has_framing_esc: true when tracked-string raw escapes would decode
     # to TSV framing. Such a line is rejected outright on both engines:
-    # decoding the identity would alias distinct runs, and decoding any
-    # field would forge rows for the downstream fold.
-    function has_framing_esc(span,    low) {
-      if (index(span, "\\t") || index(span, "\\n") || index(span, "\\r")) return 1
-      low = tolower(span)
-      if (index(low, "\\u0009") || index(low, "\\u000a") || index(low, "\\u000d")) return 1
+    # its contents could alias distinct runs or forge rows for the
+    # downstream fold. The span is walked escape by escape: an escaped
+    # backslash consumes itself, so the literal text after it can never
+    # pose as an escape.
+    function has_framing_esc(span,    i, e, hex) {
+      for (i = 1; i <= length(span); i++) {
+        if (substr(span, i, 1) != "\\") continue
+        e = substr(span, i + 1, 1)
+        if (e == "t" || e == "n" || e == "r") return 1
+        if (e == "u") {
+          hex = tolower(substr(span, i + 2, 4))
+          if (hex == "0009" || hex == "000a" || hex == "000d") return 1
+          i += 5
+        } else i++
+      }
       return 0
     }
     function parse_string(    c, start, esc) {

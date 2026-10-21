@@ -2171,22 +2171,69 @@ EOF
   pass "a broken tracked string never recovers as a bare literal"
 }
 
-test_run_events_pairs_unicode_escaped_ids_by_decoded_value() {
+test_run_events_keeps_escaped_spellings_distinct() {
   local dir log out
-  command -v node >/dev/null 2>&1 || { pass "unicode identity needs node, which is absent"; return 0; }
-  dir="$TMP_ROOT/unicode-id"
+  dir="$TMP_ROOT/escaped-spelling"
   mkdir -p "$dir"
-  # Accepted divergence, pinned: the walk compares raw bytes, so an escaped
-  # spelling stays distinct there; decoding is the JSON-correct reading and
-  # pairs here. Vendor ids never use escapes.
-  log=$(mkengine_log "$dir" escaped <<'EOF'
+  # Both engines emit raw spans, so an escaped spelling never pairs with
+  # its decoded twin on either side. Vendor ids never use escapes.
+  log=$(mkengine_log "$dir" unicode <<'EOF'
 {"payload":{"kind":"run","run_id":"r\u002d1","event":{"kind":"started"}}}
 {"payload":{"kind":"run","run_id":"r-1","event":{"kind":"terminal","terminal":"completed"}}}
 EOF
 )
-  out=$(run_state_node "$log")
-  [ "$out" = settled ] || fail "an escaped run_id did not pair with its decoded twin: folded '$out'"
-  pass "a unicode-escaped run_id pairs with its decoded spelling"
+  assert_engines_agree "$log" "a unicode-escaped identity stays distinct"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a unicode-escaped identity paired with its twin: folded '$out'"
+  log=$(mkengine_log "$dir" slash <<'EOF'
+{"payload":{"kind":"run","run_id":"a\/b","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"a/b","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "a slash-escaped identity stays distinct"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a slash-escaped identity paired with its twin: folded '$out'"
+  assert_engine_events "$log" "$(printf 'a\\/b\tstarted\t\na/b\tterminal\tcompleted')" "slash-escaped identities"
+  pass "an escaped run_id spelling never pairs with its decoded twin"
+}
+
+test_run_events_accepts_escaped_backslash_identity() {
+  local dir log out
+  dir="$TMP_ROOT/escaped-backslash"
+  mkdir -p "$dir"
+  # An escaped backslash is a literal backslash, not framing: the escape
+  # walk consumes the pair, so the text after it can never pose as an
+  # escape. The run pairs and settles on both engines.
+  log=$(mkengine_log "$dir" pair <<'EOF'
+{"payload":{"kind":"run","run_id":"path\\team","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"path\\team","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  assert_engines_agree "$log" "an escaped backslash accepts its line"
+  out=$(run_state "$log")
+  [ "$out" = settled ] || fail "an escaped-backslash run failed to settle: folded '$out'"
+  assert_engine_events "$log" "$(printf 'path\\\\team\tstarted\t\npath\\\\team\tterminal\tcompleted')" "an escaped backslash"
+  pass "an escaped backslash never marks a line as framing"
+}
+
+test_run_events_fold_survives_nul_bytes() {
+  local dir log out
+  dir="$TMP_ROOT/nul-bytes"
+  mkdir -p "$dir"
+  # NUL bytes are never valid in JSONL, and the readers meet them
+  # differently (awk record splitting is blind to NUL while node reads it
+  # intact), so the shared wrapper strips NULs before either engine folds.
+  # The direct engine entry points assume NUL-free input; this case folds
+  # through the wrapper like production does.
+  log=$(mkengine_log "$dir" trailing <<'EOF'
+{"payload":{"kind":"run","run_id":"n","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"m","event":{"kind":"started"}}}\000\n' >> "$log"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a trailing NUL settled or hid open runs: folded '$out'"
+  assert_engine_events "$log" "$(printf 'n\tstarted\t\nm\tstarted\t')" "a trailing NUL"
+  pass "a NUL byte never changes the folded events"
 }
 
 test_run_events_survives_broken_node() {
@@ -2592,7 +2639,9 @@ test_run_events_engines_agree_byte_for_byte
 test_run_events_fold_rejects_forged_rows
 test_run_events_fold_rejects_identity_collision
 test_run_events_fold_rejects_malformed_tracked_string
-test_run_events_pairs_unicode_escaped_ids_by_decoded_value
+test_run_events_keeps_escaped_spellings_distinct
+test_run_events_accepts_escaped_backslash_identity
+test_run_events_fold_survives_nul_bytes
 test_run_events_survives_broken_node
 test_1_3_session_classifies_busy_then_idle
 test_workspace_binding_treats_glob_characters_literally
