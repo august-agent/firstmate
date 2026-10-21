@@ -616,16 +616,20 @@ EOF
 # grown log; the node fold pre-filters to candidate lines and parses only
 # those at native speed instead.
 fm_busy_muse_run_events() {  # <session-log>
-  local out log=$1 tmp=
+  local out log tmp st
+  log=$1
   # NUL bytes are never valid in JSONL, but the two readers meet them
   # differently: awk record splitting is blind to NUL (C-string truncation)
   # while node reads them intact, so one NUL would fold differently per
-  # engine. Strip NULs through a temp copy so both engines fold identical
-  # bytes. The copy exists only when the log actually holds a NUL.
+  # engine. Map every NUL to SOH through a temp copy so both engines fold
+  # identical bytes. SOH is a literal control byte, so the strict parsers
+  # reject any record holding one: a NUL-bearing record contributes nothing,
+  # and stripping must never repair it into a valid lifecycle record. The
+  # copy exists only when the log actually holds a NUL.
   # shellcheck disable=SC2094 # tr reads the log into the pipe; nothing writes back to it.
   if [ -f "$log" ] && ! LC_ALL=C tr -d '\000' < "$log" | LC_ALL=C cmp -s - "$log"; then
     tmp=$(mktemp "${TMPDIR:-/tmp}/fm-busy-muse-nul.XXXXXX") || return 1
-    LC_ALL=C tr -d '\000' < "$log" > "$tmp"
+    LC_ALL=C tr '\000' '\001' < "$log" > "$tmp"
     log=$tmp
   fi
   # Prefer the fast fold, but a node that exists yet fails (a poisoned PATH,
@@ -639,8 +643,9 @@ fm_busy_muse_run_events() {  # <session-log>
     [ -n "$tmp" ] && rm -f "$tmp"
     return 0
   fi
-  fm_busy_muse_run_events_awk "$log"
+  fm_busy_muse_run_events_awk "$log"; st=$?
   [ -n "$tmp" ] && rm -f "$tmp"
+  return $st
 }
 
 # fm_busy_muse_run_events_node: the fast run_events fold. A fixed-string
@@ -670,15 +675,13 @@ fm_busy_muse_run_events_node() {  # <session-log>
   # than the awk walk, so pin the semantics-correct tier explicitly.
   node --no-opt - "$1" <<'NODE'
 const fs = require("fs");
-let text;
-try {
-  // latin1 maps every byte to one code point, so invalid UTF-8 bytes survive
-  // intact instead of merging into U+FFFD: distinct raw identities stay
-  // distinct exactly like the walk, which reads bytes under LC_ALL=C.
-  text = fs.readFileSync(process.argv[2], "latin1");
-} catch {
-  process.exit(1);
-}
+const logPath = process.argv[2];
+if (!logPath) process.exit(1);
+// Streaming read: grown logs exceed V8's ~512MiB string limit and buffering
+// the whole file wastes memory, so the fold streams chunks and folds one
+// line at a time. Bytes split on LF only; each line decodes as latin1, so
+// every byte maps to one code point exactly like a whole-file latin1 read
+// and invalid UTF-8 bytes stay distinct instead of merging into U+FFFD.
 // Direct port of the awk reference walk below: same states, same
 // acceptance, native speed. S is the line, N its length, P the cursor.
 // WS is space, tab, CR (never LF: lines arrive split on LF already).
@@ -787,6 +790,7 @@ function skipValue() {
         else if (d === '"') instr = false;
         else if (d < " ") return false;
       } else if (d === '"') instr = true;
+      else if (d < " " && !isWs(d)) return false;
       else if (d === "{" || d === "[") depth++;
       else if (d === "}" || d === "]") {
         depth--;
@@ -869,41 +873,80 @@ function resetSlots() {
 function trailingJunk() {
   return /[^ \t\r]/.test(S.slice(P + 1));
 }
-const out = [];
-// Split on LF only: a bare CR never separates vendor records, and keeping
-// it inside the line lets strict parsing reject it exactly like the walk.
-for (const rawLine of text.split("\n")) {
+const batch = [];
+function flush() {
+  if (batch.length === 0) return;
+  // latin1 out: the fold reads bytes and must write bytes, so code points
+  // 0x80-0xFF leave as single bytes exactly like the walk. Sync writes block
+  // on fd 1 instead of leaving the flush to the event loop, so the whole
+  // stream reaches the caller even for large logs.
+  fs.writeFileSync(1, batch.join(""), "latin1");
+  batch.length = 0;
+}
+// foldLine parses one LF-split line exactly like the awk reference walk: a
+// bare CR never separates vendor records, and keeping it inside the line
+// lets strict parsing reject it exactly like the walk.
+function foldLine(rawLine) {
   S = rawLine;
-  if (!S.includes('"run_id"')) continue;
-  if (!S.includes('"run"')) continue;
-  if (!S.includes('"started"') && !S.includes('"terminal"')) continue;
+  if (!S.includes('"run_id"')) return;
+  if (!S.includes('"run"')) return;
+  if (!S.includes('"started"') && !S.includes('"terminal"')) return;
   N = S.length;
   P = 0;
   skipWs();
-  if (S[P] !== "{") continue;
+  if (S[P] !== "{") return;
   resetSlots();
-  if (!scanMembers(P, "payload") || foundOpen === 0) continue;
-  if (trailingJunk()) continue;
+  if (!scanMembers(P, "payload") || foundOpen === 0) return;
+  if (trailingJunk()) return;
   const payloadOpen = foundOpen;
   resetSlots();
-  if (!scanMembers(payloadOpen, "event")) continue;
-  if (!fKindFound || fKind !== "run") continue;
-  if (!fRunidFound || fRunid === "") continue;
-  if (foundOpen === 0) continue;
+  if (!scanMembers(payloadOpen, "event")) return;
+  if (!fKindFound || fKind !== "run") return;
+  if (!fRunidFound || fRunid === "") return;
+  if (foundOpen === 0) return;
   const rid = fRunid;
   const eventOpen = foundOpen;
   resetSlots();
-  if (!scanMembers(eventOpen, "")) continue;
-  if (!fKindFound) continue;
-  if (fKind !== "started" && fKind !== "terminal") continue;
+  if (!scanMembers(eventOpen, "")) return;
+  if (!fKindFound) return;
+  if (fKind !== "started" && fKind !== "terminal") return;
   const terminal = fKind === "terminal" && fTerminalFound ? fTerminal : "";
-  out.push(`${rid}\t${fKind}\t${terminal}`);
+  batch.push(`${rid}\t${fKind}\t${terminal}\n`);
+  if (batch.length >= 1000) flush();
 }
-// latin1 out: the fold reads bytes (see the read above) and must write bytes,
-// so code points 0x80-0xFF leave as single bytes exactly like the walk.
-// Sync write: the fold's whole stream must reach the caller even for large
-// logs, so block on fd 1 instead of leaving the flush to the event loop.
-if (out.length > 0) fs.writeFileSync(1, `${out.join("\n")}\n`, "latin1");
+(async () => {
+  let stream;
+  try {
+    stream = fs.createReadStream(logPath);
+  } catch {
+    process.exit(1);
+  }
+  stream.on("error", () => process.exit(1));
+  let carry = Buffer.alloc(0);
+  for await (const chunk of stream) {
+    const buf = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+    carry = Buffer.alloc(0);
+    let start = 0;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] !== 10) continue;
+      const lineBuf = buf.subarray(start, i);
+      start = i + 1;
+      // Byte-level pre-filter: the same three substrings the awk reference
+      // scans for, so the candidate set is identical without decoding every
+      // line. Markers are ASCII, so byte search equals code-point search.
+      if (lineBuf.indexOf('"run_id"') === -1) continue;
+      if (lineBuf.indexOf('"run"') === -1) continue;
+      if (lineBuf.indexOf('"started"') === -1 && lineBuf.indexOf('"terminal"') === -1) continue;
+      foldLine(lineBuf.toString("latin1"));
+    }
+    if (start < buf.length) carry = Buffer.from(buf.subarray(start));
+  }
+  if (carry.length > 0) {
+    const lineBuf = carry;
+    if (lineBuf.indexOf('"run_id"') !== -1 && lineBuf.indexOf('"run"') !== -1 && (lineBuf.indexOf('"started"') !== -1 || lineBuf.indexOf('"terminal"') !== -1)) foldLine(lineBuf.toString("latin1"));
+  }
+  flush();
+})().catch(() => process.exit(1));
 NODE
 }
 
@@ -990,6 +1033,7 @@ fm_busy_muse_run_events_awk() {  # <session-log>
             else if (c == "\"") instr = 0
             else if (c < " ") return 0
           } else if (c == "\"") instr = 1
+          else if ((c < " ") && !is_ws(c)) return 0
           else if (c == "{" || c == "[") depth++
           else if (c == "}" || c == "]") {
             depth--

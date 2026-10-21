@@ -2226,8 +2226,10 @@ test_run_events_fold_survives_nul_bytes() {
   mkdir -p "$dir"
   # NUL bytes are never valid in JSONL, and the readers meet them
   # differently (awk record splitting is blind to NUL while node reads it
-  # intact), so the shared wrapper strips NULs before either engine folds.
-  # The direct engine entry points assume NUL-free input; this case folds
+  # intact), so the shared wrapper maps NULs to SOH before either engine
+  # folds. SOH is a literal control byte the strict parsers reject, so a
+  # NUL-bearing record contributes nothing instead of being repaired. The
+  # direct engine entry points assume NUL-free input; this case folds
   # through the wrapper like production does.
   log=$(mkengine_log "$dir" trailing <<'EOF'
 {"payload":{"kind":"run","run_id":"n","event":{"kind":"started"}}}
@@ -2236,8 +2238,56 @@ EOF
   printf '{"payload":{"kind":"run","run_id":"m","event":{"kind":"started"}}}\000\n' >> "$log"
   out=$(run_state "$log")
   [ "$out" = busy ] || fail "a trailing NUL settled or hid open runs: folded '$out'"
-  assert_engine_events "$log" "$(printf 'n\tstarted\t\nm\tstarted\t')" "a trailing NUL"
-  pass "a NUL byte never changes the folded events"
+  assert_engine_events "$log" "$(printf 'n\tstarted\t')" "a trailing NUL is rejected"
+  pass "a NUL-bearing record contributes nothing"
+}
+
+test_run_events_nul_never_repairs_a_terminal() {
+  local dir log out
+  dir="$TMP_ROOT/nul-terminal"
+  mkdir -p "$dir"
+  # Stripping a NUL would turn a corrupt terminal for run r into a valid
+  # terminal for the open run r, flipping busy to settled. Rejecting the
+  # NUL-bearing record keeps the turn open on both engines.
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"r","event":{"kind":"started"}}}
+EOF
+)
+  printf '{"payload":{"kind":"run","run_id":"r\000","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  assert_engine_events "$log" "$(printf 'r\tstarted\t')" "a NUL-bearing terminal"
+  out=$(run_state "$log")
+  [ "$out" = busy ] || fail "a corrupt NUL terminal settled the run: folded '$out'"
+  pass "a NUL-bearing terminal never settles its run"
+}
+
+test_run_events_without_node_reports_success() {
+  local dir log out st shim tool target
+  dir="$TMP_ROOT/no-node-status"
+  mkdir -p "$dir"
+  log=$(mkengine_log "$dir" root <<'EOF'
+{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started"}}}
+{"payload":{"kind":"run","run_id":"run-1","event":{"kind":"terminal","terminal":"completed"}}}
+EOF
+)
+  # The awk fallback used to leak the cleanup test as its exit status: with
+  # no temp copy the trailing '[ -n "$tmp" ]' failed and overrode awk's
+  # success, so callers with pipefail saw failure on a good fold.
+  shim="$dir/shim"
+  mkdir -p "$shim"
+  for tool in awk tr cmp mktemp rm; do
+    target=$(command -v "$tool") || continue
+    ln -sf "$target" "$shim/$tool"
+  done
+  out=$(PATH="$shim" run_events "$log"); st=$?
+  [ "$st" = 0 ] || fail "the awk fallback without node exited $st"
+  [ "$out" = "$(printf 'run-1\tstarted\t\nrun-1\tterminal\tcompleted')" ] \
+    || fail "the awk fallback without node folded '$out'"
+  set -o pipefail
+  PATH="$shim" run_events "$log" | LC_ALL=C grep -q run-1
+  st=$?
+  set +o pipefail
+  [ "$st" = 0 ] || fail "the awk fallback pipeline without node exited $st"
+  pass "the awk fallback without node reports success"
 }
 
 test_run_events_preserves_bytes_end_to_end() {
@@ -2712,6 +2762,8 @@ test_run_events_fold_rejects_malformed_tracked_string
 test_run_events_keeps_escaped_spellings_distinct
 test_run_events_accepts_escaped_backslash_identity
 test_run_events_fold_survives_nul_bytes
+test_run_events_nul_never_repairs_a_terminal
+test_run_events_without_node_reports_success
 test_run_events_preserves_bytes_end_to_end
 test_run_events_node_tier_folds_bulk_cr_records
 test_run_events_survives_broken_node
