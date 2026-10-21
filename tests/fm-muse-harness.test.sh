@@ -2083,16 +2083,20 @@ EOF
   path="$dir/crlf/session.jsonl"
   mkdir -p "$dir/crlf"
   muse_log_metadata "$dir/ws" > "$path"
-  printf '{"payload":{"kind":"run","run_id":"crlf","event":{"kind":"started"}}}\r\n' >> "$path"
-  printf '{"payload":{"kind":"run","run_id":"crlf","event":{"kind":"terminal","terminal":"cancelled"}}}\r\n' >> "$path"
+  {
+    printf '{"payload":{"kind":"run","run_id":"crlf","event":{"kind":"started"}}}\r\n'
+    printf '{"payload":{"kind":"run","run_id":"crlf","event":{"kind":"terminal","terminal":"cancelled"}}}\r\n'
+  } >> "$path"
   log=$path
   assert_engines_agree "$log" "CRLF records fold like LF ones"
   assert_engine_events "$log" "$(printf 'crlf\tstarted\t\ncrlf\tterminal\tcancelled')" "CRLF records"
 
   printf '{"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}' > "$dir/barecr.jsonl"
-  printf '\r' >> "$dir/barecr.jsonl"
-  printf '{"payload":{"kind":"run","run_id":"open","event":{"kind":"terminal","terminal":"completed"}}}' >> "$dir/barecr.jsonl"
-  printf '\n' >> "$dir/barecr.jsonl"
+  {
+    printf '\r'
+    printf '{"payload":{"kind":"run","run_id":"open","event":{"kind":"terminal","terminal":"completed"}}}'
+    printf '\n'
+  } >> "$dir/barecr.jsonl"
   assert_engines_agree "$dir/barecr.jsonl" "a bare CR never separates records"
 
   printf '{"payload":{"kind":"run","run_id":"tail","event":{"kind":"started"}}}' > "$dir/unterminated.jsonl"
@@ -2249,16 +2253,20 @@ test_run_events_preserves_bytes_end_to_end() {
 {"payload":{"kind":"run","run_id":"open","event":{"kind":"started"}}}
 EOF
 )
-  printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n' >> "$log"
-  printf '{"payload":{"kind":"run","run_id":"A\376B","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  {
+    printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n'
+    printf '{"payload":{"kind":"run","run_id":"A\376B","event":{"kind":"terminal","terminal":"completed"}}}\n'
+  } >> "$log"
   assert_engines_agree "$log" "distinct invalid bytes stay distinct"
   out=$(run_state "$log")
   [ "$out" = busy ] || fail "distinct invalid bytes settled a run: folded '$out'"
   log=$(mkengine_log "$dir" paired <<'EOF'
 EOF
 )
-  printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n' >> "$log"
-  printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  {
+    printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"started"}}}\n'
+    printf '{"payload":{"kind":"run","run_id":"A\377B","event":{"kind":"terminal","terminal":"completed"}}}\n'
+  } >> "$log"
   assert_engines_agree "$log" "identical invalid bytes pair"
   out=$(run_state "$log")
   [ "$out" = settled ] || fail "identical invalid bytes failed to settle: folded '$out'"
@@ -2267,12 +2275,35 @@ EOF
 {"payload":{"kind":"run","run_id":"caf\u00e9","event":{"kind":"terminal","terminal":"completed"}}}
 EOF
 )
-  printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"started"}}}\n' >> "$log"
-  printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"terminal","terminal":"completed"}}}\n' >> "$log"
+  {
+    printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"started"}}}\n'
+    printf '{"payload":{"kind":"run","run_id":"caf\303\251","event":{"kind":"terminal","terminal":"completed"}}}\n'
+  } >> "$log"
   assert_engines_agree "$log" "valid multibyte sequences pass through"
   out=$(run_state "$log")
   [ "$out" = settled ] || fail "valid multibyte sequences failed to settle: folded '$out'"
   pass "bytes survive the fold intact on both engines"
+}
+
+test_run_events_node_tier_folds_bulk_cr_records() {
+  local dir log out count i
+  dir="$TMP_ROOT/bulk-cr"
+  mkdir -p "$dir"
+  # Node's optimizing compiler intermittently dropped records when the fold
+  # script arrived on stdin: a 5001-line CR-prefixed log folded to ~1700
+  # events instead of 5001, varying run to run. The fold runs with --no-opt,
+  # so five thousand and one distinct CR-prefixed started records must fold
+  # to exactly that many events on every fold, with both engines agreeing.
+  log="$dir/session.jsonl"
+  muse_log_metadata "$dir/ws" > "$log"
+  awk 'BEGIN { for (i = 1; i <= 5001; i++) printf "\r{\"payload\":{\"kind\":\"run\",\"run_id\":\"bulk%d\",\"event\":{\"kind\":\"started\"}}}\n", i }' >> "$log"
+  assert_engines_agree "$log" "bulk CR-prefixed records"
+  for i in 1 2 3 4 5; do
+    out=$(run_events "$log")
+    count=$(printf '%s\n' "$out" | LC_ALL=C grep -c .)
+    [ "$count" = 5001 ] || fail "bulk fold $i kept $count of 5001 events"
+  done
+  pass "the node tier folds bulk CR-prefixed records on every fold"
 }
 
 test_run_events_survives_broken_node() {
@@ -2682,6 +2713,7 @@ test_run_events_keeps_escaped_spellings_distinct
 test_run_events_accepts_escaped_backslash_identity
 test_run_events_fold_survives_nul_bytes
 test_run_events_preserves_bytes_end_to_end
+test_run_events_node_tier_folds_bulk_cr_records
 test_run_events_survives_broken_node
 test_1_3_session_classifies_busy_then_idle
 test_workspace_binding_treats_glob_characters_literally

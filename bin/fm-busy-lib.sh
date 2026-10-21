@@ -663,7 +663,12 @@ fm_busy_muse_run_events() {  # <session-log>
 fm_busy_muse_run_events_node() {  # <session-log>
   [ -f "$1" ] || return 1
   command -v node >/dev/null 2>&1 || return 1
-  node - "$1" <<'NODE'
+  # --no-opt: node 26's optimizing compiler intermittently drops records when
+  # this script arrives on stdin (a 5001-line CR-prefixed log folds to ~1700
+  # events instead of 5001, varying run to run; --jitless and --no-opt both
+  # stabilize it). The unoptimized fold is still orders of magnitude faster
+  # than the awk walk, so pin the semantics-correct tier explicitly.
+  node --no-opt - "$1" <<'NODE'
 const fs = require("fs");
 let text;
 try {
@@ -896,7 +901,9 @@ for (const rawLine of text.split("\n")) {
 }
 // latin1 out: the fold reads bytes (see the read above) and must write bytes,
 // so code points 0x80-0xFF leave as single bytes exactly like the walk.
-if (out.length > 0) process.stdout.write(`${out.join("\n")}\n`, "latin1");
+// Sync write: the fold's whole stream must reach the caller even for large
+// logs, so block on fd 1 instead of leaving the flush to the event loop.
+if (out.length > 0) fs.writeFileSync(1, `${out.join("\n")}\n`, "latin1");
 NODE
 }
 
