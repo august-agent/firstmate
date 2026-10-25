@@ -1646,12 +1646,12 @@ test_recycled_bridge_claim_stays_open_on_anchor_match() {
   local dir rc
   dir=$(make_primary_dir "$TMP_ROOT/anchor-recycled-bridge-claim")
   : > "$dir/state/.last-watcher-beat"
-  # $1 selects the ledger's session_pid anchor: match (the live lock holder),
-  # mismatch (another live pid), legacy (a pre-binding entry with neither
-  # field), or legacy-absent (pre-binding entry with no lock at all). $2 selects
-  # entry line 4: current (the lock holder's own pid-identity) or reused
-  # (another live process's, modelling pid reuse). The lock pid is a live
-  # sibling of the claim owner, so the descent signal always fails.
+  # $2 selects the ledger's session_pid anchor: match (the live lock holder),
+  # mismatch (another live pid), or legacy (a pre-binding entry with neither
+  # field). $3 selects entry line 4: current (the lock holder's own
+  # pid-identity) or reused (another live process's, modelling pid reuse).
+  # The lock pid is a live sibling of the claim owner, so the descent signal
+  # always fails. Lockless shapes belong to the entry-binding test below.
   probe() {
     FM_STATE_OVERRIDE="$dir/state" bash -c '
         . "$1/bin/fm-wake-lib.sh"
@@ -1674,7 +1674,7 @@ test_recycled_bridge_claim_stays_open_on_anchor_match() {
           mismatch) anchor=$predecessor ;;
         esac
         case "$2" in
-          legacy|legacy-absent)
+          legacy)
             printf "epoch=470 owner_pid=%s outcome=arming updated_at=1\n%s\n" \
               "$owner" "$identity" > "$1/state/.claude-autoarm-epoch"
             ;;
@@ -1683,11 +1683,7 @@ test_recycled_bridge_claim_stays_open_on_anchor_match() {
               "$owner" "$anchor" "$identity" "$holder_identity" > "$1/state/.claude-autoarm-epoch"
             ;;
         esac
-        if [ "$2" = legacy-absent ]; then
-          rm -f "$1/state/.lock"
-        else
-          printf "%s\n" "$other" > "$1/state/.lock"
-        fi
+        printf "%s\n" "$other" > "$1/state/.lock"
         fm_pid_descends_from "$owner" "$other" && exit 96
         fm_autoarm_claim_open "$1/state"; rc=$?
         kill "$owner" "$other" "$predecessor" 2>/dev/null
@@ -1705,28 +1701,40 @@ test_recycled_bridge_claim_stays_open_on_anchor_match() {
   expect_code 1 "$rc" "a claim whose anchor names another holder must not be open"
   probe legacy current; rc=$?
   expect_code 0 "$rc" "a pre-binding entry under a live holder stays grandfathered open"
-  probe legacy-absent current; rc=$?
-  expect_code 1 "$rc" "a pre-binding entry with no lock holder at all must not be open"
   pass "auto-arm: a recycled-bridge claim stays open on its anchor pid and holder identity, and nothing else does"
 }
 
-# A claim with no numeric session-lock pid is never open: nothing can receive
-# its rewake (the hook itself goes silent on a missing or malformed lock), so
-# deferring to it would leave the home deaf. Same live, identity-matched,
-# fresh-beacon owner with an anchored entry, three lock states, one predicate.
-test_claim_without_numeric_session_lock_is_not_open() {
+# Without a session lock pid, the verdict follows the entry's binding. A
+# pre-binding entry with a live, identity-matched owner keeps the previous
+# verdict - open - which is the guard's startup race: a concurrently starting
+# arm publishes its claim while no session lock is held yet, and the waiting
+# guard must observe it instead of forcing a continuation. An anchored entry
+# whose session is gone (its anchor names no holder answering from the lock)
+# is not open, so a dead session's orphan cannot hold the home deaf after its
+# lock is released. A malformed lock is never open under either shape: nothing
+# can receive that session's rewake (the hook itself goes silent on a missing
+# or malformed lock).
+test_session_lock_absence_follows_the_entry_binding() {
   local dir rc
   dir=$(make_primary_dir "$TMP_ROOT/anchor-lockless-claim")
   : > "$dir/state/.last-watcher-beat"
+  # $1 is the lock state: self (the probe shell's own pid), absent (no lock
+  # file at all), or malformed. $2 is the entry shape: legacy (a pre-binding
+  # two-line entry) or anchored (a session_pid anchor plus holder identity).
   probe() {
     FM_STATE_OVERRIDE="$dir/state" bash -c '
         . "$1/bin/fm-wake-lib.sh"
         sleep 60 &
         owner=$!
         identity=$(fm_pid_identity "$owner") || exit 97
-        anchor_identity=$(fm_pid_identity "$$") || exit 97
-        printf "epoch=464 owner_pid=%s outcome=arming updated_at=1 session_pid=%s\n%s\n\n%s\n" \
-          "$owner" "$$" "$identity" "$anchor_identity" > "$1/state/.claude-autoarm-epoch"
+        if [ "$3" = anchored ]; then
+          anchor_identity=$(fm_pid_identity "$$") || exit 97
+          printf "epoch=464 owner_pid=%s outcome=arming updated_at=1 session_pid=%s\n%s\n\n%s\n" \
+            "$owner" "$$" "$identity" "$anchor_identity" > "$1/state/.claude-autoarm-epoch"
+        else
+          printf "epoch=464 owner_pid=%s outcome=arming updated_at=1\n%s\n" "$owner" "$identity" \
+            > "$1/state/.claude-autoarm-epoch"
+        fi
         case "$2" in
           self) printf "%s\n" "$$" > "$1/state/.lock" ;;
           absent) rm -f "$1/state/.lock" ;;
@@ -1735,16 +1743,24 @@ test_claim_without_numeric_session_lock_is_not_open() {
         fm_autoarm_claim_open "$1/state"; rc=$?
         kill "$owner" 2>/dev/null
         exit "$rc"
-      ' _ "$dir" "$1"
+      ' _ "$dir" "$1" "$2"
   }
-  probe self; rc=$?
-  [ "$rc" -ne 97 ] || fail "could not record an anchored claim for the probe's sleeper"
+  probe self legacy; rc=$?
+  [ "$rc" -ne 97 ] || fail "could not record a claim for the probe's sleeper"
   expect_code 0 "$rc" "a live claim owned by a child of the numeric lock pid must be open"
-  probe absent; rc=$?
-  expect_code 1 "$rc" "a claim with no state/.lock at all must not be open"
-  probe not-a-pid; rc=$?
-  expect_code 1 "$rc" "a claim under a malformed state/.lock must not be open"
-  pass "auto-arm: a claim is open only under a numeric session lock its session answers from"
+  probe absent legacy; rc=$?
+  [ "$rc" -ne 97 ] || fail "could not record a legacy claim for the probe's sleeper"
+  expect_code 0 "$rc" "a pre-binding claim with a live owner stays open while no lock is held yet (guard startup race)"
+  probe not-a-pid legacy; rc=$?
+  expect_code 1 "$rc" "a pre-binding claim under a malformed lock must not be open"
+  probe self anchored; rc=$?
+  [ "$rc" -ne 97 ] || fail "could not record an anchored claim for the probe's sleeper"
+  expect_code 0 "$rc" "an anchored claim owned by a child of its answering holder must be open"
+  probe absent anchored; rc=$?
+  expect_code 1 "$rc" "an anchored claim whose session answers from no lock must not be open"
+  probe not-a-pid anchored; rc=$?
+  expect_code 1 "$rc" "an anchored claim under a malformed lock must not be open"
+  pass "auto-arm: a lockless claim follows its entry binding, and a malformed lock never defers"
 }
 
 # Identity is mandatory at read time: a bare identityless one-line arming
@@ -2552,7 +2568,7 @@ test_stuck_generation_claim_is_superseded_and_rearms
 test_orphaned_claim_from_dead_session_is_superseded_by_replacement
 test_resumed_same_id_session_supersedes_the_orphan
 test_recycled_bridge_claim_stays_open_on_anchor_match
-test_claim_without_numeric_session_lock_is_not_open
+test_session_lock_absence_follows_the_entry_binding
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm
 test_superseded_owner_goes_silent_and_never_double_translates

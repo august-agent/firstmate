@@ -2046,12 +2046,16 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
     # lock holder's session is the ordinary concurrent-hook case; a recorded
     # anchor whose identity still recomputes from the current holder covers a
     # recycled bridge, where the ancestry is severed but the session is alive.
-    # Anything else - no lock, a lock the owner never belonged to, a holder
-    # that changed or can no longer be identified - means the receiving
-    # session is gone, so the claim is not open and the next firing replaces
-    # it instead of deferring to a hook that cannot deliver its wake.
+    # Anything else - a lock the owner never belonged to, a holder that
+    # changed or can no longer be identified - means the receiving session is
+    # gone, so the claim is not open and the next firing replaces it instead
+    # of deferring to a hook that cannot deliver its wake.
     # Anchor-less entries predate the binding and keep the previous verdict:
-    # open while a live lock holder answers, so legacy builds stay covered.
+    # open while no lock is held yet or a live holder answers, so the guard's
+    # startup race (a concurrently starting arm publishes its claim before
+    # any session lock is held) and legacy builds stay covered. Anchored
+    # entries keep the stricter rule: without their recorded holder answering
+    # from the lock, the session is gone.
     lock_pid=$(sed -n '1p' "$state/.lock" 2>/dev/null || true)
     lock_pid=${lock_pid%%$'\n'*}
     if [ -n "$lock_pid" ] && fm_pid_descends_from "$FM_AUTOARM_OWNER" "$lock_pid" 2>/dev/null; then
@@ -2062,7 +2066,7 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
       && [ -n "$current" ] && [ "$current" = "$FM_AUTOARM_SESSION_IDENTITY" ]; then
       :
     elif [ -z "$FM_AUTOARM_SESSION" ] && [ -z "$FM_AUTOARM_SESSION_IDENTITY" ] \
-      && [ -n "$lock_pid" ] && fm_pid_alive "$lock_pid" 2>/dev/null; then
+      && { [ -z "$lock_pid" ] || fm_pid_alive "$lock_pid" 2>/dev/null; }; then
       :
     else
       return 1
