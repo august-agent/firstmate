@@ -7511,6 +7511,11 @@ else
     trap 'exit 130' INT
     trap 'exit 143' TERM
   fi
+  if [ -n "$SPAWN_LAUNCH_PREPARE_MODE" ] &&
+    ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
+    echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
+    exit 1
+  fi
   sleep 0.3
   spawn_orca_launch_send_fail() {
     rm -f -- "$LAUNCH_FILE" 2>/dev/null || true
@@ -7547,7 +7552,11 @@ else
     LAUNCH_SOURCE_TEXT="if [ -e $(shell_quote "$LAUNCH_FILE") ]; then $LAUNCH_SOURCE_TEXT || true; else echo 'error: private launch file was already removed; refusing worker launch' >&2; fi"
   fi
   if ! spawn_send_literal "$T" "$LAUNCH_SOURCE_TEXT"; then
-    [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ] || spawn_orca_launch_send_fail
+    if [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ]; then
+      echo "error: staged launch for task $ID could not be delivered to endpoint $T" >&2
+    else
+      spawn_orca_launch_send_fail
+    fi
     exit 1
   fi
   sleep 0.3
@@ -7556,45 +7565,17 @@ else
     spawn_herdr_presentation_order_lock_release
   fi
   if ! spawn_send_key "$T" Enter; then
-    [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ] || spawn_orca_launch_send_fail
+    if [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ]; then
+      echo "error: staged launch for task $ID could not be submitted to endpoint $T" >&2
+    else
+      spawn_orca_launch_send_fail
+    fi
     exit 1
   fi
   if [ "$ORCA_LAUNCH_ENV_ENABLED" = 1 ]; then
     spawn_orca_wait_launch_consumed
     trap - HUP INT TERM
   fi
-fi
-LAUNCH_FILE="$LAUNCH_DIR/launch.$SPAWN_GEN.sh"
-LAUNCH_STAGE="$LAUNCH_DIR/.launch.$SPAWN_GEN.tmp"
-if [ -e "$LAUNCH_FILE" ] || [ -L "$LAUNCH_FILE" ]; then
-  echo "error: task launch file $LAUNCH_FILE already exists; refusing to replace it" >&2
-  exit 1
-fi
-if ! (umask 077 && printf '%s\n' "$LAUNCH" >"$LAUNCH_STAGE" &&
-  chmod 0600 "$LAUNCH_STAGE" && mv -f "$LAUNCH_STAGE" "$LAUNCH_FILE"); then
-  rm -f "$LAUNCH_STAGE"
-  echo "error: could not stage the launch command at $LAUNCH_FILE" >&2
-  exit 1
-fi
-if [ -n "$SPAWN_LAUNCH_PREPARE_MODE" ] &&
-  ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
-  echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
-  exit 1
-fi
-sleep 0.3
-SPAWN_LAUNCH_SENT=1
-if ! spawn_send_literal "$T" ". $(shell_quote "$LAUNCH_FILE")"; then
-  echo "error: staged launch for task $ID could not be delivered to endpoint $T" >&2
-  exit 1
-fi
-sleep 0.3
-if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
-  HERDR_PROJECTION_ABORT_CLEANUP=0
-  spawn_herdr_presentation_order_lock_release
-fi
-if ! spawn_send_key "$T" Enter; then
-  echo "error: staged launch for task $ID could not be submitted to endpoint $T" >&2
-  exit 1
 fi
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
