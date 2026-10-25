@@ -844,6 +844,10 @@ test_plain_codex_launch_is_unchanged_by_pool_support() {
   status=$?
   expect_code 0 "$status" "plain codex reference spawn should succeed"$'\n'"$out"
   launch_a=$(cat "$LAUNCH_LOG")
+  # The staged launch path carries per-spawn uniqueness (the home-identity
+  # token and the git-config nonce), which pool configuration must not affect:
+  # normalize both before the byte comparison so only pool-driven drift fails.
+  launch_a=$(printf '%s\n' "$launch_a" | sed -E -e 's/\+[0-9a-f]{64}/+HOME-TOKEN/g' -e 's/git-config\.s[0-9]+\.[0-9]+\.[0-9]+\.sh/git-config.sNONCE.sh/g')
 
   id_b=profile-codex-plain-b-z4r
   rec=$(make_spawn_case profile-codex-plain-b codex "$id_b")
@@ -858,6 +862,10 @@ test_plain_codex_launch_is_unchanged_by_pool_support() {
   launch_b=${launch_b//$CASE_DIR/$dir_a}
   launch_b=${launch_b//$FAKEBIN_DIR/$fakebin_a}
   launch_b=${launch_b//$id_b/$id_a}
+  # The staged launch path carries per-spawn uniqueness (the home-identity
+  # token and the git-config nonce), which pool configuration must not affect:
+  # normalize both before the byte comparison so only pool-driven drift fails.
+  launch_b=$(printf '%s\n' "$launch_b" | sed -E -e 's/\+[0-9a-f]{64}/+HOME-TOKEN/g' -e 's/git-config\.s[0-9]+\.[0-9]+\.[0-9]+\.sh/git-config.sNONCE.sh/g')
   [ "$launch_a" = "$launch_b" ] \
     || fail "pool configuration changed a plain codex launch"$'\n'"without: $launch_a"$'\n'"with:    $launch_b"
   [ ! -e "$CASE_DIR/curl.log" ] || fail "a plain codex spawn queried a pool status endpoint"
