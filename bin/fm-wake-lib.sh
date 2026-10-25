@@ -1961,6 +1961,11 @@ _fm_autoarm_epoch_field() {  # <epoch-file> <field>
 # FM_AUTOARM_IDENTITY (line 2 of the entry, and ONLY
 # line 2 - identity is never substituted from a lock, so a transient
 # micro-mutex hold or a reused pid can never authenticate a stale entry).
+# FM_AUTOARM_SESSION is the lock holder the entry is bound to: the anchor
+# recorded at claim time on arming entries, the committing session on terminal
+# ones. FM_AUTOARM_SESSION_IDENTITY is the anchor's recorded process identity
+# (line 4, arming entries only): it proves the bound holder is still the same
+# process, so a reused pid number cannot impersonate a dead session.
 fm_autoarm_ledger_read() {  # <state-dir>
   local state=$1 epoch
   epoch="$state/.claude-autoarm-epoch"
@@ -1972,6 +1977,7 @@ fm_autoarm_ledger_read() {  # <state-dir>
   FM_AUTOARM_IDENTITY=
   FM_AUTOARM_TRANSPORT=
   FM_AUTOARM_TRANSPORT_IDENTITY=
+  FM_AUTOARM_SESSION_IDENTITY=
   FM_AUTOARM_GEN=$(_fm_autoarm_epoch_field "$epoch" epoch) || return 1
   FM_AUTOARM_OWNER=$(_fm_autoarm_epoch_field "$epoch" owner_pid) || return 1
   FM_AUTOARM_OUTCOME=$(_fm_autoarm_epoch_field "$epoch" outcome) || return 1
@@ -1979,6 +1985,7 @@ fm_autoarm_ledger_read() {  # <state-dir>
   FM_AUTOARM_RECOVERY=$(_fm_autoarm_epoch_field "$epoch" recovery_generation 2>/dev/null || true)
   FM_AUTOARM_TRANSPORT=$(_fm_autoarm_epoch_field "$epoch" transport_pid 2>/dev/null || true)
   FM_AUTOARM_TRANSPORT_IDENTITY=$(sed -n '3p' "$epoch" 2>/dev/null || true)
+  FM_AUTOARM_SESSION_IDENTITY=$(sed -n '4p' "$epoch" 2>/dev/null || true)
   case "$FM_AUTOARM_GEN" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -2001,15 +2008,22 @@ fm_pid_descends_from() {  # <pid> <ancestor>
 
 # True while the CURRENT ledger claim is open and healthy - the defer predicate
 # both Stop participants use. Open means: outcome "arming", a live owner whose
-# mandatory recorded identity recomputes and matches its pid, and not stuck
-# (the contract comment above owns the stuck proof). fm_path_age reports an
-# absent beacon as ancient, which is exactly right: arming for a full grace
-# window without producing a first beat is the same hang. An identityless
-# entry is never open: real generation claims always record identity, a legacy
-# build's entry gets its deference from its held role-carrying lock through
-# the legacy shim, and anything else must not defer.
+# mandatory recorded identity recomputes and matches its pid, a live supervising
+# transport whose recorded identity still recomputes (transport-fenced claims,
+# the fork's supervised-arm design), or - for claims with no transport - a
+# receiving session that still answers: the owner still descends from the
+# session-lock holder, the recorded anchor pid still names that holder and its
+# recorded identity still recomputes from it (a recycled bridge), or the entry
+# predates anchors and a live holder answers. A dead, replaced, or
+# unidentifiable receiving session is not open, so the next firing replaces the
+# orphan instead of deferring to a hook that cannot deliver its wake. Stuck
+# proof: fm_path_age reports an absent beacon as ancient, which is exactly
+# right: arming for a full grace window without producing a first beat is the
+# same hang. An identityless entry is never open: real generation claims always
+# record identity, a legacy build's entry gets its deference from its held
+# role-carrying lock through the legacy shim, and anything else must not defer.
 fm_autoarm_claim_open() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} epoch current
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} epoch current lock_pid
   epoch="$state/.claude-autoarm-epoch"
   case "$grace" in
     ''|*[!0-9]*|0) grace=300 ;;
@@ -2026,6 +2040,33 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
     [ -n "$FM_AUTOARM_TRANSPORT_IDENTITY" ] || return 1
     current=$(fm_pid_identity "$FM_AUTOARM_TRANSPORT" 2>/dev/null) || return 1
     [ "$current" = "$FM_AUTOARM_TRANSPORT_IDENTITY" ] || return 1
+  else
+    # A claim with no supervising transport is bound to the session that held
+    # the lock when it claimed it. The owner still running inside the current
+    # lock holder's session is the ordinary concurrent-hook case; a recorded
+    # anchor whose identity still recomputes from the current holder covers a
+    # recycled bridge, where the ancestry is severed but the session is alive.
+    # Anything else - no lock, a lock the owner never belonged to, a holder
+    # that changed or can no longer be identified - means the receiving
+    # session is gone, so the claim is not open and the next firing replaces
+    # it instead of deferring to a hook that cannot deliver its wake.
+    # Anchor-less entries predate the binding and keep the previous verdict:
+    # open while a live lock holder answers, so legacy builds stay covered.
+    lock_pid=$(sed -n '1p' "$state/.lock" 2>/dev/null || true)
+    lock_pid=${lock_pid%%$'\n'*}
+    if [ -n "$lock_pid" ] && fm_pid_descends_from "$FM_AUTOARM_OWNER" "$lock_pid" 2>/dev/null; then
+      :
+    elif [ -n "$FM_AUTOARM_SESSION" ] && [ "$FM_AUTOARM_SESSION" = "$lock_pid" ] \
+      && [ -n "$FM_AUTOARM_SESSION_IDENTITY" ] \
+      && current=$(fm_pid_identity "$lock_pid" 2>/dev/null) \
+      && [ -n "$current" ] && [ "$current" = "$FM_AUTOARM_SESSION_IDENTITY" ]; then
+      :
+    elif [ -z "$FM_AUTOARM_SESSION" ] && [ -z "$FM_AUTOARM_SESSION_IDENTITY" ] \
+      && [ -n "$lock_pid" ] && fm_pid_alive "$lock_pid" 2>/dev/null; then
+      :
+    else
+      return 1
+    fi
   fi
   if [ "$(fm_path_age "$epoch")" -ge "$grace" ] \
     && [ "$(fm_path_age "$state/.last-watcher-beat")" -ge "$grace" ]; then
@@ -2075,7 +2116,7 @@ fm_autoarm_midturn_healthy() {  # <state-dir> [grace]
 # computed, or the write failed. An optional expected generation restricts
 # recovery to that still-arming, abandoned generation under the same mutex.
 fm_autoarm_claim_next() {  # <state-dir> [grace] [expected-abandoned-generation]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} expected=${3:-} lock epoch pid gen identity tmp transport='' transport_identity=''
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} expected=${3:-} lock epoch pid gen identity tmp transport='' transport_identity='' anchor_pid anchor_identity
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
@@ -2110,9 +2151,26 @@ fm_autoarm_claim_next() {  # <state-dir> [grace] [expected-abandoned-generation]
     ''|*[!0-9]*) gen=0 ;;
   esac
   gen=$((gen + 1))
+  # Bind the claim to the session holding the lock right now: the anchor pid
+  # (session_pid) plus its process identity (line 4). A later firing without a
+  # supervising transport stays deferred only while this anchor still answers,
+  # so a dead session's orphaned claim cannot hold the home deaf. Recording is
+  # mandatory: without an anchor the entry could never prove its session is
+  # gone, so a lock that cannot be read or identified refuses the claim and
+  # the next firing retries.
+  anchor_pid=$(sed -n '1p' "$state/.lock" 2>/dev/null || true)
+  anchor_pid=${anchor_pid%%$'\n'*}
+  anchor_identity=$(fm_pid_identity "$anchor_pid" 2>/dev/null) || anchor_identity=
+  if [ -z "$anchor_pid" ] || [ -z "$anchor_identity" ]; then
+    fm_lock_release "$lock"
+    return 1
+  fi
   tmp="$epoch.tmp.$pid"
-  if ! printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s%s\n%s\n%s\n' \
-      "$gen" "$pid" "$(date +%s)" "$transport" "$identity" "$transport_identity" > "$tmp" 2>/dev/null \
+  # session_pid precedes the optional transport_pid so a fenced entry still
+  # ends with transport_pid, which the hook transport's retry-fence match
+  # (bin/fm-claude-stop-autoarm.sh) anchors at end of line.
+  if ! printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s session_pid=%s%s\n%s\n%s\n%s\n' \
+      "$gen" "$pid" "$(date +%s)" "$anchor_pid" "$transport" "$identity" "$transport_identity" "$anchor_identity" > "$tmp" 2>/dev/null \
     || ! mv -f "$tmp" "$epoch" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     fm_lock_release "$lock"
