@@ -2014,7 +2014,7 @@ fm_pid_descends_from() {  # <pid> <ancestor>
 # receiving session that still answers: the owner still descends from the
 # session-lock holder, the recorded anchor pid still names that holder and its
 # recorded identity still recomputes from it (a recycled bridge), or the entry
-# predates anchors and a live holder answers. A dead, replaced, or
+# predates anchors and no session lock is held yet. A dead, replaced, or
 # unidentifiable receiving session is not open, so the next firing replaces the
 # orphan instead of deferring to a hook that cannot deliver its wake. Stuck
 # proof: fm_path_age reports an absent beacon as ancient, which is exactly
@@ -2050,12 +2050,16 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
     # changed or can no longer be identified - means the receiving session is
     # gone, so the claim is not open and the next firing replaces it instead
     # of deferring to a hook that cannot deliver its wake.
-    # Anchor-less entries predate the binding and keep the previous verdict:
-    # open while no lock is held yet or a live holder answers, so the guard's
-    # startup race (a concurrently starting arm publishes its claim before
-    # any session lock is held) and legacy builds stay covered. Anchored
-    # entries keep the stricter rule: without their recorded holder answering
-    # from the lock, the session is gone.
+    # Anchor-less entries predate the binding: they stay open only while no
+    # session lock is held yet, which is the guard's startup race (a
+    # concurrently starting arm publishes its claim before any session lock
+    # is held). Once a holder exists, an anchor-less claim needs the same
+    # session-reachability evidence as everything else - the owner descending
+    # from the holder - because a live holder answering for a session the
+    # owner never belonged to is a replacement session, and deferring to the
+    # orphan would leave the home deaf. Anchored entries keep the stricter
+    # rule: without their recorded holder answering from the lock, the
+    # session is gone.
     lock_pid=$(sed -n '1p' "$state/.lock" 2>/dev/null || true)
     lock_pid=${lock_pid%%$'\n'*}
     if [ -n "$lock_pid" ] && fm_pid_descends_from "$FM_AUTOARM_OWNER" "$lock_pid" 2>/dev/null; then
@@ -2066,7 +2070,7 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
       && [ -n "$current" ] && [ "$current" = "$FM_AUTOARM_SESSION_IDENTITY" ]; then
       :
     elif [ -z "$FM_AUTOARM_SESSION" ] && [ -z "$FM_AUTOARM_SESSION_IDENTITY" ] \
-      && { [ -z "$lock_pid" ] || fm_pid_alive "$lock_pid" 2>/dev/null; }; then
+      && [ -z "$lock_pid" ]; then
       :
     else
       return 1

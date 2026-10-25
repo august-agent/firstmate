@@ -1640,15 +1640,18 @@ test_resumed_same_id_session_supersedes_the_orphan() {
 # recovery as absent. The anchor is pinned to the holder's identity: a claim
 # whose anchor names another pid, one whose recorded holder identity no longer
 # recomputes from the lock's holder pid (a resumed session may even reuse the
-# dead holder's pid number, but never its identity), and a pre-binding entry
-# that records neither field but has no live holder all stay closed.
+# dead holder's pid number, but never its identity), and an anchor-less
+# pre-binding entry - whether or not a live holder answers - all stay closed:
+# with no anchor the entry carries no session-reachability evidence of its
+# own, so a live holder the owner never belonged to is a replacement.
 test_recycled_bridge_claim_stays_open_on_anchor_match() {
   local dir rc
   dir=$(make_primary_dir "$TMP_ROOT/anchor-recycled-bridge-claim")
   : > "$dir/state/.last-watcher-beat"
   # $2 selects the ledger's session_pid anchor: match (the live lock holder),
   # mismatch (another live pid), or legacy (a pre-binding entry with neither
-  # field). $3 selects entry line 4: current (the lock holder's own
+  # field, which stays closed under a live holder for lack of reachability
+  # evidence). $3 selects entry line 4: current (the lock holder's own
   # pid-identity) or reused (another live process's, modelling pid reuse).
   # The lock pid is a live sibling of the claim owner, so the descent signal
   # always fails. Lockless shapes belong to the entry-binding test below.
@@ -1700,8 +1703,66 @@ test_recycled_bridge_claim_stays_open_on_anchor_match() {
   probe mismatch current; rc=$?
   expect_code 1 "$rc" "a claim whose anchor names another holder must not be open"
   probe legacy current; rc=$?
-  expect_code 0 "$rc" "a pre-binding entry under a live holder stays grandfathered open"
+  expect_code 1 "$rc" "an anchor-less entry under a live holder that is not its session must not be open"
   pass "auto-arm: a recycled-bridge claim stays open on its anchor pid and holder identity, and nothing else does"
+}
+
+# A claim with no supervising transport and no session anchor (the legacy
+# shape: a two-line entry) carries no session-reachability evidence of its
+# own, so once a session-lock holder exists the verdict follows ancestry
+# alone. A legacy orphan whose owner no longer descends from the lock holder
+# is not open - whether the holder is a replacement session after the dying
+# session exited, or a resumed session that reclaimed the lock under the same
+# session id (at the predicate level both are a live holder with no ancestry;
+# the reclaim flow itself is proved by the replacement e2e tests above) - so
+# the next firing supersedes it instead of deferring to a hook that cannot
+# deliver its wake. Only the lockless startup shape stays open: no lock held
+# yet means the holder is still starting, and the guard must observe the
+# concurrently starting arm instead of forcing a continuation.
+test_transportless_legacy_claim_needs_holder_ancestry() {
+  local dir rc
+  dir=$(make_primary_dir "$TMP_ROOT/transportless-legacy-claim")
+  : > "$dir/state/.last-watcher-beat"
+  # $1 is the lock state: replacement (a live pid that never contained the
+  # owner - the dead session exited and a new session took the lock),
+  # reclaimed (a live pid holding a reclaimed lock - the resumed session
+  # under the same id), or absent (no lock file at all - the holder is still
+  # starting). The entry is always the legacy shape: a two-line arming record
+  # with a live identity-matched owner, no transport_pid, no session_pid.
+  probe() {
+    FM_STATE_OVERRIDE="$dir/state" bash -c '
+        . "$1/bin/fm-wake-lib.sh"
+        sleep 60 &
+        owner=$!
+        sleep 60 &
+        holder=$!
+        identity=$(fm_pid_identity "$owner") || exit 97
+        printf "epoch=470 owner_pid=%s outcome=arming updated_at=1\n%s\n" \
+          "$owner" "$identity" > "$1/state/.claude-autoarm-epoch"
+        case "$2" in
+          replacement|reclaimed) printf "%s\n" "$holder" > "$1/state/.lock" ;;
+          absent) rm -f "$1/state/.lock" ;;
+        esac
+        if [ "$2" != absent ]; then
+          fm_pid_descends_from "$owner" "$holder" && exit 96
+        fi
+        fm_autoarm_claim_open "$1/state"; rc=$?
+        kill "$owner" "$holder" 2>/dev/null
+        exit "$rc"
+      ' _ "$dir" "$1"
+  }
+  probe replacement; rc=$?
+  [ "$rc" -ne 97 ] || fail "could not record a legacy claim for the probe's sleeper"
+  [ "$rc" -ne 96 ] || fail "the probe holder was an ancestor of the claim owner, so the dead-session case kept ancestry"
+  expect_code 1 "$rc" "a legacy orphan must not stay open after a replacement session takes the lock"
+  probe reclaimed; rc=$?
+  [ "$rc" -ne 97 ] || fail "could not record a legacy claim for the probe's sleeper"
+  [ "$rc" -ne 96 ] || fail "the probe holder was an ancestor of the claim owner, so the resumed-session case kept ancestry"
+  expect_code 1 "$rc" "a legacy orphan must not stay open after a resumed session reclaims the lock under the same id"
+  probe absent; rc=$?
+  [ "$rc" -ne 97 ] || fail "could not record a legacy claim for the probe's sleeper"
+  expect_code 0 "$rc" "a pre-binding legacy claim stays open while no lock is held yet (holder still starting)"
+  pass "auto-arm: a transport-less legacy claim needs holder ancestry once a holder exists, and stays open only before the lock"
 }
 
 # Without a session lock pid, the verdict follows the entry's binding. A
@@ -2568,6 +2629,7 @@ test_stuck_generation_claim_is_superseded_and_rearms
 test_orphaned_claim_from_dead_session_is_superseded_by_replacement
 test_resumed_same_id_session_supersedes_the_orphan
 test_recycled_bridge_claim_stays_open_on_anchor_match
+test_transportless_legacy_claim_needs_holder_ancestry
 test_session_lock_absence_follows_the_entry_binding
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm
