@@ -104,6 +104,25 @@ fm_pid_alive() {
 fm_pid_identity() {
   local pid=$1 out proc_root stat_line starttime cmdline_hex identity_key
   local -a stat_fields
+  # A tagged Windows holder lives outside this process table: /proc and ps -o
+  # know nothing about it, and the numeric guard below would refuse it before
+  # either path is tried. The Windows bridge in the session-lock library is the
+  # one owner of that namespace, so delegate there; only a win:-shaped value
+  # loads the library, and anything else keeps the local verdict below.
+  case "$pid" in
+    win:*)
+      if ! command -v fm_win_pid_identity >/dev/null 2>&1; then
+        # An analysis boundary, as in fm_extension_owns_supervision below: the
+        # session-lock library is linted in its own right, and following it
+        # here would re-analyze it for every consumer of this widely sourced
+        # library.
+        # shellcheck source=/dev/null
+        . "$FM_WAKE_LIB_DIR/fm-session-lock-lib.sh"
+      fi
+      fm_win_pid_identity "$pid"
+      return
+      ;;
+  esac
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac

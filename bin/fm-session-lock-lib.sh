@@ -220,6 +220,29 @@ fm_win_command() {  # <winpid>
   fm_win_normalize_command "$out"
 }
 
+# Process-start identity for a tagged Windows holder (win:<pid>), read from
+# the Windows process table (`ps -W`).
+# The table's STIME column carries only HH:MM:SS with no date, so this
+# identity is weaker than the POSIX starttime-plus-cmdline identity: a pid
+# reused within the same second for the same executable would compare equal.
+# Combining the start time with the full normalized executable path is the
+# finest distinction the platform offers, and it serves the lock sidecar's
+# purpose, which is to notice that the holder changed rather than to prove
+# absolute process continuity.
+fm_win_pid_identity() {  # <win:pid>
+  local winpid=$1 table stime comm
+  winpid=$(fm_win_untag_pid "$winpid") || return 1
+  table=$(ps -W 2>/dev/null) || return 1
+  case "$table" in
+    *WINPID*) ;;
+    *) return 1 ;;
+  esac
+  stime=$(printf '%s\n' "$table" | awk -v w="$winpid" '$4 == w { print $7; exit }')
+  [ -n "$stime" ] || return 1
+  comm=$(fm_win_command "$winpid") || return 1
+  printf 'win-stime=%s command=%s\n' "$stime" "$comm"
+}
+
 # Environment variables through which a verified harness publishes the pid of
 # its own session process. Extend only with a variable confirmed to name the
 # session-long harness process on Windows, because the identity check below is
