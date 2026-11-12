@@ -65,9 +65,6 @@ chmod +x "$FAKEBIN/uname" "$FAKEBIN/ps"
 # WINPID 7204 is the Claude session holding the lock.
 WIN_TABLE='  4201508       0       0       7204  ?              0 22:24:48 C:\Users\u\.local\bin\claude.exe
   4198625       0       0       4321  ?              0 22:24:48 C:\Windows\explorer.exe'
-# The same Windows pid reissued to the same executable at a later start time.
-RESTARTED_TABLE='  4201508       0       0       7204  ?              0 23:01:10 C:\Users\u\.local\bin\claude.exe
-  4198625       0       0       4321  ?              0 22:24:48 C:\Windows\explorer.exe'
 # The same Windows pid reissued to an unrelated process.
 REUSED_TABLE='  4201508       0       0       7204  ?              0 23:01:10 C:\Windows\notepad.exe'
 # The session has exited.
@@ -110,7 +107,7 @@ lib_eval() {  # <windows|posix> <home> <expression> [$0 [args...]]
 }
 
 test_supervision_main_key_reads_a_windows_session_lock() {
-  local home key restarted reused
+  local home key
   home=$(make_home main-key win:7204)
   key=$(lib_eval windows "$home" 'fm_supervision_host_main_key "$FM_STATE_OVERRIDE"') \
     || fail "the supervision host found no main-session key for a live win:7204 holder"
@@ -121,10 +118,8 @@ test_supervision_main_key_reads_a_windows_session_lock() {
   if FM_TEST_WIN_TABLE="$GONE_TABLE" lib_eval windows "$home" 'fm_supervision_host_main_key "$FM_STATE_OVERRIDE"' >/dev/null; then
     fail "a win:7204 holder that has exited still produced a main-session key"
   fi
-  # A pid reissued to the same executable at a different STIME or to another
-  # executable is a different holder, so neither may reuse the live session's key.
-  restarted=$(FM_TEST_WIN_TABLE="$RESTARTED_TABLE" lib_eval windows "$home" 'fm_supervision_host_main_key "$FM_STATE_OVERRIDE"') || restarted=
-  [ "$restarted" != "$key" ] || fail "a Windows pid reused by the same executable with a new STIME kept the old main-session key"
+  # A pid reissued to another executable is a different holder, so it must not
+  # reuse the live session's key.
   reused=$(FM_TEST_WIN_TABLE="$REUSED_TABLE" lib_eval windows "$home" 'fm_supervision_host_main_key "$FM_STATE_OVERRIDE"') || reused=
   [ "$reused" != "$key" ] || fail "a reissued Windows pid kept the live session's main-session key"
   if lib_eval posix "$home" 'fm_supervision_host_main_key "$FM_STATE_OVERRIDE"' >/dev/null; then
@@ -141,30 +136,21 @@ test_autoarm_claim_pins_a_windows_lock_holder_and_reads_it_back() {
     fm_autoarm_claim_next "$FM_STATE_OVERRIDE" || { echo claim-failed; exit 0; }
     sed -n "1p;3p" "$FM_STATE_OVERRIDE/.claude-autoarm-epoch"
     if fm_autoarm_claim_open "$FM_STATE_OVERRIDE"; then echo open; else echo closed; fi
-    if FM_TEST_WIN_TABLE=$1 fm_autoarm_claim_open "$FM_STATE_OVERRIDE"; then echo restarted-open; else echo restarted-closed; fi
-    if FM_TEST_WIN_TABLE=$2 fm_autoarm_claim_open "$FM_STATE_OVERRIDE"; then echo reused-open; else echo reused-closed; fi
-    if FM_TEST_WIN_TABLE=$3 fm_autoarm_claim_open "$FM_STATE_OVERRIDE"; then echo gone-open; else echo gone-closed; fi
-    sed "s|^win-stime=22:24:48 command=|win-pid=7204 command=|" "$FM_STATE_OVERRIDE/.claude-autoarm-epoch" \
-      > "$FM_STATE_OVERRIDE/.claude-autoarm-epoch.legacy" \
-      && mv -f "$FM_STATE_OVERRIDE/.claude-autoarm-epoch.legacy" "$FM_STATE_OVERRIDE/.claude-autoarm-epoch"
-    if fm_autoarm_claim_open "$FM_STATE_OVERRIDE"; then echo legacy-open; else echo legacy-closed; fi
-  ' _ "$RESTARTED_TABLE" "$REUSED_TABLE" "$GONE_TABLE")
+    if FM_TEST_WIN_TABLE=$1 fm_autoarm_claim_open "$FM_STATE_OVERRIDE"; then echo reused-open; else echo reused-closed; fi
+    if FM_TEST_WIN_TABLE=$2 fm_autoarm_claim_open "$FM_STATE_OVERRIDE"; then echo gone-open; else echo gone-closed; fi
+  ' _ "$REUSED_TABLE" "$GONE_TABLE")
   [ "$out" != claim-failed ] || fail "the auto-arm claim failed under a win:7204 lock"
   printf '%s\n' "$out" | sed -n 1p | grep -q 'owner_session_id=S1' \
     || fail "the claim did not record the trusted session id S1: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 2p)" = 'win-stime=22:24:48 command=C:/Users/u/.local/bin/claude' ] \
-    || fail "the claim did not pin the win:7204 holder's STIME identity: $out"
+  [ "$(printf '%s\n' "$out" | sed -n 2p)" = 'win-pid=7204 command=C:/Users/u/.local/bin/claude' ] \
+    || fail "the claim did not pin the win:7204 holder's identity: $out"
   [ "$(printf '%s\n' "$out" | sed -n 3p)" = open ] \
     || fail "a claim pinned to the live win:7204 holder did not read back as open: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 4p)" = restarted-closed ] \
-    || fail "a claim stayed open after win:7204 restarted the same executable at a new STIME: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 5p)" = reused-closed ] \
+  [ "$(printf '%s\n' "$out" | sed -n 4p)" = reused-closed ] \
     || fail "a claim stayed open after win:7204 was reissued to another executable: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 6p)" = gone-closed ] \
+  [ "$(printf '%s\n' "$out" | sed -n 5p)" = gone-closed ] \
     || fail "a claim stayed open after the win:7204 holder exited: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 7p)" = legacy-closed ] \
-    || fail "a legacy win-pid identity record without STIME did not fail closed: $out"
-  pass "auto-arm: a claim pins a win:<pid> lock holder with STIME and fails closed on STIME change or legacy records"
+  pass "auto-arm: a claim pins a win:<pid> lock holder and reads open only while that holder lives"
 }
 
 test_autoarm_midturn_health_follows_a_windows_lock_holder() {
@@ -217,50 +203,7 @@ test_untagged_values_reach_the_numeric_helpers_unchanged() {
   pass "untagged lock values: the session-pid helpers answer exactly as fm_pid_identity and fm_pid_alive do"
 }
 
-test_lock_identity_sidecar_tracks_windows_stime_and_rejects_legacy_records() {
-  local home out
-  home=$(make_home lock-sidecar win:7204)
-  out=$(lib_eval windows "$home" '
-    _fm_wake_require_session_lock
-    STATE=$FM_STATE_OVERRIDE
-    eval "$(sed -n "/^owner_process_independent()/,/^}/p; /^owner_lock_present()/,/^}/p" "$FM_ROOT_OVERRIDE/bin/fm-procevent.sh")"
-    "$FM_ROOT_OVERRIDE/bin/fm-lock.sh" >/dev/null || { echo acquire-failed; exit 0; }
-    sed -n "1p;2p;3p" "$FM_STATE_OVERRIDE/.lock-identity"
-    if owner_lock_present "$$"; then
-      echo live-matches
-    else
-      echo live-mismatch
-    fi
-    if FM_TEST_WIN_TABLE=$1 owner_lock_present "$$"; then
-      echo restarted-matches
-    else
-      echo restarted-mismatch
-    fi
-    printf "win:7204\nwin-pid=7204 command=C:/Users/u/.local/bin/claude\nindependent\n" > "$FM_STATE_OVERRIDE/.lock-identity"
-    if owner_lock_present "$$"; then
-      echo legacy-matches
-    else
-      echo legacy-mismatch
-    fi
-  ' _ "$RESTARTED_TABLE")
-  [ "$out" != acquire-failed ] || fail "fm-lock.sh failed to confirm a live win:7204 lock"
-  [ "$(printf '%s\n' "$out" | sed -n 1p)" = 'win:7204' ] \
-    || fail "sidecar line 1 did not record win:7204: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 2p)" = 'win-stime=22:24:48 command=C:/Users/u/.local/bin/claude' ] \
-    || fail "sidecar line 2 did not record the Windows STIME identity: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 3p)" = 'independent' ] \
-    || fail "sidecar line 3 did not record independent provenance: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 4p)" = 'live-matches' ] \
-    || fail "live win:7204 holder did not match its sidecar identity: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 5p)" = 'restarted-mismatch' ] \
-    || fail "a restarted win:7204 holder with a new STIME still matched the old sidecar identity: $out"
-  [ "$(printf '%s\n' "$out" | sed -n 6p)" = 'legacy-mismatch' ] \
-    || fail "a legacy win-pid sidecar record without STIME did not fail closed: $out"
-  pass "fm-lock sidecar: a win:<pid> holder records STIME identity and fails closed on STIME change or legacy records"
-}
-
 test_untagged_values_reach_the_numeric_helpers_unchanged
 test_supervision_main_key_reads_a_windows_session_lock
 test_autoarm_claim_pins_a_windows_lock_holder_and_reads_it_back
 test_autoarm_midturn_health_follows_a_windows_lock_holder
-test_lock_identity_sidecar_tracks_windows_stime_and_rejects_legacy_records

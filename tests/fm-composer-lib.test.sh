@@ -1613,15 +1613,14 @@ test_kiro_palette_gray_ghost_is_stripped_and_chromatic_indexes_survive() {
   [ "$out" = 'placeholder text' ] \
     || fail "SCOPE GUARD: a cube-diagonal grey outside 232-255 (38;5;145) must be untouched, got '$out'"
 
-  # NON-REGRESSION: a grey above the ceiling is real input, and a CHROMATIC
-  # index in the 128..180 widening band or a theme-remapped (0-15) index
-  # carries no fixed grey to widen.
+  # NON-REGRESSION: a grey above the ceiling is real input, and a CHROMATIC or
+  # theme-remapped (0-15) index carries no fixed grey to measure.
   out=$(printf '%s' "${ESC}[38;5;253mdeploy the thing${ESC}[0m" | FM_COMPOSER_HARNESS=kiro fm_composer_strip_ghost)
   [ "$out" = 'deploy the thing' ] \
     || fail "NON-REGRESSION: a bright palette grey (38;5;253, level 218) must survive, got '$out'"
-  out=$(printf '%s' "${ESC}[38;5;75mdeploy the thing${ESC}[0m" | FM_COMPOSER_HARNESS=kiro fm_composer_strip_ghost)
+  out=$(printf '%s' "${ESC}[38;5;33mdeploy the thing${ESC}[0m" | FM_COMPOSER_HARNESS=kiro fm_composer_strip_ghost)
   [ "$out" = 'deploy the thing' ] \
-    || fail "NON-REGRESSION: a chromatic palette index in the kiro widening band (38;5;75) must survive, got '$out'"
+    || fail "NON-REGRESSION: a chromatic palette index (38;5;33) must survive, got '$out'"
   out=$(printf '%s' "${ESC}[38;5;8mdeploy the thing${ESC}[0m" | FM_COMPOSER_HARNESS=kiro fm_composer_strip_ghost)
   [ "$out" = 'deploy the thing' ] \
     || fail "NON-REGRESSION: a theme-remapped index (38;5;8) must survive, got '$out'"
@@ -1651,13 +1650,13 @@ test_composer_widening_is_kiro_only() {
     out=$(printf '%s' "${ESC}[38;2;158;158;158mask a question${ESC}[0m" | FM_COMPOSER_HARNESS=$h fm_composer_strip_ghost)
     [ "$out" = 'ask a question' ] \
       || fail "harness '${h:-none}': a near-gray run above the shared ceiling must survive outside kiro, got '$out'"
-    out=$(printf '%s' "${ESC}[38;5;247mask a question${ESC}[0m" | FM_COMPOSER_HARNESS=$h fm_composer_strip_ghost)
+    out=$(printf '%s' "${ESC}[38;5;240mask a question${ESC}[0m" | FM_COMPOSER_HARNESS=$h fm_composer_strip_ghost)
     [ "$out" = 'ask a question' ] \
-      || fail "harness '${h:-none}': a mid palette grey above the shared ceiling must survive outside kiro, got '$out'"
+      || fail "harness '${h:-none}': a dark palette grey must stay untested outside kiro, got '$out'"
   done
-  out=$(printf '%s' "${ESC}[38;5;247mask a question${ESC}[0m" | FM_COMPOSER_HARNESS=kiro fm_composer_strip_ghost)
+  out=$(printf '%s' "${ESC}[38;5;240mask a question${ESC}[0m" | FM_COMPOSER_HARNESS=kiro fm_composer_strip_ghost)
   [ -z "${out//[[:space:]]/}" ] \
-    || fail "fixture drift: the kiro scope must strip a mid palette grey (38;5;247, level 158), got '$out'"
+    || fail "fixture drift: the kiro scope must strip a dark palette grey, got '$out'"
 
   # The hinted idle row reads empty only on kiro; on every other read it is
   # ordinary bare-composer text, exactly as before kiro existed.

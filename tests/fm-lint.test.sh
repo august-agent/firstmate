@@ -214,6 +214,21 @@ test_canonical_partitions_preserve_full_lint() {
       || fail "partition $part did not stream an end record per root"
   done
   [ "$(LC_ALL=C sort "$tmp/union")" = "$all" ] || fail "lint partitions lose or duplicate canonical roots"
+  mkdir -p "$tmp/balanced/bin/backends" "$tmp/balanced/tests"
+  cp "$LINT" "$tmp/balanced/bin/fm-lint.sh"
+  chmod +x "$tmp/balanced/bin/fm-lint.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%060000d\n", 0 }' > "$tmp/balanced/bin/heavy-a.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%060000d\n", 0 }' > "$tmp/balanced/tests/suite-a.test.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%059000d\n", 0 }' > "$tmp/balanced/bin/heavy-b.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%059000d\n", 0 }' > "$tmp/balanced/tests/suite-b.test.sh"
+  for part in 1of2 2of2; do
+    selected=$(cd "$tmp/balanced" && ./bin/fm-lint.sh --partition "$part" --list-files) \
+      || fail "balanced fixture partition $part failed"
+    [ "$(printf '%s\n' "$selected" | grep -c '^bin/heavy-')" -eq 1 ] \
+      || fail "partition $part did not balance bin/ roots independently of same-sized tests/ roots: $selected"
+    [ "$(printf '%s\n' "$selected" | grep -c '^tests/suite-')" -eq 1 ] \
+      || fail "partition $part did not balance tests/ roots independently of same-sized bin/ roots: $selected"
+  done
   for option in 0of2 3of2 1of3; do
     rc=0
     "$LINT" --partition "$option" --list-files > "$tmp/refused" 2>&1 || rc=$?

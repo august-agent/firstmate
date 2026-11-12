@@ -585,22 +585,6 @@ test_branch_outcomes_keep_a_drain_presented_outcome_across_an_index_repair() {
   pass "drain: an outcome the host drain presented but main never acknowledged survives an outcome index repair"
 }
 
-test_pass_stops_registered_home_processes_between_cases() {
-  local home pid out
-  home=$(make_home pass-cleanup attended)
-  sleep 300 &
-  pid=$!
-  printf '%s\n' "$pid" > "$home/claude-pids"
-  kill -0 "$pid" 2>/dev/null || fail "fixture: background process did not start"
-  grep -qxF "$home" "$HOMES_FILE" || fail "fixture: make_home did not register $home in HOMES_FILE"
-  out=$(pass "inner case")
-  [ "$out" = "ok - inner case" ] || fail "pass did not emit its TAP line: $out"
-  wait_until 50 bash -c '! kill -0 "$1" 2>/dev/null' _ "$pid" \
-    || fail "pass did not stop the registered home's process between cases"
-  [ ! -s "$HOMES_FILE" ] || fail "pass did not clear HOMES_FILE after stopping registered homes"
-  pass "helpers: pass stops registered home processes and clears HOMES_FILE between split-suite cases"
-}
-
 fm_test_run \
   test_report_surface_enforces_actor_turn_and_scope \
   test_report_after_the_return_is_queued_for_main \
@@ -618,5 +602,4 @@ fm_test_run \
   test_branch_outcomes_date_an_outcome_carried_across_a_switch_off_pi \
   test_branch_outcomes_keep_an_unshown_outcome_until_acknowledged \
   test_branch_outcomes_keep_a_drain_presented_outcome_across_a_switch_to_pi \
-  test_branch_outcomes_keep_a_drain_presented_outcome_across_an_index_repair \
-  test_pass_stops_registered_home_processes_between_cases
+  test_branch_outcomes_keep_a_drain_presented_outcome_across_an_index_repair

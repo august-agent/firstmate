@@ -270,22 +270,11 @@ fm_composer_kiro_scope() {
 #     foreground colour (30-37 / 90-97), or a lighter 38;2 foreground ends the
 #     dark-foreground run. This assumes a DARK terminal theme, the firstmate
 #     fleet reality, where real typed input is bright and only de-emphasised UI
-#     is dark; the SGR-2 signal above stays theme-independent.
-#   - dark INDEXED runs (SGR 38;5;n / 38:5:n) for n >= 16 only, scored on the
-#     same luminance rule after mapping the index through the xterm-256
-#     standard: 16-231 is the 6x6x6 cube over the fixed levels
-#     {0,95,135,175,215,255} and 232-255 is the greyscale ramp 8+10*(n-232).
-#     Indices 0-15 stay untested because those sixteen ARE the terminal's
-#     configurable palette and carry no fixed luminance.
-#     This range was previously untested wholesale, on the reasoning that an
-#     indexed colour is palette-dependent and no fleet harness used it for ghost
-#     text. The first half of that is only true of 0-15; the second stopped being
-#     true at muse 1.3.0-R3401.1, which draws its composer hint
-#     ("Ctrl+B sends the selected task to the background queue") in 38;5;242 -
-#     grey 108, comfortably dark. Reading that hint as typed input made every
-#     steer to an IDLE muse worker defer forever and made fm-control refuse to
-#     exit or relaunch it, because both decline to type onto text a human may
-#     have entered. The worker was reachable by nothing.
+#     is dark; the SGR-2 signal above stays theme-independent. A 256-colour
+#     foreground (38;5;n) is NOT luminance-tested - it is palette-dependent and
+#     no fleet harness except kiro (below) uses it for ghost text, so it is kept
+#     (real text wins: under-stripping merely defers, which the max-defer alarm
+#     surfaces, while over-stripping would inject over real input).
 # Raising FM_COMPOSER_GHOST_LUMA_MAX is not free: muse draws its `⟩` prompt glyph
 # in truecolor 38;2;90;160;255, luminance ~149.9 (verified, muse 0.1.0-R708.1),
 # the tightest margin over the 128 default in the fleet. Above ~150 that glyph is
@@ -385,36 +374,15 @@ fm_composer_strip_ghost() {
     function gray_is_dark(lv) {
       return (lv >= 0 && lv < ceiling_for(lv, lv, lv)) ? 1 : 0
     }
-    # One xterm-256 index to its standard level, for the 6x6x6 cube.
-    function xterm256_level(v) { return v == 0 ? 0 : 55 + 40 * v }
-
-    # Luminance of an indexed colour, or -1 when the index has no fixed colour.
-    # 0-15 ARE the configurable terminal palette, so they have none.
-    function idx256_luma(n,   c, r, g, b) {
-      if (n < 16 || n > 255) return -1
-      if (n >= 232) { c = 8 + 10 * (n - 232); return c }   # greyscale ramp
-      c = n - 16
-      r = xterm256_level(int(c / 36))
-      g = xterm256_level(int((c % 36) / 6))
-      b = xterm256_level(c % 6)
-      return (299*r + 587*g + 114*b) / 1000
-    }
-
     # fg38_is_dark: 1 when the SGR 38 foreground starting at param p is a
-    # TRUECOLOR (38;2 / 38:2) whose luminance is below ceiling_for(r, g, b),
-    # an INDEXED colour (38;5 / 38:5) with n >= 16 whose standard luminance is
-    # below lumamax, or in the kiro scope a PALETTE GREY (38;5 / 38:5 in 232-255)
-    # whose luminance is below the kiro gray ceiling; 0 otherwise.
-    function fg38_is_dark(a, p, k,   spec, nf, f, r, g, b, idx, luma) {
+    # TRUECOLOR (38;2 / 38:2), or in the kiro scope a PALETTE GREY (38;5 / 38:5),
+    # whose luminance is below the ceiling that applies to it; 0 otherwise (any
+    # other palette index, a bright colour, or a malformed run).
+    function fg38_is_dark(a, p, k,   spec, nf, f, r, g, b) {
       spec = a[p]
       if (index(spec, ":") > 0) {           # colon form: whole colour in a[p]
         nf = split(spec, f, ":")
-        if (f[2] == "5" && nf >= 3) {
-          idx = f[nf] + 0
-          if (gray_is_dark(palette_gray_level(idx))) return 1
-          luma = idx256_luma(idx)
-          return (luma >= 0 && luma < lumamax) ? 1 : 0
-        }
+        if (f[2] == "5" && nf >= 3) return gray_is_dark(palette_gray_level(f[nf] + 0))
         if (f[2] != "2" || nf < 5) return 0
         r = f[nf - 2] + 0; g = f[nf - 1] + 0; b = f[nf] + 0
         return ((299*r + 587*g + 114*b) / 1000 < ceiling_for(r, g, b)) ? 1 : 0
@@ -422,10 +390,7 @@ fm_composer_strip_ghost() {
       if (p + 1 > k) return 0
       if (a[p + 1] == "5") {
         if (p + 2 > k) return 0
-        idx = a[p + 2] + 0
-        if (gray_is_dark(palette_gray_level(idx))) return 1
-        luma = idx256_luma(idx)
-        return (luma >= 0 && luma < lumamax) ? 1 : 0
+        return gray_is_dark(palette_gray_level(a[p + 2] + 0))
       }
       if (a[p + 1] != "2" || p + 4 > k) return 0
       r = a[p + 2] + 0; g = a[p + 3] + 0; b = a[p + 4] + 0

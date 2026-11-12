@@ -20,11 +20,11 @@
 #                                        config/secondmate-harness, or empty when absent.
 #                                        An id selects that mate's override line first.
 #        fm-harness.sh validate-native-effort <harness> <model> <effort>
-#                                        Refuse ultra unless the harness is muse,
-#                                        or pi/pi-signed with a model that explicitly
-#                                        names codex-native/<id>. Other efforts retain
-#                                        their adapter's existing policy. Each native
-#                                        runtime owns model-level support.
+#                                        Refuse ultra unless the harness is pi or
+#                                        pi-signed and the model explicitly names
+#                                        codex-native/<id>. Other efforts retain
+#                                        their adapter's existing policy. Native
+#                                        Codex validates model support at startup.
 #        fm-harness.sh ancestry [<pid>] print "<strength> <harness>" for the nearest
 #                                        harness process at or above <pid> (default this
 #                                        process), or nothing when the walk finds none.
@@ -676,12 +676,11 @@ validate_native_effort() {
   local harness=${1:-} model=${2:-} effort=${3:-}
   [ "$effort" = ultra ] || return 0
   case "$harness" in
-    muse) return 0 ;;
     pi|pi-signed)
       case "$model" in codex-native/?*) return 0 ;; esac
       ;;
   esac
-  echo "error: ultra effort requires pi or pi-signed with an explicit codex-native/<model> model, or muse" >&2
+  echo "error: ultra effort requires pi or pi-signed with an explicit codex-native/<model> model" >&2
   return 1
 }
 

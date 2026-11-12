@@ -115,18 +115,13 @@
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
 #   from that harness's launch rather than guessed. Ultra is the explicit
-#   exception: bin/fm-harness.sh validate-native-effort owns its harness/model
-#   scope; Muse receives --reasoning-effort ultra, while supported Pi launches
-#   receive --codex-effort ultra and never --thinking ultra.
+#   exception: bin/fm-harness.sh validate-native-effort owns its model scope;
+#   supported Pi launches receive --codex-effort ultra, never --thinking ultra.
 #   OpenCode 2 has no interactive model or effort flag, so its selected model
 #   and effort are written as the build agent's model and variant inside the
 #   OPENCODE_CONFIG_CONTENT JSON its launch already carries (config schema
 #   re-verified on opencode 2.0.21); without a model the effort axis is recorded
 #   but omitted.
-#   On a canonical codex launch, --model pool:<pool>[:<model>] routes the worker
-#   through an OpenAI-compatible pooled gateway; bin/fm-codex-pool-lib.sh owns
-#   the syntax, gateway base, model lookup, and launch flags, and the record
-#   stores the resolved pool:<pool>:<model>. Any other harness refuses it.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -971,8 +966,6 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
-# shellcheck source=bin/fm-muse-lib.sh
-. "$SCRIPT_DIR/fm-muse-lib.sh"
 # shellcheck source=bin/fm-polytoken-lib.sh
 . "$SCRIPT_DIR/fm-polytoken-lib.sh"
 # shellcheck source=bin/fm-cursor-lib.sh
@@ -995,8 +988,6 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-project-capacity-lib.sh"
 # shellcheck source=bin/fm-worker-account-lib.sh
 . "$SCRIPT_DIR/fm-worker-account-lib.sh"
-# shellcheck source=bin/fm-codex-pool-lib.sh
-. "$SCRIPT_DIR/fm-codex-pool-lib.sh"
 # shellcheck source=bin/fm-omp-profile-lib.sh
 . "$SCRIPT_DIR/fm-omp-profile-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
@@ -1354,10 +1345,8 @@ fi
 
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
-  local remote_schema remote_backend remote_target remote_harness remote_model remote_effort remote_herdr_session
-  local remote_schema_count remote_model_count remote_effort_count remote_response_valid requested_pool recorded_model
+  local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
   local remote_rex_session_id remote_rex_server remote_rex_ok
-  local registry_lock remote_lock remote_generation
   local remote_traceparent remote_recorded_traceparent sm_primary_head sync_out sync_rc account_config
   local -a launch_args
   id=${POS[0]:-}
@@ -1460,17 +1449,6 @@ spawn_remote_secondmate() {
       fm_lock_release "$SPAWN_TASK_LOCK" || true
       echo "error: existing metadata for $id does not identify this remote secondmate route" >&2
       return 1
-    fi
-    if [ "$harness" = codex ] && fm_codex_pool_is_spec "$model" \
-      && fm_codex_pool_parse "$model" >/dev/null 2>&1 \
-      && [ -z "$FM_CODEX_POOL_MODEL" ]; then
-      requested_pool=$FM_CODEX_POOL_NAME
-      recorded_model=$(fm_meta_get "$meta" model)
-      if fm_codex_pool_parse "$recorded_model" >/dev/null 2>&1 \
-        && [ "$FM_CODEX_POOL_NAME" = "$requested_pool" ] \
-        && [ -n "$FM_CODEX_POOL_MODEL" ]; then
-        model=$recorded_model
-      fi
     fi
   fi
   # A remote second mate runs only on a backend whose session-provider server
@@ -1589,12 +1567,9 @@ spawn_remote_secondmate() {
     fi
     return "$rc"
   fi
-  remote_schema=$(printf '%s\n' "$out" | sed -n 's/^schema=//p' | tail -1)
   remote_backend=$(printf '%s\n' "$out" | sed -n 's/^backend=//p' | tail -1)
   remote_target=$(printf '%s\n' "$out" | sed -n 's/^target=//p' | tail -1)
   remote_harness=$(printf '%s\n' "$out" | sed -n 's/^harness=//p' | tail -1)
-  remote_model=$(printf '%s\n' "$out" | sed -n 's/^model=//p' | tail -1)
-  remote_effort=$(printf '%s\n' "$out" | sed -n 's/^effort=//p' | tail -1)
   if [ "$remote_backend" != "$backend" ]; then
     fm_lock_release "$remote_lock" || true
     fm_lock_release "$registry_lock" || true
@@ -1644,39 +1619,6 @@ spawn_remote_secondmate() {
       fi
       ;;
   esac
-  remote_schema_count=$(printf '%s\n' "$out" | grep -c '^schema=' || true)
-  remote_model_count=$(printf '%s\n' "$out" | grep -c '^model=' || true)
-  remote_effort_count=$(printf '%s\n' "$out" | grep -c '^effort=' || true)
-  remote_response_valid=1
-  [ "$remote_schema" = fm-remote-secondmate-control.v1 ] && [ "$remote_schema_count" -eq 1 ] \
-    && [ "$remote_model_count" -eq 1 ] && [ "$remote_effort_count" -eq 1 ] \
-    || remote_response_valid=0
-  case "$remote_model" in *[[:space:]]*) remote_response_valid=0 ;; esac
-  case "$remote_effort" in
-  '' | default | low | medium | high | xhigh | max | ultra) ;;
-  *) remote_response_valid=0 ;;
-  esac
-  if [ "$remote_response_valid" -ne 1 ]; then
-    fm_lock_release "$remote_lock" || true
-    fm_lock_release "$registry_lock" || true
-    fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: remote launch returned malformed profile metadata; preserving the remote route for reconciliation" >&2
-    return 1
-  fi
-  if fm_codex_pool_is_spec "$model"; then
-    requested_pool=${model#pool:}
-    requested_pool=${requested_pool%%:*}
-    if ! fm_codex_pool_parse "$remote_model" >/dev/null 2>&1 \
-      || [ "$FM_CODEX_POOL_NAME" != "$requested_pool" ] \
-      || [ -z "$FM_CODEX_POOL_MODEL" ]; then
-      fm_lock_release "$remote_lock" || true
-      fm_lock_release "$registry_lock" || true
-      fm_lock_release "$SPAWN_TASK_LOCK" || true
-      echo "error: remote launch returned a model that does not identify the resolved codex pool; preserving the remote route for reconciliation" >&2
-      return 1
-    fi
-    model=$remote_model
-  fi
   # Record what the remote endpoint ACTUALLY carries, read back from its own
   # launch, rather than what this side hoped to deliver. That keeps the #995
   # guarantee that the recorded carrier is the identity the child received even
@@ -1787,9 +1729,6 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
-SPAWN_MUSE_BIN=
-SPAWN_MUSE_BIN_NAME=
-SPAWN_MUSE_BIN_COMMITTED=0
 GIT_HOOKS_DIR=
 SPAWN_LAUNCH_SENT=0
 SPAWN_ENDPOINT_CLOSED=0
@@ -1836,7 +1775,7 @@ spawn_orca_reclaim_launch_file() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? muse_owner=
+  local status=$?
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&
@@ -1983,13 +1922,6 @@ spawn_abort_cleanup() {
       status=1
     fi
   fi
-  if [ -n "$SPAWN_MUSE_BIN" ] && [ "$SPAWN_MUSE_BIN_COMMITTED" != 1 ] &&
-    [ -f "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ]; then
-    muse_owner=$(fm_meta_get "$STATE/$ID.meta" muse_bin)
-    if [ "$muse_owner" = "$SPAWN_MUSE_BIN_NAME" ]; then
-      SPAWN_MUSE_BIN_COMMITTED=1
-    fi
-  fi
   if [ "$SPAWN_META_LOCK_HELD" = 1 ]; then
     SPAWN_META_LOCK_HELD=0
     fm_lock_release "$SPAWN_META_LOCK" || true
@@ -2102,12 +2034,6 @@ spawn_abort_cleanup() {
     fm_lock_release "$SPAWN_CONTROL_LOCK" || true
   fi
   [ -z "$SPAWN_META_TMP" ] || rm -f "$SPAWN_META_TMP" 2>/dev/null || true
-  if [ -n "$SPAWN_MUSE_BIN" ] && [ "$SPAWN_MUSE_BIN_COMMITTED" != 1 ]; then
-    if ! rm -f "$SPAWN_MUSE_BIN" 2>/dev/null; then
-      echo "warning: could not retire aborted Muse executable for task $ID; retry will clean $SPAWN_MUSE_BIN" >&2
-      status=1
-    fi
-  fi
   if [ "$status" -ne 0 ] && [ "${ORCA_LAUNCH_ENV_ENABLED:-0}" = 1 ] && [ -n "$SPAWN_STAGED_LAUNCH_FILE" ]; then
     if [ "$SPAWN_LAUNCH_SENT" = 0 ] || [ "$SPAWN_ENDPOINT_CLOSED" = 1 ]; then
       rm -f -- "$SPAWN_STAGED_LAUNCH_FILE" 2>/dev/null || true
@@ -3555,28 +3481,13 @@ if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
     fi
   fi
 fi
-# A pool: model routes a canonical codex launch through an OpenAI-compatible
-# pooled gateway (bin/fm-codex-pool-lib.sh owns the syntax, the gateway base,
-# and the model lookup). Resolve it to the concrete pool:<pool>:<model> before
-# any endpoint, worktree, or record exists, so the record names exactly what
-# runs and a relaunch reuses it without another lookup.
-CODEX_POOL=0
-if fm_codex_pool_is_spec "$MODEL"; then
-  [ "$RAW_LAUNCH" = 0 ] || {
-    echo "error: --model $MODEL requires the canonical --harness codex launch, not a raw launch command" >&2
-    exit 1
-  }
-  fm_codex_pool_resolve "$MODEL" "$HARNESS" "$CONFIG" || exit 1
-  MODEL=$FM_CODEX_POOL_SPEC
-  CODEX_POOL=1
-fi
 fm_backend_validate_harness "$BACKEND" "$HARNESS" || exit 1
-# Ultra is an explicit native capability, never a generic thinking-level alias.
+# Ultra is an explicit native capability, never a Pi thinking-level alias.
 # Validate the fully resolved profile before worktree or endpoint provisioning.
 if [ "$EFFORT" = ultra ]; then
   "$SCRIPT_DIR/fm-harness.sh" validate-native-effort "$HARNESS" "$MODEL" "$EFFORT" || exit 1
   [ "$RAW_LAUNCH" = 0 ] || {
-    echo "error: --effort ultra requires the canonical --harness pi or pi-signed launch, or canonical --harness muse launch, so its native flag cannot be omitted" >&2
+    echo "error: --effort ultra requires the canonical --harness pi or pi-signed launch so its native flag cannot be omitted" >&2
     exit 1
   }
 fi
@@ -3718,182 +3629,6 @@ resolve_muse_binary() {
   fi
   echo "error: muse executable not found on PATH; install Muse Code or select a different verified harness" >&2
   return 1
-}
-
-muse_install_dir_for_launcher() {
-  local path=$1 dir base target hops=0
-  dir=$(CDPATH='' cd -- "$(dirname -- "$path")" 2>/dev/null && pwd -P) || return 1
-  base=$(basename -- "$path")
-  while [ -L "$dir/$base" ] && [ "$hops" -lt 16 ]; do
-    target=$(readlink -- "$dir/$base") || return 1
-    case "$target" in
-    /*)
-      dir=$(CDPATH='' cd -- "$(dirname -- "$target")" 2>/dev/null && pwd -P) || return 1
-      base=$(basename -- "$target")
-      ;;
-    *)
-      dir=$(CDPATH='' cd -- "$dir/$(dirname -- "$target")" 2>/dev/null && pwd -P) || return 1
-      base=$(basename -- "$target")
-      ;;
-    esac
-    hops=$((hops + 1))
-  done
-  [ ! -L "$dir/$base" ] || return 1
-  printf '%s\n' "$dir"
-}
-
-muse_preserve_executable() {
-  local source=$1 target=$2 system
-  rm -f "$target"
-  if ln "$source" "$target" 2>/dev/null; then
-    return 0
-  fi
-  rm -f "$target"
-  system=$(uname -s 2>/dev/null || true)
-  if [ "$system" = Darwin ]; then
-    if cp -c -p "$source" "$target" 2>/dev/null; then
-      return 0
-    fi
-  elif cp --reflink=auto -p "$source" "$target" 2>/dev/null; then
-    return 0
-  fi
-  rm -f "$target"
-  cp -p "$source" "$target"
-}
-
-resolve_muse_max_launch() {
-  local launcher=$1 output status version release line_count
-  local mapped_effort install_dir stable stable_output stable_status major remainder minor
-  local lock attempts wait_attempts resolve_attempts task_binary task_name task_stage task_output task_status
-  install_dir=$(muse_install_dir_for_launcher "$launcher") || {
-    echo "error: Muse max effort could not resolve the install directory for launcher '$launcher'" >&2
-    return 1
-  }
-  lock="$install_dir/.muse-update-lock"
-  wait_attempts=${FM_MUSE_UPDATE_LOCK_WAIT_ATTEMPTS:-300}
-  case "$wait_attempts" in
-  '' | *[!0-9]* | 0)
-    echo "error: FM_MUSE_UPDATE_LOCK_WAIT_ATTEMPTS must be a positive integer" >&2
-    return 1
-    ;;
-  esac
-  attempts=0
-  resolve_attempts=0
-  while :; do
-    if output=$(MUSE_SYNC_UPDATE=1 "$launcher" --version 2>&1); then
-      status=0
-    else
-      status=$?
-    fi
-    if [ -e "$lock" ] || [ -L "$lock" ]; then
-      while [ -e "$lock" ] || [ -L "$lock" ]; do
-        if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -d "$lock" ]; }; then
-          echo "error: Muse max effort found an unsafe update lock at '$lock'" >&2
-          return 1
-        fi
-        [ -d "$lock" ] || break
-        attempts=$((attempts + 1))
-        if [ "$attempts" -gt "$wait_attempts" ]; then
-          echo "error: Muse max effort could not establish a stable version because update lock '$lock' did not clear" >&2
-          return 1
-        fi
-        sleep 0.1
-      done
-      continue
-    fi
-    line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
-    if [ "$status" -ne 0 ] || [ "$line_count" -ne 1 ] || ! printf '%s\n' "$output" | grep -Eq '^Muse Code (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*) \((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-R[0-9]+(\.[0-9]+)?\)$'; then
-      [ -n "$output" ] || output='<no output>'
-      echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' exited $status and reported '$output'" >&2
-      return 1
-    fi
-    version=${output#Muse Code }
-    version=${version%% *}
-    release=${output##*\(}
-    release=${release%\)}
-    case "$release" in
-    "$version"-R*) ;;
-    *)
-      echo "error: Muse max effort requires one stable executable version, but '$launcher --version' reported mismatched version '$output'" >&2
-      return 1
-      ;;
-    esac
-    if [ "$version" = 0.1.0 ]; then
-      mapped_effort=ultra
-    else
-      major=${version%%.*}
-      remainder=${version#*.}
-      minor=${remainder%%.*}
-      if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 3 ]; }; then
-        mapped_effort=max
-      else
-        echo "error: Muse max effort requires Muse Code 0.1.0 or 1.3.0 or later; '$launcher --version' reported '$output'" >&2
-        return 1
-      fi
-    fi
-    stable="$install_dir/muse-bin-$release"
-    if [ ! -f "$stable" ] || [ -L "$stable" ] || [ ! -x "$stable" ]; then
-      resolve_attempts=$((resolve_attempts + 1))
-      if [ "$resolve_attempts" -lt 3 ]; then
-        sleep 0.1
-        continue
-      fi
-      echo "error: Muse max effort resolved '$output' but its stable executable '$stable' is missing or not executable" >&2
-      return 1
-    fi
-    if stable_output=$("$stable" --version 2>&1); then
-      stable_status=0
-    else
-      stable_status=$?
-    fi
-    if [ "$stable_status" -ne 0 ] || [ "$stable_output" != "$output" ]; then
-      [ -n "$stable_output" ] || stable_output='<no output>'
-      echo "error: Muse max effort resolved '$output' but stable executable '$stable' exited $stable_status and reported '$stable_output'" >&2
-      return 1
-    fi
-    task_stage=$(mktemp "$STATE/.muse-bin-$ID+XXXXXXXXXXXX") || {
-      echo "error: Muse max effort could not allocate a task-owned executable in '$STATE'" >&2
-      return 1
-    }
-    task_name=${task_stage##*/}
-    task_binary="$STATE/${task_name#.}"
-    if ! muse_preserve_executable "$stable" "$task_stage"; then
-      rm -f "$task_stage"
-      if { [ ! -e "$stable" ] && [ ! -L "$stable" ]; } || [ -e "$lock" ] || [ -L "$lock" ]; then
-        resolve_attempts=$((resolve_attempts + 1))
-        if [ "$resolve_attempts" -lt 3 ]; then
-          sleep 0.1
-          continue
-        fi
-      fi
-      echo "error: Muse max effort could not preserve verified executable '$stable' as task-owned '$task_binary'" >&2
-      return 1
-    fi
-    if [ ! -f "$task_stage" ] || [ -L "$task_stage" ] || [ ! -x "$task_stage" ] ||
-      [ -e "$task_binary" ] || [ -L "$task_binary" ] ||
-      ! ln "$task_stage" "$task_binary"; then
-      rm -f "$task_stage"
-      echo "error: Muse max effort could not preserve verified executable '$stable' as task-owned '$task_binary'" >&2
-      return 1
-    fi
-    rm -f "$task_stage"
-    SPAWN_MUSE_BIN=$task_binary
-    SPAWN_MUSE_BIN_NAME=${task_binary##*/}
-    if task_output=$("$task_binary" --version 2>&1); then
-      task_status=0
-    else
-      task_status=$?
-    fi
-    if [ "$task_status" -ne 0 ] || [ "$task_output" != "$output" ]; then
-      [ -n "$task_output" ] || task_output='<no output>'
-      rm -f "$task_binary"
-      echo "error: Muse max effort preserved '$output' but task-owned executable '$task_binary' exited $task_status and reported '$task_output'" >&2
-      return 1
-    fi
-    MUSE_MAX_EFFORT=$mapped_effort
-    MUSE_BIN=$task_binary
-    return 0
-  done
 }
 
 resolve_rovo_binary() {
@@ -4148,12 +3883,17 @@ effort_flag_for_harness() {
     fi
     ;;
   muse)
+    # muse 0.1.0-R708.1 --reasoning-effort accepts none|minimal|low|medium|
+    # high|xhigh|ultra and defaults to high, so low..xhigh map straight across.
+    # ultra is muse's max-CLASS level, so firstmate's max maps onto it - but
+    # only ever as an EXPLICIT captain choice, never as a fallback, because
+    # AGENTS.md section 4 forbids selecting max without captain preference and
+    # the omitted effort here leaves muse on its own high default. muse's extra
+    # none/minimal levels sit below firstmate's shared vocabulary and are
+    # deliberately unreachable rather than remapped onto low.
     case "$effort" in
-    low | medium | high | xhigh | ultra) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
-    max)
-      [ -n "${MUSE_MAX_EFFORT:-}" ] || return 1
-      printf -- '--reasoning-effort %s ' "$(shell_quote "$MUSE_MAX_EFFORT")"
-      ;;
+    low | medium | high | xhigh) printf -- '--reasoning-effort %s ' "$(shell_quote "$effort")" ;;
+    max) printf -- '--reasoning-effort %s ' "$(shell_quote ultra)" ;;
     esac
     ;;
     # rovo has no --effort flag on `run`; its effort mapping rides
@@ -4171,10 +3911,6 @@ effort_flag_for_harness() {
 case "$LAUNCH" in
 *__MUSEBIN__*)
   MUSE_BIN=$(resolve_muse_binary) || exit 1
-  MUSE_MAX_EFFORT=
-  if [ "$EFFORT" = max ]; then
-    resolve_muse_max_launch "$MUSE_BIN" || exit 1
-  fi
   MUSE_CONFIG_HOME=$(resolve_directory_input XDG_CONFIG_HOME "${XDG_CONFIG_HOME:-${HOME:-}/.config}") || exit 1
   MUSE_DATA_HOME=$(resolve_directory_input XDG_DATA_HOME "${XDG_DATA_HOME:-${HOME:-}/.local/share}") || exit 1
   MUSE_AUTH_FILE="$MUSE_CONFIG_HOME/muse/auth.json"
@@ -5392,7 +5128,7 @@ else
     # it stands up a DIFFERENT home's own workspace by design - so it asks for
     # the per-home container instead of inheriting this launcher's.
     HERDR_LABEL_HOME=$FM_HOME
-    HERDR_LAUNCHER_RELATIONSHIP='launcher-home'
+    HERDR_LAUNCHER_RELATIONSHIP=launcher-home
     if [ "$KIND" = secondmate ]; then
       HERDR_LABEL_HOME=$PROJ_ABS
       HERDR_LAUNCHER_RELATIONSHIP=other-home
@@ -5606,7 +5342,7 @@ EOF
     REX_LABEL_HOME=$FM_HOME
     REX_LABEL_ROOT=$FM_ROOT
     REX_LABEL_STATE=$STATE
-    REX_LAUNCHER_RELATIONSHIP='launcher-home'
+    REX_LAUNCHER_RELATIONSHIP=launcher-home
     if [ "$KIND" = secondmate ]; then
       REX_LABEL_HOME=$PROJ_ABS
       REX_LABEL_ROOT=$PROJ_ABS
@@ -5815,30 +5551,6 @@ spawn_send_key() { # <target> <key>
     fi
     ;;
   esac
-}
-spawn_prepare_launch_composer() {
-  local mode=$1 marker="$STATE/.$ID.launch-ready.${BASHPID:-$$}.$RANDOM" i=0
-  SPAWN_LAUNCH_COMPOSER_ERROR=
-  rm -f -- "$marker" || { SPAWN_LAUNCH_COMPOSER_ERROR="could not clear the prior readiness marker"; return 1; }
-  if [ "$mode" = clear ]; then
-    fm_control_backend_supports_key "$BACKEND" C-c \
-      || { SPAWN_LAUNCH_COMPOSER_ERROR="backend $BACKEND cannot clear shell input"; return 1; }
-    spawn_send_key "$T" C-c \
-      || { SPAWN_LAUNCH_COMPOSER_ERROR="the shell-input clear key was not delivered"; return 1; }
-  fi
-  spawn_send_text_line "$T" "(umask 077; : > $(shell_quote "$marker"))" \
-    || { SPAWN_LAUNCH_COMPOSER_ERROR="the readiness probe was not delivered"; return 1; }
-  while [ "$i" -lt 40 ]; do
-    if [ -f "$marker" ] && [ ! -L "$marker" ]; then
-      rm -f -- "$marker" || return 1
-      return 0
-    fi
-    i=$((i + 1))
-    sleep 0.05
-  done
-  rm -f -- "$marker" 2>/dev/null || true
-  SPAWN_LAUNCH_COMPOSER_ERROR="the shell did not execute its readiness probe"
-  return 1
 }
 
 # Lease the task copy durably instead of typing the interactive `treehouse get`
@@ -6241,17 +5953,6 @@ agy_spawn_fail() {  # <detail>
   echo "error: $1; inspect window $T" >&2
   rovo_endpoint_cleanup
 }
-
-SPAWN_LAUNCH_PREPARE_MODE=
-if [ "$HARNESS" = muse ]; then
-  SPAWN_LAUNCH_PREPARE_MODE="wait"
-  [ "$RELAUNCH" -eq 0 ] || SPAWN_LAUNCH_PREPARE_MODE=clear
-  if ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
-    echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
-    exit 1
-  fi
-fi
-[ -z "$SPAWN_LAUNCH_PREPARE_MODE" ] || SPAWN_LAUNCH_PREPARE_MODE="wait"
 
 # polytoken's launch-then-confirm gate, in the same shape as agy's: the brief
 # rides the launch command (--prompt submits it after the TUI attaches), so
@@ -7625,7 +7326,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode muse_bin traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
+      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -7671,7 +7372,6 @@ preserve_relaunch_meta() {
   [ "$HARNESS" != hermes ] || { echo "hermes_profile=$HERMES_PROFILE"; echo "hermes_home=$HERMES_PROFILE_HOME"; }
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
-  [ -z "$SPAWN_MUSE_BIN_NAME" ] || echo "muse_bin=$SPAWN_MUSE_BIN_NAME"
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
@@ -7804,13 +7504,6 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: replacement task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
     exit 1
   fi
-  if [ -n "$SPAWN_MUSE_BIN" ]; then
-    SPAWN_MUSE_BIN_COMMITTED=1
-  fi
-  if ! fm_muse_cleanup_task_binaries "$STATE" "$ID" "$SPAWN_MUSE_BIN_NAME"; then
-    echo "error: could not retire stale pinned Muse executables for task $ID; the replacement record preserves the current identity and a retry will clean the remaining task-owned files" >&2
-    exit 1
-  fi
   RELAUNCH_REPLACEMENT_PENDING=0
   SPAWN_META_PUBLISH_STARTED=0
   SPAWN_META_TMP=
@@ -7848,18 +7541,10 @@ sq_ompext=$(shell_quote "$STATE/$ID.omp-ext.ts")
 sq_ompcfg=$(shell_quote "${OMP_WORKER_CFG:-$FM_ROOT/.omp/fm-worker-overlay.yml}")
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
-EFFORT_MODEL=$MODEL
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL" "$OPENCODE_MAJOR")
-# A resolved pool model replaces codex's plain --model with the pooled-provider
-# flags and names the provider key the gateway expects (fm-codex-pool-lib.sh).
-if [ "$CODEX_POOL" = 1 ]; then
-  MODELFLAG=$(fm_codex_pool_launch_flags "$FM_CODEX_POOL_BASE" "$FM_CODEX_POOL_NAME" "$FM_CODEX_POOL_MODEL")
-  EFFORT_MODEL=$FM_CODEX_POOL_MODEL
-  LAUNCH="$(fm_codex_pool_launch_env) $LAUNCH"
-fi
 # A pinned Pi launch confines Pi's model lookup to the declared provider.
 [ -z "$WORKER_ACCOUNT_PROVIDER" ] || MODELFLAG="--provider $(shell_quote "$WORKER_ACCOUNT_PROVIDER") $MODELFLAG"
-EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$EFFORT_MODEL" "$OPENCODE_MAJOR") || exit 1
+EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL" "$OPENCODE_MAJOR") || exit 1
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 # Relaunch session continuity. Computed here, where the adopted endpoint (T) is
@@ -8370,11 +8055,6 @@ else
     trap 'exit 130' INT
     trap 'exit 143' TERM
   fi
-  if [ -n "$SPAWN_LAUNCH_PREPARE_MODE" ] &&
-    ! spawn_prepare_launch_composer "$SPAWN_LAUNCH_PREPARE_MODE"; then
-    echo "error: task $ID launch shell could not be prepared and verified on endpoint $T: $SPAWN_LAUNCH_COMPOSER_ERROR" >&2
-    exit 1
-  fi
   sleep 0.3
   spawn_orca_launch_send_fail() {
     rm -f -- "$LAUNCH_FILE" 2>/dev/null || true
@@ -8411,11 +8091,7 @@ else
     LAUNCH_SOURCE_TEXT="if [ -e $(shell_quote "$LAUNCH_FILE") ]; then $LAUNCH_SOURCE_TEXT || true; else echo 'error: private launch file was already removed; refusing worker launch' >&2; fi"
   fi
   if ! spawn_send_literal "$T" "$LAUNCH_SOURCE_TEXT"; then
-    if [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ]; then
-      echo "error: staged launch for task $ID could not be delivered to endpoint $T" >&2
-    else
-      spawn_orca_launch_send_fail
-    fi
+    [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ] || spawn_orca_launch_send_fail
     exit 1
   fi
   sleep 0.3
@@ -8424,11 +8100,7 @@ else
     spawn_herdr_presentation_order_lock_release
   fi
   if ! spawn_send_key "$T" Enter; then
-    if [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ]; then
-      echo "error: staged launch for task $ID could not be submitted to endpoint $T" >&2
-    else
-      spawn_orca_launch_send_fail
-    fi
+    [ "$ORCA_LAUNCH_ENV_ENABLED" != 1 ] || spawn_orca_launch_send_fail
     exit 1
   fi
   if [ "$ORCA_LAUNCH_ENV_ENABLED" = 1 ]; then
@@ -8604,21 +8276,9 @@ if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
     echo "error: task $ID was republished but its backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR); fix the backlog and re-run the relaunch" >&2
   fi
 fi
-if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -eq 0 ] && [ -n "$SPAWN_MUSE_BIN" ]; then
-  SPAWN_MUSE_BIN_COMMITTED=1
-fi
 trap - HUP INT TERM
 if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
   exit "$SPAWN_BACKLOG_COMMIT_STATUS"
-fi
-if [ -n "$SPAWN_MUSE_BIN" ]; then
-  if ! fm_muse_cleanup_task_binaries "$STATE" "$ID" "$SPAWN_MUSE_BIN_NAME"; then
-    echo "warning: could not retire stale pinned Muse executables for task $ID; task metadata preserves the current identity for retry" >&2
-  fi
-else
-  if ! fm_muse_cleanup_task_binaries "$STATE" "$ID"; then
-    echo "warning: could not retire stale pinned Muse executables for task $ID; their task-owned names remain discoverable for retry" >&2
-  fi
 fi
 if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
   case "$SPAWN_DEFERRED_SIGNAL" in

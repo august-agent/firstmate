@@ -890,10 +890,23 @@ fm_lint_root_weights() {
 if [ -n "$PARTITION" ]; then
   PARTITION_ROOTS=()
   partition_weights=$(fm_lint_root_weights) || exit $?
+  # Balance bin/ and tests/ byte weights independently: production bin/ roots
+  # follow full library closures while tests stop at tests/lib.sh, so a shared
+  # byte accumulator lets large test files displace heavy bin/ roots into one
+  # partition.
   while IFS="$TAB" read -r index path; do
     PARTITION_ROOTS+=("$path")
   done < <(printf '%s\n' "$partition_weights" | LC_ALL=C sort -t "$TAB" -k1,1nr -k2,2n | awk -F '\t' -v want="${PARTITION%%of*}" '
-    { shard=(load[2] < load[1]) ? 2 : 1; load[shard]+=$1; if (shard == want) print $2 "\t" $3 }
+    {
+      if ($3 ~ /^tests\//) {
+        shard=(load["tests", 1] < load["tests", 2]) ? 1 : 2
+        load["tests", shard]+=$1
+      } else {
+        shard=(load["bin", 2] < load["bin", 1]) ? 2 : 1
+        load["bin", shard]+=$1
+      }
+      if (shard == want) print $2 "\t" $3
+    }
   ' | LC_ALL=C sort -t "$TAB" -k1,1n)
   ROOTS=("${PARTITION_ROOTS[@]}")
 fi
