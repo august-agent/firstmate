@@ -642,7 +642,8 @@ autoarm_commit_attended_alarm() {
     && [ -e "$FAILURE_NOTICE" ] \
     && [ ! -e "$FAILURE_ALARM" ] \
     && [ ! -e "$STATE/.afk" ]; then
-    if fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"; then
+    if [ "$ATTACH_RECOVERY" -eq 1 ] && [ "$ACTIONABLE" -eq 1 ] \
+      && fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"; then
       rc=2
     else
       session_id=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // "unknown"' 2>/dev/null || printf 'unknown')

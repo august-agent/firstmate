@@ -574,7 +574,8 @@ test_actionable_close_with_live_successor_rewakes_once() {
 
   out3=$(FM_CLAUDE_AUTOARM_ATTEMPTS=3 run_autoarm "$dir" 2>/dev/null); status3=$?
   expect_code 2 "$status3" "healthy but undelivered recovery must keep the bounded retry handoff"
-  [ -z "$out3" ] || fail "healthy failed arms repeated the episode notice: $out3"
+  assert_contains "$out3" "suppressed continuation" "healthy failed arms did not carry the suppressed continuation reason: $out3"
+  assert_not_contains "$out3" "automatic supervision mechanism is broken" "healthy failed arms repeated the episode notice: $out3"
   [ "$(epoch_outcome "$dir")" = failed-suppressed ] || fail "healthy failed arms reset their own failure episode"
   [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 7 ] || fail "consecutive healthy failures exceeded their retry budgets"
   kill "$pid" 2>/dev/null || true
@@ -2873,7 +2874,8 @@ test_missing_monitor_uses_bounded_failure_episode() {
   status=0
   out=$(FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1 run_autoarm "$dir" 2>/dev/null) || status=$?
   expect_code 0 "$status" "an attended readiness failure must stop automatic continuation"
-  [ -z "$out" ] || fail "attended readiness failure repeated its notice"
+  assert_contains "$out" "suppressed continuation" "an attended readiness failure did not carry its one-line reason: $out"
+  assert_not_contains "$out" "automatic supervision mechanism is broken" "attended readiness failure repeated its notice"
   assert_absent "$dir/state/arm-ran" "missing readiness started an unprotected arm"
   pass "auto-arm: missing monitor readiness follows the bounded failure episode"
 }

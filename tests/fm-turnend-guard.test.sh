@@ -2317,19 +2317,21 @@ SH
     assert_not_contains "$(cat "$dir/auto-$i.out")" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "the attended alarm repeated after commit ($variant, stop $i)"
   done
   # Positive recovery clears the whole episode - notice, alarm, and budget - so
-  # the next failure episode restarts its own attended budget. The recovery
-  # cycle closes non-actionably beside the verified healthy watcher.
+  # the next failure episode restarts its own attended budget. Health alone is
+  # insufficient: the replacement arm must attach to the verified healthy
+  # watcher and deliver its wake.
   : > "$dir/config/supervision-host-off"
-  printf '#!/usr/bin/env bash\nprintf '"'"'watcher: FAILED - persistent fixture failure\\n'"'"'\nexit 1\n' > "$dir/bin/fm-watch-arm.sh"
+  write_integrated_recovering_arm "$dir"
   sleep 60 &
   pid=$!
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify recovery watcher"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
-  auto_status=$(FM_CLAUDE_AUTOARM_ATTEMPTS=1 run_integrated_autoarm "$dir" > "$dir/auto-recovery.out"; printf '%s' "$?")
+  auto_status=$(run_integrated_autoarm "$dir" > "$dir/auto-recovery.out"; printf '%s' "$?")
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  expect_code 0 "$auto_status" "a healthy watcher must close the alarmed episode cleanly ($variant)"
+  expect_code 2 "$auto_status" "positive attachment recovery must deliver its wake ($variant)"
+  assert_contains "$(cat "$dir/auto-recovery.out")" "signal: recovered watcher wake" "positive recovery abandoned delivery ($variant)"
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "positive recovery left the failure notice ($variant)"
   assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "positive recovery left the attended alarm ($variant)"
   assert_absent "$dir/state/.turnend-claude-blocks" "positive recovery left the block budget ($variant)"

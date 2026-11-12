@@ -1581,13 +1581,13 @@ owner_lock_present() {  # <runner-pid>
   recorded_pid=$(sed -n '1p' "$sidecar") || return 1
   recorded_identity=$(sed -n '2p' "$sidecar") || return 1
   [ "$recorded_pid" = "$holder" ] && [ -n "$recorded_identity" ] || return 1
-  identity=$(fm_pid_identity "$holder") || return 1
+  identity=$(fm_session_pid_identity "$holder") || return 1
   [ "$identity" = "$recorded_identity" ] || return 1
   provenance=$(sed -n '3p' "$sidecar") || return 1
   owner_process_independent "$holder" "$1" "$provenance" || return 1
   # Recheck after the provenance walk so a changing holder cannot borrow it.
   [ "$(sed -n '1p' "$STATE/.lock" 2>/dev/null)" = "$holder" ] || return 1
-  [ "$(fm_pid_identity "$holder")" = "$identity" ]
+  [ "$(fm_session_pid_identity "$holder")" = "$identity" ]
 }
 
 # The runner's owner guard, which bounds an accidentally orphaned detached

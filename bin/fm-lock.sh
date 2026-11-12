@@ -209,7 +209,7 @@ publish_lock_session_or_die() {
 publish_lock_identity() {  # <verified-holder-pid>
   local identity tmp provenance=process-event
   [ "${FM_PROCEVENT_IN_RUNNER+x}" = x ] || provenance=independent
-  identity=$(fm_pid_identity "$1") || return 1
+  identity=$(fm_session_pid_identity "$1") || return 1
   [ -n "$identity" ] || return 1
   tmp=$(mktemp "$STATE/.lock-identity.XXXXXX") || return 1
   if ! { printf '%s\n%s\n%s\n' "$1" "$identity" "$provenance" > "$tmp" && mv -f "$tmp" "$STATE/.lock-identity"; }; then
