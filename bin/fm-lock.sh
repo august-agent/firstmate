@@ -38,7 +38,7 @@
 #
 # state/.lock-identity is published only after an acquisition or confirmed-own
 # acquisition verifies the lock. Its first two lines are that holder's pid and the
-# process-start identity from fm_pid_identity. Line 3 records acquisition
+# process-start identity from fm_session_pid_identity. Line 3 records acquisition
 # provenance: independent when FM_PROCEVENT_IN_RUNNER is unset, otherwise
 # process-event. Readers must match the pid and identity; an
 # absent or stale sidecar adds no owner-presence evidence. Atomic replacement
@@ -209,7 +209,7 @@ publish_lock_session_or_die() {
 publish_lock_identity() {  # <verified-holder-pid>
   local identity tmp provenance=process-event
   [ "${FM_PROCEVENT_IN_RUNNER+x}" = x ] || provenance=independent
-  identity=$(fm_pid_identity "$1") || return 1
+  identity=$(fm_session_pid_identity "$1") || return 1
   [ -n "$identity" ] || return 1
   tmp=$(mktemp "$STATE/.lock-identity.XXXXXX") || return 1
   if ! { printf '%s\n%s\n%s\n' "$1" "$identity" "$provenance" > "$tmp" && mv -f "$tmp" "$STATE/.lock-identity"; }; then
@@ -281,7 +281,7 @@ if [ -f "$LOCK" ] && [ ! -L "$LOCK" ]; then
     confirm_own_lock "$old"
     old=$(cat "$LOCK" 2>/dev/null || true)
   fi
-  if [ -z "$REANCHOR" ] && fm_harness_pid_alive "$old"; then
+  if [ -z "$REANCHOR" ] && fm_session_lock_pid_blocks_reclaim "$old"; then
     refuse_live_owner "$old"
   fi
 fi
@@ -309,10 +309,10 @@ if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
   }
   # A re-anchor decided above has held the claim lock since, so line 1 is the
   # pid it recorded and needs no second verdict.
-  if [ -z "$REANCHOR" ] && [ "$old" != "$me" ] && fm_harness_pid_alive "$old"; then
+  if [ -z "$REANCHOR" ] && [ "$old" != "$me" ] && fm_session_lock_pid_blocks_reclaim "$old"; then
     fm_session_lock_owned_by_self "$STATE" && confirm_own_lock "$old"
     old=$(cat "$LOCK" 2>/dev/null || true)
-    if [ -z "$REANCHOR" ] && [ "$old" != "$me" ] && fm_harness_pid_alive "$old"; then
+    if [ -z "$REANCHOR" ] && [ "$old" != "$me" ] && fm_session_lock_pid_blocks_reclaim "$old"; then
       refuse_live_owner "$old"
     fi
   fi

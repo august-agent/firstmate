@@ -170,8 +170,9 @@ test_list_files_reports_the_shell_inventory() {
   # CI=true forces the full canonical set regardless of the ambient branch or
   # working-tree diff a local test run happens to have, so this stays a pure
   # inventory check independent of fm-lint.sh's own changed-file mode below.
+  # Hidden scripts are outside the documented shell-glob inventory.
   listed=$(CI=true "$LINT" --list-files)
-  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "fm-lint.sh --list-files did not return the complete shell inventory"
   pass "fm-lint.sh --list-files reports the complete shell inventory"
@@ -184,7 +185,7 @@ test_canonical_partitions_preserve_full_lint() {
   mkdir -p "$fakebin"
   all=$(CI=true "$LINT" --list-files | LC_ALL=C sort)
   : > "$tmp/union"
-  for part in 1of2 2of2; do
+  for part in 1of3 2of3 3of3; do
     selected=$(CI=false GITHUB_ACTIONS=false "$LINT" --partition "$part" --list-files) \
       || fail "partition $part must select full canonical roots even on a local branch"
     [ -n "$selected" ] || fail "empty lint partition $part"
@@ -213,18 +214,35 @@ test_canonical_partitions_preserve_full_lint() {
       || fail "partition $part did not stream an end record per root"
   done
   [ "$(LC_ALL=C sort "$tmp/union")" = "$all" ] || fail "lint partitions lose or duplicate canonical roots"
-  for option in 0of2 3of2 1of3; do
+  mkdir -p "$tmp/balanced/bin/backends" "$tmp/balanced/tests"
+  cp "$LINT" "$tmp/balanced/bin/fm-lint.sh"
+  chmod +x "$tmp/balanced/bin/fm-lint.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%060000d\n", 0 }' > "$tmp/balanced/bin/heavy-a.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%060000d\n", 0 }' > "$tmp/balanced/tests/suite-a.test.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%059000d\n", 0 }' > "$tmp/balanced/bin/heavy-b.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%059000d\n", 0 }' > "$tmp/balanced/tests/suite-b.test.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%058000d\n", 0 }' > "$tmp/balanced/bin/heavy-c.sh"
+  awk 'BEGIN { printf "#!/usr/bin/env bash\n#%058000d\n", 0 }' > "$tmp/balanced/tests/suite-c.test.sh"
+  for part in 1of3 2of3 3of3; do
+    selected=$(cd "$tmp/balanced" && ./bin/fm-lint.sh --partition "$part" --list-files) \
+      || fail "balanced fixture partition $part failed"
+    [ "$(printf '%s\n' "$selected" | grep -c '^bin/heavy-')" -eq 1 ] \
+      || fail "partition $part did not balance bin/ roots independently of same-sized tests/ roots: $selected"
+    [ "$(printf '%s\n' "$selected" | grep -c '^tests/suite-')" -eq 1 ] \
+      || fail "partition $part did not balance tests/ roots independently of same-sized bin/ roots: $selected"
+  done
+  for option in 0of3 4of3 1of2 2of2 1of4; do
     rc=0
     "$LINT" --partition "$option" --list-files > "$tmp/refused" 2>&1 || rc=$?
     [ "$rc" = 2 ] || fail "invalid partition $option was not refused"
   done
   rc=0
-  "$LINT" --partition 1of2 --fast > "$tmp/refused" 2>&1 || rc=$?
+  "$LINT" --partition 1of3 --fast > "$tmp/refused" 2>&1 || rc=$?
   [ "$rc" = 2 ] || fail "partition accepted --fast"
   rc=0
-  "$LINT" --partition 1of2 bin/fm-lint.sh > "$tmp/refused" 2>&1 || rc=$?
+  "$LINT" --partition 1of3 bin/fm-lint.sh > "$tmp/refused" 2>&1 || rc=$?
   [ "$rc" = 2 ] || fail "partition accepted an explicit subset"
-  pass "two canonical lint partitions preserve complete source-aware coverage and reject weakened modes"
+  pass "three canonical lint partitions preserve complete source-aware coverage and reject weakened modes"
 }
 
 # fm_lint_stub_git <fakebin-dir>: install a git stub for the changed-file mode
@@ -528,7 +546,7 @@ test_ci_forces_full_lint_even_with_empty_diff() {
   # No git stub: CI=true must short-circuit fm-lint.sh's mode selection before
   # it ever consults git, so this proves CI wins regardless of local diff state.
   listed=$(CI=true "$LINT" --list-files)
-  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "CI=true did not force the full canonical file set"
   pass "fm-lint.sh forces a full lint in CI even when the local diff would be empty"
@@ -544,7 +562,7 @@ test_main_branch_forces_full_lint() {
   # not the ambient CI signal a real CI run would otherwise supply.
   listed=$(PATH="$fakebin:$PATH" GITHUB_ACTIONS='' CI='' \
     FM_TEST_GIT_BRANCH=main "$LINT" --list-files)
-  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' -print | LC_ALL=C sort)
+  expected=$(find bin bin/backends tests -maxdepth 1 -type f -name '*.sh' ! -name '.*' -print | LC_ALL=C sort)
   [ "$(printf '%s\n' "$listed" | LC_ALL=C sort)" = "$expected" ] \
     || fail "fm-lint.sh did not force a full lint when HEAD is on main"
   pass "fm-lint.sh forces a full lint when HEAD is on main"
