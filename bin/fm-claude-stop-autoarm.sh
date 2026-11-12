@@ -316,35 +316,33 @@ fm_session_lock_owned_by_self "$STATE" || exit 0
 
 # A second native asyncRewake hook owns an independent notification channel.
 # It stays tokenless until completion, with one recovery monitor per Claude
-# session. Killing the generation owner OR its original hook transport
-# therefore leaves a hook able to reclaim the abandoned generation and deliver
-# its exit-2 wake. The monitor writes its Claude session and identity after
-# acquisition. Missing identity remains an in-progress/uncertain holder; a
-# positive identity mismatch or a changed Claude session permits live reclaim.
+# session under a session-scoped lock. Killing the generation owner OR its
+# original hook transport therefore leaves a hook able to reclaim the abandoned
+# generation and deliver its exit-2 wake, while a delayed hook from an earlier
+# session cannot displace the current session's monitor. The monitor writes its
+# Claude session and identity after acquisition. Missing identity remains an
+# in-progress/uncertain holder; only a positive identity mismatch permits
+# live-PID reclaim.
 autoarm_recovery_lock_acquire() {
-  local owner pid identity current owner_session steal steal_owner acquired rc=1
+  local owner pid identity current steal steal_owner acquired rc=1
   fm_lock_try_acquire "$RECOVERY_LOCK" && return 0
   owner=$(fm_lock_link_owner "$RECOVERY_LOCK") || return 1
   pid=$(cat "$owner/pid" 2>/dev/null) || return 1
   identity=$(cat "$owner/pid-identity" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
-  owner_session=$(cat "$owner/claude-session" 2>/dev/null || true)
   current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-  [ "$current" != "$identity" ] || [ "$owner_session" != "$HOOK_SESSION" ] || return 1
+  [ "$current" != "$identity" ] || return 1
   steal="$RECOVERY_LOCK.steal"
   fm_lock_try_acquire_steal_mutex "$steal" || return 1
   steal_owner=$FM_LOCK_OWNER_DIR
-  # Revalidate the exact immutable directory, pid, identity, and Claude session
-  # while the steal mutex excludes replacement claims. Never signal the
-  # unrelated live process.
+  # Revalidate the exact immutable directory, pid, and identity while the steal
+  # mutex excludes replacement claims. Never signal the unrelated live process.
   if fm_lock_points_to_owner "$steal" "$steal_owner" \
     && fm_lock_points_to_owner "$RECOVERY_LOCK" "$owner" \
     && [ "$(cat "$owner/pid" 2>/dev/null)" = "$pid" ] \
-    && [ "$(cat "$owner/pid-identity" 2>/dev/null)" = "$identity" ] \
-    && [ "$(cat "$owner/claude-session" 2>/dev/null || true)" = "$owner_session" ]; then
+    && [ "$(cat "$owner/pid-identity" 2>/dev/null)" = "$identity" ]; then
     current=$(fm_pid_identity "$pid" 2>/dev/null) || current=
-    if [ -n "$current" ] && { [ "$current" != "$identity" ] || [ "$owner_session" != "$HOOK_SESSION" ]; }; then
-      : > "$owner/complete" 2>/dev/null || true
+    if [ -n "$current" ] && [ "$current" != "$identity" ]; then
       fm_lock_remove_path "$RECOVERY_LOCK" || true
       if fm_lock_try_create "$RECOVERY_LOCK" "$steal_owner"; then
         acquired=$FM_LOCK_OWNER_DIR
@@ -356,7 +354,7 @@ autoarm_recovery_lock_acquire() {
   FM_LOCK_OWNER_DIR=${acquired:-}
   return "$rc"
 }
-RECOVERY_LOCK="$STATE/.claude-autoarm-recovery.lock"
+RECOVERY_LOCK="$STATE/.claude-autoarm-recovery${HOOK_SESSION:+-$HOOK_SESSION}.lock"
 if [ "${FM_CLAUDE_AUTOARM_RECOVERY_WATCH:-0}" = 1 ]; then
   autoarm_recovery_lock_acquire || exit 0
   RECOVERY_OWNER_DIR=$FM_LOCK_OWNER_DIR

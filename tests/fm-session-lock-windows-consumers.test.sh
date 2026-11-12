@@ -222,20 +222,22 @@ test_lock_identity_sidecar_tracks_windows_stime_and_rejects_legacy_records() {
   home=$(make_home lock-sidecar win:7204)
   out=$(lib_eval windows "$home" '
     _fm_wake_require_session_lock
+    STATE=$FM_STATE_OVERRIDE
+    eval "$(sed -n "/^owner_process_independent()/,/^}/p; /^owner_lock_present()/,/^}/p" "$FM_ROOT_OVERRIDE/bin/fm-procevent.sh")"
     "$FM_ROOT_OVERRIDE/bin/fm-lock.sh" >/dev/null || { echo acquire-failed; exit 0; }
     sed -n "1p;2p;3p" "$FM_STATE_OVERRIDE/.lock-identity"
-    if [ "$(fm_session_pid_identity win:7204)" = "$(sed -n "2p" "$FM_STATE_OVERRIDE/.lock-identity")" ]; then
+    if owner_lock_present "$$"; then
       echo live-matches
     else
       echo live-mismatch
     fi
-    if [ "$(FM_TEST_WIN_TABLE=$1 fm_session_pid_identity win:7204)" = "$(sed -n "2p" "$FM_STATE_OVERRIDE/.lock-identity")" ]; then
+    if FM_TEST_WIN_TABLE=$1 owner_lock_present "$$"; then
       echo restarted-matches
     else
       echo restarted-mismatch
     fi
     printf "win:7204\nwin-pid=7204 command=C:/Users/u/.local/bin/claude\nindependent\n" > "$FM_STATE_OVERRIDE/.lock-identity"
-    if [ "$(fm_session_pid_identity win:7204)" = "$(sed -n "2p" "$FM_STATE_OVERRIDE/.lock-identity")" ]; then
+    if owner_lock_present "$$"; then
       echo legacy-matches
     else
       echo legacy-mismatch

@@ -93,7 +93,7 @@ The ordinary hook waits for that owner and relays its exit status, retrying untr
 A separate native `asyncRewake` hook (`bin/fm-claude-stop-recovery.sh`), registered on both Stop and StopFailure, keeps one tokenless recovery monitor per Claude session, so losing the ordinary hook itself does not also lose the only notification channel.
 The ordinary hook waits for its session's monitor readiness before claiming, routes readiness exhaustion through the bounded failure episode, and closes the monitor on completion so sibling hooks cannot hold up feedback.
 The monitor reclaims only its session's exact observed generation while it remains abandoned and `arming` under the generation mutex, and returns the recovered wake on its own hook channel without requiring another Stop or StopFailure.
-Its singleton lock revalidates a mismatched process identity or changed Claude session under the steal mutex before replacing an earlier holder.
+Its per-session lock revalidates a mismatched process identity under the steal mutex before replacing a reused PID.
 An open supervised generation must prove both its owner and notification transport by process identity; the transport captures its identity before forking and an adopted child refuses startup.
 Legacy generations retain their existing owner proof.
 The owner stops its arm when its transport or session disappears, leaving transport-loss recovery to the independent hook.
