@@ -423,11 +423,13 @@ fm_busy_record_read() {  # <state-dir> <id>
 #
 # muse persists an append-only session event log per session at
 # <sessions-root>/YYYY/MM/DD/<session-uuid>/session.jsonl, and brackets every
-# submitted turn with one run lifecycle pair. Verified live on muse
-# 0.1.0-R708.1 across completed, interrupted, and killed-mid-turn turns:
-#   {"payload":{"kind":"run","run_id":"<uuid>","event":{"kind":"started",...
-#   {"payload":{"kind":"run","run_id":"<uuid>","event":{"kind":"terminal",
-#     "terminal":"completed"|"cancelled",...
+# submitted turn with one run lifecycle pair: a payload with top-level
+# kind "run" and event kind "started" opens the turn, and the same run_id with
+# event kind "terminal" (terminal "completed" or "cancelled") closes it.
+# Verified live on muse 0.1.0-R708.1 across completed, interrupted, and
+# killed-mid-turn turns, and again on muse 1.3.0, which reordered the payload
+# keys (event first) and opens the log with a retained_frame envelope ahead of
+# the metadata record without changing the lifecycle pair itself.
 # An Escape interrupt closes its run with terminal=cancelled, so unlike Claude's
 # Stop hook this source covers the interrupt path itself. Any later
 # run_retracted records follow the terminal rather than replacing it.
@@ -440,7 +442,7 @@ fm_busy_record_read() {  # <state-dir> <id>
 # Pi push sources. A version allowlist would be false precision and a maintenance
 # treadmill for an auto-updating vendor binary: busy classification receives
 # only the normalized muse harness identity, while session metadata records
-# semver 0.1.0 plus a build SHA that cannot be matched against it. Resolution
+# a semver plus a build SHA that cannot be matched against it. Resolution
 # failures - no sidecar, no matching log, an unreadable or run-free log - remain
 # unknown because those prove nothing about the turn either way. See
 # docs/verification/muse.md for the evidence.
@@ -505,11 +507,40 @@ function metadataWorkspace(file) {
   try {
     descriptor = fs.openSync(file, "r");
     const buffer = Buffer.alloc(65536);
-    const length = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
-    const newline = buffer.indexOf(10, 0);
-    if (newline < 0 || newline >= length) return null;
-    const record = JSON.parse(buffer.subarray(0, newline).toString("utf8"));
-    return record?.payload?.record?.workspace_root ?? null;
+    const maxPreludeBytes = 1024 * 1024;
+    const maxPreludeRecords = 8;
+    let offset = 0;
+    let pending = Buffer.alloc(0);
+    let records = 0;
+    while (offset < maxPreludeBytes && records < maxPreludeRecords) {
+      const length = fs.readSync(
+        descriptor,
+        buffer,
+        0,
+        Math.min(buffer.length, maxPreludeBytes - offset),
+        offset,
+      );
+      if (length === 0) break;
+      offset += length;
+      pending = Buffer.concat([pending, buffer.subarray(0, length)]);
+      let newline;
+      while (records < maxPreludeRecords && (newline = pending.indexOf(10)) >= 0) {
+        const line = pending.subarray(0, newline).toString("utf8");
+        pending = pending.subarray(newline + 1);
+        records += 1;
+        if (!line) continue;
+        let record;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (record?.payload_type !== "runtime.session.metadata") continue;
+        const workspace = record?.payload?.record?.workspace_root;
+        if (typeof workspace === "string" && workspace.length > 0) return workspace;
+      }
+    }
+    return null;
   } catch {
     return null;
   } finally {
@@ -674,35 +705,572 @@ EOF
   printf '%s' "$selected"
 }
 
+# fm_busy_muse_run_events: print "run_id<TAB>started|terminal<TAB>terminal?"
+# for every run lifecycle record in the log. The match reads the payload's
+# TOP-LEVEL kind, run_id, and event object, plus the event's top-level kind
+# and terminal value, with a string-aware walk that never looks inside nested
+# values. Key order therefore does not matter: 0.1.0 wrote
+# {"kind":"run","run_id":..,"event":..} while 1.3.0 writes
+# {"event":..,"kind":"run","run_id":..}, and both parse identically here, as
+# does a log holding both shapes after a mid-day vendor update. The top-level
+# kind gate is also what rejects the nested "record":{"kind":"terminal"}
+# decoys (cleanup effects on 0.1.0, tool batch effects on 1.3.0) and the
+# run_model records whose nested run_stream carries kind "run": none of them
+# is a top-level run. Prompt text cannot inject a lifecycle event either,
+# because it sits inside the event's prompt string, which parsing skips as
+# one opaque value. A line that fails to parse contributes nothing, so a
+# corrupt log folds to none (unknown), never to idle.
+# Two engines print this contract: the node fold below, used whenever node
+# exists (the session binding above already requires it, so this adds no new
+# dependency), and the awk reference beside it. The awk walk is
+# character-by-character, so one multi-MB prompt line costs it minutes on a
+# grown log; the node fold pre-filters to candidate lines and parses only
+# those at native speed instead.
 fm_busy_muse_run_events() {  # <session-log>
+  local out log tmp="" st=""
+  log=$1
+  # NUL bytes are never valid in JSONL, but the two readers meet them
+  # differently: awk record splitting is blind to NUL (C-string truncation)
+  # while node reads them intact, so one NUL would fold differently per
+  # engine. Map every NUL to SOH through a temp copy so both engines fold
+  # identical bytes. SOH is a literal control byte, so the strict parsers
+  # reject any record holding one: a NUL-bearing record contributes nothing,
+  # and stripping must never repair it into a valid lifecycle record. The
+  # copy exists only when the log actually holds a NUL.
+  # shellcheck disable=SC2094 # tr reads the log into the pipe; nothing writes back to it.
+  if [ -f "$log" ] && ! LC_ALL=C tr -d '\000' < "$log" | LC_ALL=C cmp -s - "$log"; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/fm-busy-muse-nul.XXXXXX") || return 1
+    # A failed copy (a full disk) must never fold its truncated prefix: the
+    # surviving head can drop a trailing open run and read a busy session
+    # as idle. Remove the temp copy and fail closed to unknown instead.
+    if ! LC_ALL=C tr '\000' '\001' < "$log" > "$tmp"; then
+      rm -f "$tmp"
+      return 1
+    fi
+    log=$tmp
+  fi
+  # Prefer the fast fold, but a node that exists yet fails (a poisoned PATH,
+  # a broken runtime) must degrade to the reference instead of folding to
+  # none: the cached binding path classifies without any other node use, so
+  # the fold cannot be the one thing that needs a working node. The node
+  # fold only ever writes on success, and the capture keeps even a partial
+  # write from escaping, so the fallback always folds the whole log.
+  if command -v node >/dev/null 2>&1 && out=$(fm_busy_muse_run_events_node "$log"); then
+    [ -n "$out" ] && printf '%s\n' "$out"
+    [ -n "$tmp" ] && rm -f "$tmp"
+    return 0
+  fi
+  fm_busy_muse_run_events_awk "$log"; st=$?
+  [ -n "$tmp" ] && rm -f "$tmp"
+  return $st
+}
+
+# fm_busy_muse_run_events_node: the fast run_events fold. A fixed-string
+# pre-filter passes only lines carrying every lifecycle marker (the same
+# three substrings the awk reference scans for, so the candidate set is
+# identical), and node parses just those lines. The field rules mirror the
+# reference exactly: a top-level payload object with string kind "run" and a
+# non-empty string run_id, an object event with string kind started or
+# terminal, and the terminal value only when it is a string. A later
+# non-string duplicate leaves the earlier string active on both sides, and a
+# later non-object duplicate leaves the earlier object active, so the reviver
+# below records last-string-wins and last-object-wins instead of
+# JSON.parse's last-value-wins. Row framing can never come from field
+# contents: a tracked string whose raw escapes would decode to tab, newline,
+# or CR rejects the line on both engines, so field contents can never alias
+# distinct runs or forge rows for the downstream fold. Both engines emit the
+# raw spans, so escape spellings stay distinct in both; vendor ids and
+# terminal enums never use escapes, so the spelling never matters in
+# practice. Corrupt lines print nothing on both sides.
+fm_busy_muse_run_events_node() {  # <session-log>
   [ -f "$1" ] || return 1
-  LC_ALL=C awk '
-    BEGIN { OFS = "\t"; pre = "\"payload\":{\"kind\":\"run\",\"run_id\":\"" }
-    {
-      p = index($0, pre)
-      if (p == 0) next
-      rest = substr($0, p + length(pre))
-      q = index(rest, "\"")
-      if (q == 0) next
-      rid = substr(rest, 1, q - 1)
-      rest = substr(rest, q)
-      head = "\",\"event\":{\"kind\":\""
-      if (substr(rest, 1, length(head)) != head) next
-      rest = substr(rest, length(head) + 1)
-      q = index(rest, "\"")
-      if (q == 0) next
-      ev = substr(rest, 1, q - 1)
-      terminal = ""
-      if (ev == "terminal") {
-        marker = "\"terminal\":\""
-        p = index(rest, marker)
-        if (p != 0) {
-          value = substr(rest, p + length(marker))
-          q = index(value, "\"")
-          if (q != 0) terminal = substr(value, 1, q - 1)
+  command -v node >/dev/null 2>&1 || return 1
+  # --no-opt: node 26's optimizing compiler intermittently drops records when
+  # this script arrives on stdin (a 5001-line CR-prefixed log folds to ~1700
+  # events instead of 5001, varying run to run; --jitless and --no-opt both
+  # stabilize it). The unoptimized fold is still orders of magnitude faster
+  # than the awk walk, so pin the semantics-correct tier explicitly.
+  node --no-opt - "$1" <<'NODE'
+const fs = require("fs");
+const logPath = process.argv[2];
+if (!logPath) process.exit(1);
+// Test seam: FM_MUSE_FOLD_CHUNK forces a small stream chunk so tests can
+// pack many chunk boundaries into a modest fixture. Unset in production,
+// where the default 64 KiB chunk applies.
+const chunkEnv = Number(process.env.FM_MUSE_FOLD_CHUNK);
+const streamOpts = Number.isSafeInteger(chunkEnv) && chunkEnv > 0 ? { highWaterMark: chunkEnv } : {};
+// Streaming read: grown logs exceed V8's ~512MiB string limit and buffering
+// the whole file wastes memory, so the fold streams chunks and folds one
+// line at a time. Bytes split on LF only; each line decodes as latin1, so
+// every byte maps to one code point exactly like a whole-file latin1 read
+// and invalid UTF-8 bytes stay distinct instead of merging into U+FFFD.
+// Direct port of the awk reference walk below: same states, same
+// acceptance, native speed. S is the line, N its length, P the cursor.
+// WS is space, tab, CR (never LF: lines arrive split on LF already).
+// Field slots keep RAW inner text: comparisons run against raw spans and
+// emission prints the raw spans, exactly like the walk, so escape
+// spellings behave identically on both sides.
+let S = "";
+let N = 0;
+let P = 0;
+let sval = "";
+let foundOpen = 0;
+let fKind = "";
+let fKindFound = false;
+let fRunid = "";
+let fRunidFound = false;
+let fTerminal = "";
+let fTerminalFound = false;
+function isWs(c) {
+  return c === " " || c === "\t" || c === "\r";
+}
+function skipWs() {
+  while (P < N && isWs(S[P])) P++;
+}
+function isEsc(c) {
+  return c === '"' || c === "\\" || c === "/" || c === "b" || c === "f" || c === "n" || c === "r" || c === "t" || c === "u";
+}
+function isHex(c) {
+  return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
+}
+// hasFramingEsc is true when tracked-string raw escapes would decode to TSV
+// framing. Such a line is rejected outright on both engines. The span is
+// walked escape by escape: an escaped backslash (\\) consumes itself, so
+// the literal text after it can never pose as an escape. Only a real \t,
+// \n, \r, or \u0009/000a/000d escape framing-marks the line.
+function hasFramingEsc(span) {
+  for (let i = 0; i < span.length; i++) {
+    if (span[i] !== "\\") continue;
+    const e = span[i + 1];
+    if (e === "t" || e === "n" || e === "r") return true;
+    if (e === "u") {
+      const hex = span.slice(i + 2, i + 6).toLowerCase();
+      if (hex === "0009" || hex === "000a" || hex === "000d") return true;
+      i += 5;
+    } else {
+      i += 1;
+    }
+  }
+  return false;
+}
+// parseString consumes the JSON string at S[P] into sval (raw inner text)
+// and advances past its closing quote. Escapes are validated and literal
+// control characters rejected, exactly like the walk.
+function parseString() {
+  if (S[P] !== '"') return false;
+  P++;
+  const start = P;
+  while (P < N) {
+    const c = S[P];
+    if (c === "\\") {
+      const esc = S[P + 1];
+      if (!isEsc(esc)) return false;
+      if (esc === "u") {
+        if (!isHex(S[P + 2]) || !isHex(S[P + 3]) || !isHex(S[P + 4]) || !isHex(S[P + 5])) return false;
+        P += 6;
+      } else {
+        P += 2;
+      }
+      continue;
+    }
+    if (c === '"') {
+      sval = S.slice(start, P);
+      P++;
+      return true;
+    }
+    if (c < " ") return false;
+    P++;
+  }
+  return false;
+}
+// skipValue consumes one JSON value at S[P], past any whitespace. Strings
+// are validated, bare literals must be true, false, null, or a JSON
+// number, and object/array interiors skip non-string bytes blindly, all
+// exactly like the walk.
+function skipValue() {
+  skipWs();
+  if (P >= N) return false;
+  const c = S[P];
+  if (c === '"') return parseString();
+  if (c === "{" || c === "[") {
+    let depth = 0;
+    let instr = false;
+    let esc = 0;
+    while (P < N) {
+      const d = S[P];
+      if (instr) {
+        if (esc > 0) {
+          if (esc === 1) {
+            if (!isEsc(d)) return false;
+            esc = d === "u" ? 5 : 0;
+          } else {
+            if (!isHex(d)) return false;
+            esc--;
+            if (esc === 1) esc = 0;
+          }
+        } else if (d === "\\") esc = 1;
+        else if (d === '"') instr = false;
+        else if (d < " ") return false;
+      } else if (d === '"') instr = true;
+      else if (d < " " && !isWs(d)) return false;
+      else if (d === "{" || d === "[") depth++;
+      else if (d === "}" || d === "]") {
+        depth--;
+        if (depth === 0) {
+          P++;
+          return true;
         }
       }
-      if (ev == "started" || ev == "terminal") print rid, ev, terminal
+      P++;
+    }
+    return false;
+  }
+  const start = P;
+  while (P < N) {
+    const d = S[P];
+    if (d === "," || d === "}" || d === "]" || isWs(d)) break;
+    P++;
+  }
+  const tok = S.slice(start, P);
+  if (tok === "true" || tok === "false" || tok === "null") return true;
+  if (/^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/.test(tok)) return true;
+  return false;
+}
+// scanMembers walks the members of the object at objOpen in one pass,
+// collecting top-level fields into the shared slots (each with a found
+// flag) and the nested object named by wantObj into foundOpen. A later
+// duplicate overwrites only a matching type: a later string replaces an
+// earlier string, and a later object replaces an earlier object, while a
+// later value of another type leaves the earlier value active.
+function scanMembers(objOpen, wantObj) {
+  P = objOpen + 1;
+  skipWs();
+  if (S[P] === "}") return true;
+  while (P < N) {
+    skipWs();
+    if (!parseString()) return false;
+    const key = sval;
+    skipWs();
+    if (S[P] !== ":") return false;
+    P++;
+    skipWs();
+    if (key === wantObj && S[P] === "{") {
+      foundOpen = P;
+      if (!skipValue()) return false;
+    } else if (key === "kind" || key === "run_id" || key === "terminal") {
+      // A value starting with a quote is a string or the line is corrupt:
+      // falling through to skipValue with an advanced cursor would let a
+      // broken string recover as a bare literal.
+      if (S[P] === '"') {
+        if (!parseString() || hasFramingEsc(sval)) return false;
+        if (key === "kind") {
+          fKind = sval;
+          fKindFound = true;
+        } else if (key === "run_id") {
+          fRunid = sval;
+          fRunidFound = true;
+        } else {
+          fTerminal = sval;
+          fTerminalFound = true;
+        }
+      } else if (!skipValue()) return false;
+    } else if (!skipValue()) return false;
+    skipWs();
+    const c = S[P];
+    if (c === "}") return true;
+    if (c !== ",") return false;
+    P++;
+  }
+  return false;
+}
+function resetSlots() {
+  fKind = "";
+  fKindFound = false;
+  fRunid = "";
+  fRunidFound = false;
+  fTerminal = "";
+  fTerminalFound = false;
+  foundOpen = 0;
+}
+function trailingJunk() {
+  return /[^ \t\r]/.test(S.slice(P + 1));
+}
+const batch = [];
+function flush() {
+  if (batch.length === 0) return;
+  // latin1 out: the fold reads bytes and must write bytes, so code points
+  // 0x80-0xFF leave as single bytes exactly like the walk. Sync writes block
+  // on fd 1 instead of leaving the flush to the event loop, so the whole
+  // stream reaches the caller even for large logs.
+  fs.writeFileSync(1, batch.join(""), "latin1");
+  batch.length = 0;
+}
+// foldLine parses one LF-split line exactly like the awk reference walk: a
+// bare CR never separates vendor records, and keeping it inside the line
+// lets strict parsing reject it exactly like the walk.
+function foldLine(rawLine) {
+  S = rawLine;
+  if (!S.includes('"run_id"')) return;
+  if (!S.includes('"run"')) return;
+  if (!S.includes('"started"') && !S.includes('"terminal"')) return;
+  N = S.length;
+  P = 0;
+  skipWs();
+  if (S[P] !== "{") return;
+  resetSlots();
+  if (!scanMembers(P, "payload") || foundOpen === 0) return;
+  if (trailingJunk()) return;
+  const payloadOpen = foundOpen;
+  resetSlots();
+  if (!scanMembers(payloadOpen, "event")) return;
+  if (!fKindFound || fKind !== "run") return;
+  if (!fRunidFound || fRunid === "") return;
+  if (foundOpen === 0) return;
+  const rid = fRunid;
+  const eventOpen = foundOpen;
+  resetSlots();
+  if (!scanMembers(eventOpen, "")) return;
+  if (!fKindFound) return;
+  if (fKind !== "started" && fKind !== "terminal") return;
+  const terminal = fKind === "terminal" && fTerminalFound ? fTerminal : "";
+  batch.push(`${rid}\t${fKind}\t${terminal}\n`);
+  if (batch.length >= 1000) flush();
+}
+(async () => {
+  let stream;
+  try {
+    stream = fs.createReadStream(logPath, streamOpts);
+  } catch {
+    process.exit(1);
+  }
+  stream.on("error", () => process.exit(1));
+  // Fragments of the one unfinished line. Each byte is scanned once, in the
+  // chunk that delivers it, and a completed line joins its fragments a single
+  // time, so a multi-megabyte prompt line costs linear work instead of a
+  // re-scan and re-copy of the whole unfinished line per chunk.
+  let parts = [];
+  for await (const chunk of stream) {
+    let start = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      if (chunk[i] !== 10) continue;
+      const slice = chunk.subarray(start, i);
+      start = i + 1;
+      let lineBuf;
+      if (parts.length === 0) {
+        lineBuf = slice;
+      } else {
+        parts.push(slice);
+        lineBuf = Buffer.concat(parts);
+        parts = [];
+      }
+      // Byte-level pre-filter: the same three substrings the awk reference
+      // scans for, so the candidate set is identical without decoding every
+      // line. Markers are ASCII, so byte search equals code-point search,
+      // and joining before filtering keeps markers split across chunks.
+      if (lineBuf.indexOf('"run_id"') === -1) continue;
+      if (lineBuf.indexOf('"run"') === -1) continue;
+      if (lineBuf.indexOf('"started"') === -1 && lineBuf.indexOf('"terminal"') === -1) continue;
+      foldLine(lineBuf.toString("latin1"));
+    }
+    if (start < chunk.length) parts.push(Buffer.from(chunk.subarray(start)));
+  }
+  if (parts.length > 0) {
+    const lineBuf = Buffer.concat(parts);
+    if (lineBuf.indexOf('"run_id"') !== -1 && lineBuf.indexOf('"run"') !== -1 && (lineBuf.indexOf('"started"') !== -1 || lineBuf.indexOf('"terminal"') !== -1)) foldLine(lineBuf.toString("latin1"));
+  }
+  flush();
+})().catch(() => process.exit(1));
+NODE
+}
+
+# fm_busy_muse_run_events_awk: the reference run_events fold, kept for nodes
+# without node. It prints the same contract as the node fold above.
+fm_busy_muse_run_events_awk() {  # <session-log>
+  [ -f "$1" ] || return 1
+  LC_ALL=C awk '
+    BEGIN { OFS = "\t" }
+    function is_ws(c) { return (c == " " || c == "\t" || c == "\r") }
+    function skip_ws(    c) {
+      while (p <= n) {
+        c = substr(line, p, 1)
+        if (!is_ws(c)) break
+        p++
+      }
+    }
+    # parse_string consumes the JSON string at line[p] into sval (raw inner
+    # text, escapes intact) and advances past its closing quote. It records
+    # the span and slices once, so long prompt strings cost linear time.
+    function is_esc(c) { return (c == "\"" || c == "\\" || c == "/" || c == "b" || c == "f" || c == "n" || c == "r" || c == "t" || c == "u") }
+    function is_hex(c) { return ((c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")) }
+    # has_framing_esc: true when tracked-string raw escapes would decode
+    # to TSV framing. Such a line is rejected outright on both engines:
+    # its contents could alias distinct runs or forge rows for the
+    # downstream fold. The span is walked escape by escape: an escaped
+    # backslash consumes itself, so the literal text after it can never
+    # pose as an escape.
+    function has_framing_esc(span,    i, e, hex) {
+      for (i = 1; i <= length(span); i++) {
+        if (substr(span, i, 1) != "\\") continue
+        e = substr(span, i + 1, 1)
+        if (e == "t" || e == "n" || e == "r") return 1
+        if (e == "u") {
+          hex = tolower(substr(span, i + 2, 4))
+          if (hex == "0009" || hex == "000a" || hex == "000d") return 1
+          i += 5
+        } else i++
+      }
+      return 0
+    }
+    function parse_string(    c, start, esc) {
+      if (substr(line, p, 1) != "\"") return 0
+      p++
+      start = p
+      while (p <= n) {
+        c = substr(line, p, 1)
+        if (c == "\\") {
+          esc = substr(line, p + 1, 1)
+          if (!is_esc(esc)) return 0
+          if (esc == "u") {
+            if (!is_hex(substr(line, p + 2, 1)) || !is_hex(substr(line, p + 3, 1)) || !is_hex(substr(line, p + 4, 1)) || !is_hex(substr(line, p + 5, 1))) return 0
+            p += 6
+          } else p += 2
+          continue
+        }
+        if (c == "\"") { sval = substr(line, start, p - start); p++; return 1 }
+        if (c < " ") return 0
+        p++
+      }
+      return 0
+    }
+    # skip_value consumes one JSON value at line[p], past any whitespace.
+    function skip_value(    c, depth, instr, esc, start, tok) {
+      skip_ws()
+      if (p > n) return 0
+      c = substr(line, p, 1)
+      if (c == "\"") return parse_string()
+      if (c == "{" || c == "[") {
+        depth = 0; instr = 0; esc = 0
+        while (p <= n) {
+          c = substr(line, p, 1)
+          if (instr) {
+            if (esc > 0) {
+              if (esc == 1) {
+                if (!is_esc(c)) return 0
+                esc = (c == "u") ? 5 : 0
+              } else {
+                if (!is_hex(c)) return 0
+                esc--
+                if (esc == 1) esc = 0
+              }
+            } else if (c == "\\") esc = 1
+            else if (c == "\"") instr = 0
+            else if (c < " ") return 0
+          } else if (c == "\"") instr = 1
+          else if ((c < " ") && !is_ws(c)) return 0
+          else if (c == "{" || c == "[") depth++
+          else if (c == "}" || c == "]") {
+            depth--
+            if (depth == 0) { p++; return 1 }
+          }
+          p++
+        }
+        return 0
+      }
+      start = p
+      while (p <= n) {
+        c = substr(line, p, 1)
+        if (c == "," || c == "}" || c == "]" || is_ws(c)) break
+        p++
+      }
+      tok = substr(line, start, p - start)
+      if (tok == "true" || tok == "false" || tok == "null") return 1
+      if (tok ~ /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) return 1
+      return 0
+    }
+    # scan_members walks the members of the object at obj_open in one pass,
+    # collecting top-level fields into the shared f_ slots (each with a
+    # found flag) and the nested object named by want_obj into found_open.
+    # A non-object or missing value leaves its slot unset rather than
+    # failing the line: a record whose kind is not a string is simply not a
+    # run lifecycle record. A later duplicate overwrites only a matching
+    # type: a later string replaces an earlier string, and a later object
+    # replaces an earlier object, while a later value of another type leaves
+    # the earlier value active.
+    function scan_members(obj_open, want_obj,    key, c) {
+      p = obj_open + 1
+      skip_ws()
+      if (substr(line, p, 1) == "}") return 1
+      while (p <= n) {
+        skip_ws()
+        if (!parse_string()) return 0
+        key = sval
+        skip_ws()
+        if (substr(line, p, 1) != ":") return 0
+        p++
+        skip_ws()
+        if (key == want_obj && substr(line, p, 1) == "{") {
+          found_open = p
+          if (!skip_value()) return 0
+        } else if (key == "kind" || key == "run_id" || key == "terminal") {
+          # A value starting with a quote is a string or the line is corrupt:
+          # falling through to skip_value with an advanced cursor would let a
+          # broken string recover as a bare literal. Framing escapes in a
+          # tracked field reject the line for the same reason on both sides.
+          if (substr(line, p, 1) == "\"") {
+            if (!parse_string() || has_framing_esc(sval)) return 0
+            if (key == "kind") { f_kind = sval; f_kind_found = 1 }
+            else if (key == "run_id") { f_runid = sval; f_runid_found = 1 }
+            else { f_terminal = sval; f_terminal_found = 1 }
+          } else if (!skip_value()) return 0
+        } else if (!skip_value()) return 0
+        skip_ws()
+        c = substr(line, p, 1)
+        if (c == "}") return 1
+        if (c != ",") return 0
+        p++
+      }
+      return 0
+    }
+    function trailing_junk(    rest) {
+      rest = substr(line, p + 1)
+      gsub(/[ \t\r]/, "", rest)
+      return (rest != "")
+    }
+    function reset_slots() {
+      f_kind = ""; f_kind_found = 0
+      f_runid = ""; f_runid_found = 0
+      f_terminal = ""; f_terminal_found = 0
+      found_open = 0
+    }
+    {
+      # Fast path only: a lifecycle record always carries the "run_id" key,
+      # the exact "run" kind value, and a "started" or "terminal" event
+      # value, so a line missing any of the three can never match and skips
+      # the character walk. All three are plain index scans at C speed.
+      if (index($0, "\"run_id\"") == 0) next
+      if (index($0, "\"run\"") == 0) next
+      if (index($0, "\"started\"") == 0 && index($0, "\"terminal\"") == 0) next
+      line = $0; n = length(line); p = 1
+      skip_ws()
+      if (substr(line, p, 1) != "{") next
+      reset_slots()
+      if (!scan_members(p, "payload") || found_open == 0) next
+      if (trailing_junk()) next
+      payload_open = found_open
+      reset_slots()
+      if (!scan_members(payload_open, "event")) next
+      if (!f_kind_found || f_kind != "run") next
+      if (!f_runid_found || f_runid == "") next
+      if (found_open == 0) next
+      # Copy the identity out before the event scan resets the shared slots.
+      rid = f_runid
+      event_open = found_open
+      reset_slots()
+      if (!scan_members(event_open, "")) next
+      if (!f_kind_found) next
+      if (f_kind != "started" && f_kind != "terminal") next
+      terminal = (f_kind == "terminal" && f_terminal_found) ? f_terminal : ""
+      print rid, f_kind, terminal
     }
   ' "$1"
 }
@@ -711,10 +1279,10 @@ fm_busy_muse_run_events() {  # <session-log>
 #   busy     at least one run started with no matching terminal
 #   settled  every started run reached a terminal
 #   none     the log holds no run lifecycle records at all
-# The match is anchored on the exact structural prefix rather than a bare
-# "kind":"terminal" search, because muse also emits nested "record":{"kind":
-# "terminal"} cleanup-effect payloads that are NOT run terminals and would
-# otherwise close a run that is still in flight.
+# The match reads top-level payload fields rather than searching for
+# "kind":"terminal", because muse also emits nested "record":{"kind":
+# "terminal"} payloads that are NOT run terminals and would otherwise close a
+# run that is still in flight.
 fm_busy_muse_run_state() {  # <session-log>
   [ -f "$1" ] || return 1
   fm_busy_muse_run_events "$1" | LC_ALL=C awk -F '\t' '
@@ -1000,7 +1568,7 @@ fm_busy_rovo_tail_busy() {
 # fm_busy_agy_tail_busy: the AGY-only temporary rendered-tail fallback.
 # Consumes the tail on stdin; 0 when AGY's verified busy signature matches:
 # the `esc to cancel` token in the status row the TUI pins to the bottom of
-# the pane while a turn runs (verified live on agy 1.2.0; the idle status row
+# the pane while a turn runs (verified live on agy 1.2.7; the idle status row
 # shows `? for shortcuts` instead). The `Generating...` spinner word that
 # renders beside it is deliberately NOT matched: it is a free-floating output
 # line, so ordinary worker output echoing the word would classify an idle
@@ -1119,6 +1687,33 @@ fm_busy_launch_prompt_parked() {  # <harness>
   esac
 }
 
+# fm_busy_agy_status_row: prints AGY's pinned idle status row from the tail on
+# stdin - the `? for shortcuts` shortcuts hint the TUI pins to the bottom of
+# the pane while it waits for input (verified live on agy 1.2.7). Empty output
+# when no such row is present. It reads the LAST matching non-blank line so a
+# `? for shortcuts` string echoed earlier in worker output cannot shadow the
+# real pinned row: the pinned row is always the bottom-most line that carries
+# the hint. This is POSITIVE evidence - unlike the free-floating busy spinner
+# word, the shortcuts hint lives on the row the TUI keeps at the bottom, so it
+# cannot scroll out of the capture the way output can, which is the only reason
+# an idle verdict is safe here at all.
+fm_busy_agy_status_row() {
+  grep -v '^[[:space:]]*$' | grep -iE '\?[[:space:]]+for[[:space:]]+shortcuts' | tail -1
+}
+
+# fm_busy_agy_bg_task: 0 when the AGY status row read on stdin advertises a
+# NON-ZERO background task count - the `N task(s)` field agy appends to the
+# pinned status row while a shell job the worker launched is still running
+# (verified live on agy 1.2.7: `... Gemini 3.8 Flash · high · 1 task(s) ·
+# /tasks`). Such a worker is legitimately waiting on its own job, so this is
+# read as busy, not a wedge. The count must be a non-zero integer, so `0
+# task(s)` and no field at all are not busy. It is applied ONLY to the status
+# row returned by fm_busy_agy_status_row, never the whole tail, so worker
+# output that happens to print "task(s)" cannot read as busy.
+fm_busy_agy_bg_task() {
+  grep -qiE '[1-9][0-9]*[[:space:]]+task\(s\)'
+}
+
 # fm_busy_classify: semantic classification for a task whose endpoint the
 # caller has already established as present. Prints "<verdict> <source>":
 # busy|idle|unknown plus the producing source (see header). Never probes
@@ -1130,7 +1725,7 @@ fm_busy_launch_prompt_parked() {  # <harness>
 # at the fm-spawn seed keeps reading busy fm-spawn, unchanged.
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
-  local out rc r_state r_source native log
+  local out rc r_state r_source native log agy_row
   # t3code first: the T3 server reports the session status for claude and
   # codex alike. Native uncertainty must not fall through to a stale idle
   # record or a harness-specific fallback.
@@ -1284,10 +1879,25 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
           return 0
         fi
       fi
-      # Best-effort like rovo: a long turn can scroll the busy marker out of
-      # the captured tail, so its absence means "can't tell," never idle.
+      # Positive-evidence classification on the status row agy pins to the
+      # bottom of the pane. Absence of the busy marker never means idle on its
+      # own; the idle verdict rests on the pinned `? for shortcuts` row instead:
+      #  - `esc to cancel` present -> a turn is running (busy).
+      #  - the pinned `? for shortcuts` row carries a non-zero `N task(s)`
+      #    count -> a background shell job the worker launched is still running
+      #    and the worker is legitimately waiting on it (busy); this is the
+      #    case supervision must not escalate as a wedge.
+      #  - the pinned `? for shortcuts` row with no task count -> idle.
+      #  - neither token -> the pane is unreadable; fail closed to unknown.
       if printf '%s' "$tail40" | fm_busy_agy_tail_busy; then
         printf 'busy agy-regex'
+      elif agy_row=$(printf '%s' "$tail40" | fm_busy_agy_status_row) \
+        && [ -n "$agy_row" ]; then
+        if printf '%s' "$agy_row" | fm_busy_agy_bg_task; then
+          printf 'busy agy-regex'
+        else
+          printf 'idle agy-regex'
+        fi
       else
         printf 'unknown agy-regex'
       fi

@@ -896,7 +896,7 @@ test_tracked_claude_entries_inert_under_grok() {
   command -v jq >/dev/null 2>&1 || fail "test host must provide jq"
   dir="$TMP_ROOT/claude-entries-grok-inert"
   mkdir -p "$dir/bin"
-  for script in fm-turnend-guard.sh fm-claude-stop-autoarm.sh fm-sessionstart-run.sh \
+  for script in fm-turnend-guard.sh fm-claude-stop-autoarm.sh fm-claude-stop-recovery.sh fm-sessionstart-run.sh \
     fm-arm-pretool-check.sh fm-cd-pretool-check.sh fm-subagent-pretool-check.sh fm-host-mirror.sh \
     fm-stow-guard.sh; do
     printf '#!/usr/bin/env bash\nprintf ran >> %q\n' "$dir/invoked" > "$dir/bin/$script"
@@ -939,7 +939,7 @@ test_tracked_claude_entries_inert_under_grok() {
       || fail "tracked entry for $target ran under a legacy GROK_AGENT environment"
   done < <(jq -r '.hooks[][].hooks[].command' "$ROOT/.claude/settings.json")
 
-  [ "$guarded" -eq 9 ] || fail "expected 9 grok-guarded tracked entries, saw $guarded"
+  [ "$guarded" -eq 11 ] || fail "expected 11 grok-guarded tracked entries, saw $guarded"
   [ "$unguarded" -eq 1 ] || fail "expected 1 documented unguarded tracked entry, saw $unguarded"
   pass "tracked .claude/settings.json entries: $guarded inert under grok, the documented subagent exception still armed, all live under Claude"
 }
@@ -1545,6 +1545,24 @@ SH
   chmod +x "$dir/bin/fm-watch-arm.sh"
 }
 
+write_integrated_recovering_arm() {
+  local dir=$1
+  cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${FM_WATCH_PREDECESSOR_ARM_PID:-}" ]; then
+  printf 'watcher: started pid=%s\n' "$$"
+  exit 0
+fi
+if [ ! -e "$FM_HOME/state/recovery-attempted" ]; then
+  : > "$FM_HOME/state/recovery-attempted"
+  exit 1
+fi
+printf 'pending:downtime:recovered-generation\n' > "$FM_HOME/state/.watcher-down"
+printf 'signal: recovered watcher wake\n'
+SH
+  chmod +x "$dir/bin/fm-watch-arm.sh"
+}
+
 # The 2026-07-21 incident regression: after a spent forced continuation the old
 # one-shot loop guard ALLOWED a blind stop (stop_hook_active=true) while the
 # watcher was already dead. In --claude mode the guard must re-block instead.
@@ -1796,6 +1814,57 @@ test_hook_claude_mode_allows_on_open_generation_claim() {
   pass "fm-turnend-guard --claude: a live open generation claim owns recovery with no lock held"
 }
 
+# Publish only after the guard has exhausted its former eight-poll window.
+# The owner stays alive throughout; poll counting makes the handoff deterministic
+# even on a loaded machine, rather than racing a wall-clock delay.
+test_hook_claude_mode_allows_recovery_startup_before_claim() {
+  local dir pid identity fakebin out status polls
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-starting-claim")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(fm_test_pid_identity "$pid") || fail "could not identify the starting arm owner"
+  printf '%s\n' "$identity" > "$dir/owner-identity"
+  fakebin=$(fm_fakebin "$TMP_ROOT/hook-claude-starting-bin")
+  cat > "$fakebin/sleep" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = 0.1 ]; then
+  polls=$(cat "$FM_CLAIM_HOME/polls" 2>/dev/null || printf 0)
+  polls=$((polls + 1))
+  printf '%s\n' "$polls" > "$FM_CLAIM_HOME/polls"
+  if [ "$polls" -eq 9 ]; then
+    printf 'epoch=1 owner_pid=%s outcome=arming updated_at=%s\n%s\n' \
+      "$FM_CLAIM_PID" "$(date +%s)" "$(cat "$FM_CLAIM_HOME/owner-identity")" \
+      > "$FM_CLAIM_HOME/state/.claude-autoarm-epoch"
+  fi
+fi
+exec /bin/sleep "$@"
+SH
+  chmod +x "$fakebin/sleep"
+  [ ! -e "$dir/state/.claude-autoarm-epoch" ] || fail "claim was published before the guard evaluated"
+  out=$(unset FM_CLAUDE_AUTOARM_SYNC_WAIT_MS; PATH="$fakebin:$PATH" FM_CLAIM_HOME="$dir" FM_CLAIM_PID="$pid" run_hook_claude "$dir" false); status=$?
+  polls=$(cat "$dir/polls")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "the default bounded startup wait must observe a late verified arm claim"
+  [ "$polls" -eq 9 ] || fail "guard did not observe the ninth-poll claim: $polls polls"
+  [ -z "$out" ] || fail "recovery startup forced a continuation: $out"
+  assert_absent "$dir/state/.turnend-claude-blocks" "startup consumed a forced-continuation budget"
+  pass "fm-turnend-guard --claude: default startup wait observes a late verified generation claim"
+}
+
+test_hook_claude_mode_blocks_on_dead_generation_with_fresh_beat() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-claude-dead-fresh")
+  : > "$dir/state/task1.meta"
+  printf 'epoch=464 owner_pid=9999999 outcome=arming updated_at=1\ndead-owner\n' > "$dir/state/.claude-autoarm-epoch"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=200 run_hook_claude "$dir" true); status=$?
+  expect_code 2 "$status" "a dead arming owner cannot allow Stop on a leftover fresh beat"
+  assert_contains "$out" 'TURN WOULD END BLIND' "dead-owner block omitted the diagnostic"
+  pass "fm-turnend-guard --claude: a dead arming owner blocks even with a fresh beacon"
+}
+
 # The same claim gone stuck (entry and beacon both past grace) stops counting
 # as recovery even though its owner is alive and identity-matched.
 test_hook_claude_mode_blocks_on_stuck_generation_claim() {
@@ -1913,14 +1982,21 @@ test_hook_claude_mode_integrated_monotonic_fail_open() {
   }
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
+  # Health alone is insufficient: the replacement arm must actually deliver.
+  write_integrated_recovering_arm "$dir"
   out=$(run_integrated_autoarm "$dir"); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   rm -rf "$dir/state/.watch.lock"
-  expect_code 0 "$status" "positive watcher recovery must make the auto-arm silent"
+  expect_code 2 "$status" "positive attachment recovery must deliver its wake"
+  assert_contains "$out" "signal: recovered watcher wake" "positive recovery abandoned delivery"
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "positive recovery left the failure notice marker"
   assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "positive recovery left the attended alarm marker"
   assert_absent "$dir/state/.turnend-claude-blocks" "positive recovery left the bounded block budget"
+  # Model a later watcher failure, distinct from the just-delivered recovery.
+  touch -t 202001010000 "$dir/state/.claude-autoarm-epoch"
+  printf 'pending:downtime:next-generation\n' > "$dir/state/.watcher-down"
+  write_integrated_failed_arm "$dir"
   guard_out=$(FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=100 run_hook_claude "$dir" false); guard_status=$?
   expect_code 2 "$guard_status" "a guard after one-shot recovery must start a fresh failure budget"
   count=$(sed -n '2s/^count=//p' "$dir/state/.turnend-claude-blocks")
@@ -2065,7 +2141,7 @@ test_hook_claude_mode_concurrent_recovery_resets_are_idempotent() {
   dir=$(make_primary_dir "$TMP_ROOT/hook-claude-concurrent-recovery")
   : > "$dir/state/task1.meta"
   install_integrated_autoarm "$dir"
-  write_integrated_failed_arm "$dir"
+  write_integrated_recovering_arm "$dir"
   seed_claude_budget "$dir" 3
   : > "$dir/state/.claude-autoarm-failure-notified"
   : > "$dir/state/.claude-autoarm-failure-alarmed"
@@ -2241,19 +2317,21 @@ SH
     assert_not_contains "$(cat "$dir/auto-$i.out")" 'FIRSTMATE SUPERVISION IS GENUINELY DOWN' "the attended alarm repeated after commit ($variant, stop $i)"
   done
   # Positive recovery clears the whole episode - notice, alarm, and budget - so
-  # the next failure episode restarts its own attended budget. The recovery
-  # cycle closes non-actionably beside the verified healthy watcher.
+  # the next failure episode restarts its own attended budget. Health alone is
+  # insufficient: the replacement arm must attach to the verified healthy
+  # watcher and deliver its wake.
   : > "$dir/config/supervision-host-off"
-  printf '#!/usr/bin/env bash\nprintf '"'"'watcher: FAILED - persistent fixture failure\\n'"'"'\nexit 1\n' > "$dir/bin/fm-watch-arm.sh"
+  write_integrated_recovering_arm "$dir"
   sleep 60 &
   pid=$!
   identity=$(watcher_identity "$dir" "$pid") || fail "could not identify recovery watcher"
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
-  auto_status=$(FM_CLAUDE_AUTOARM_ATTEMPTS=1 run_integrated_autoarm "$dir" > "$dir/auto-recovery.out"; printf '%s' "$?")
+  auto_status=$(run_integrated_autoarm "$dir" > "$dir/auto-recovery.out"; printf '%s' "$?")
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  expect_code 0 "$auto_status" "a healthy watcher must close the alarmed episode cleanly ($variant)"
+  expect_code 2 "$auto_status" "positive attachment recovery must deliver its wake ($variant)"
+  assert_contains "$(cat "$dir/auto-recovery.out")" "signal: recovered watcher wake" "positive recovery abandoned delivery ($variant)"
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "positive recovery left the failure notice ($variant)"
   assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "positive recovery left the attended alarm ($variant)"
   assert_absent "$dir/state/.turnend-claude-blocks" "positive recovery left the block budget ($variant)"
@@ -2729,6 +2807,8 @@ test_hook_claude_mode_blocks_on_pid_reused_arming_claim
 test_hook_claude_mode_blocks_on_stuck_arming_claim
 test_hook_claude_mode_allows_on_open_generation_claim
 test_hook_claude_mode_blocks_on_stuck_generation_claim
+test_hook_claude_mode_allows_recovery_startup_before_claim
+test_hook_claude_mode_blocks_on_dead_generation_with_fresh_beat
 test_hook_claude_mode_terminal_fail_open_clears_abandoned_claim
 test_hook_claude_mode_preserves_fresh_failed_progression
 test_hook_claude_mode_integrated_monotonic_fail_open

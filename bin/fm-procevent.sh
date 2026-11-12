@@ -66,8 +66,15 @@
 #            registered until its owner concludes it with `handled`.
 # reconcile  Idempotent liveness entry the watcher calls on its ordinary cycle:
 #            republish every durably captured result with no handled
-#            acknowledgement yet - regardless of any earlier publication - and
-#            start a runner for any registered source that has no live owner and
+#            acknowledgement yet, regardless of any earlier publication.
+#            Defer fresh self-announcing built-in results for
+#            FM_PROCEVENT_SELF_ANNOUNCE_GRACE_SECS (default 60, 0 disables;
+#            malformed values use the default) so their runner can autohandle
+#            first. Task-owned results bypass this grace. After it expires,
+#            unhandled results are republished even if their runner crashed.
+#            Future-dated captures are republished immediately, so a backward
+#            clock step cannot extend the grace.
+#            Start a runner for any registered source that has no live owner and
 #            no open task-owned round. This is liveness repair only - it never
 #            discovers results by
 #            polling the source, because the child blocks on the source itself.
@@ -178,7 +185,7 @@
 # adapter keeps the strict publish-before-apply order, because without a
 # declared downstream channel an applied-and-acknowledged result would otherwise
 # go silent. An unhandled result stays eligible for bounded re-announcement on
-# every reconcile in both modes, exactly as before.
+# every reconcile in both modes, after the startup grace described above.
 #
 # Polling again is adapter-owned through the same kind of seam. An adapter that
 # answers exit 0 to `bin/fm-procevent-<adapter>.sh relisten` keeps this runner
@@ -219,11 +226,12 @@
 # spawns - running with nobody left to reap it. So every runner starts a small
 # guard beside it, in its own separate process group, which re-reads the owning
 # state root's lease on a bounded cadence and stops the runner's whole process
-# group once that lease can no longer be proved fresh. Owner-presence operations
-# refresh the lease, an attached public start keeps it fresh while its caller
+# group once neither that lease nor the home's verified lock holder proves
+# presence. Owner-presence operations refresh the lease, an attached public start keeps it fresh while its caller
 # remains attached, and the watcher's reconcile cycle keeps it fresh in a live
-# home. A runner exports the inherited FM_PROCEVENT_IN_RUNNER marker and every
-# refresh is skipped under it, so a runner and its ordinary children do not
+# home. The guard also accepts a live home lock holder independently of those
+# refreshes, without writing the lease. A runner exports the inherited
+# FM_PROCEVENT_IN_RUNNER marker and every refresh is skipped under it, so a runner and its ordinary children do not
 # certify their own owner. That rule is CONFUSED-AGENT-GRADE, the grade
 # bin/fm-lease-lib.sh documents: a source that DELIBERATELY strips the marker
 # can still refresh, and adversarial-grade unforgeability is out of scope (see
@@ -900,11 +908,22 @@ EOF
   return "$status"
 }
 
-publish_pending() {  # [result-file-to-skip]
-  local skip=${1-} result published=0
+publish_pending() {  # [result-file-to-skip] [self-announcing-grace-seconds]
+  local skip=${1-} grace=${2:-0} result adapter age published=0
   while IFS= read -r result; do
     [ -n "$result" ] || continue
     [ "$result" = "$skip" ] && continue
+    # Only reconcile supplies a grace: start still owns its immediate
+    # post-autohandle publish. A capture's immutable owner, not the current
+    # registration, decides whether it is a built-in or task-owned round.
+    if [ "$grace" -gt 0 ] && age=$(fm_path_age "$result") \
+      && [ "$age" -ge 0 ] && [ "$age" -lt "$grace" ] \
+      && [ ! -e "${result%.result}.extension" ] && [ ! -L "${result%.result}.extension" ] \
+      && [ -z "$(fm_procevent_result_owner_task "$result" 2>/dev/null || true)" ] \
+      && adapter=$(fm_procevent_result_adapter "$result" 2>/dev/null) \
+      && adapter_self_announcing "$adapter"; then
+      continue
+    fi
     if publish_result "$result"; then
       published=$((published + 1))
     fi
@@ -1505,10 +1524,80 @@ start_owner_guard() {  # <source-id>
   return 1
 }
 
+# A live lock holder is independent owner evidence only when its acquisition
+# recorded this process-start identity. An old pid alone is not proof. The
+# provenance check follows ancestry across group changes and rejects the
+# inherited runner marker even after a detached child has been reparented.
+# New acquisitions record the inherited marker before environment inspection
+# can become unavailable. Legacy records require readable holder environment.
+# Unreadable identity, ancestry, or provenance falls back to the lease.
+owner_process_independent() {  # <holder-pid> <runner-pid> <acquisition-provenance>
+  local holder=$1 candidate=$1 parent depth=0
+  if fm_win_untag_pid "$holder" >/dev/null; then
+    [ "${3:-}" = independent ]
+    return
+  fi
+  while [ "$candidate" -gt 1 ] && [ "$depth" -lt 128 ]; do
+    [ "$candidate" != "$2" ] && [ "$candidate" != "$$" ] || return 1
+    parent=$(ps -o ppid= -p "$candidate" 2>/dev/null | tr -d '[:space:]') || return 1
+    case "$parent" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$parent" != "$candidate" ] && [ "$parent" -gt 0 ] || return 1
+    candidate=$parent
+    depth=$((depth + 1))
+  done
+  [ "$candidate" -eq 1 ] || return 1
+  case "${3:-}" in
+    independent) return 0 ;;
+    '') ;; # Legacy two-line record: require live environment evidence below.
+    *) return 1 ;;
+  esac
+  if [ -d /proc/self ]; then
+    # Never print environment bytes: only the predicate's exit status escapes.
+    perl -e '
+      open my $in, "<", $ARGV[0] or exit 1;
+      local $/; my $env = <$in>;
+      defined($env) && length($env) or exit 1;
+      my $marked = grep { $_ eq "FM_PROCEVENT_IN_RUNNER=1" } split /\0/, $env;
+      exit($marked ? 1 : 0);
+    ' "/proc/$holder/environ"
+  else
+    # BSD ps exposes the inherited environment after argv. Require a visible
+    # PATH entry as evidence that environment inspection succeeded, and treat
+    # an ambiguous marker in argv conservatively as runner provenance too.
+    (
+      set -o pipefail
+      ps eww -p "$holder" -o command= 2>/dev/null | perl -e '
+        local $/; my $env = <STDIN>;
+        defined($env) && length($env) or exit 1;
+        $env =~ /(?:^|\s)PATH=\S+/ or exit 1;
+        exit($env =~ /(?:^|\s)FM_PROCEVENT_IN_RUNNER=1(?:\s|$)/ ? 1 : 0);
+      '
+    )
+  fi
+}
+
+owner_lock_present() {  # <runner-pid>
+  local holder identity recorded_pid recorded_identity provenance sidecar="$STATE/.lock-identity"
+  fm_session_lock_inspect "$STATE"
+  [ "$FM_LOCK_INSPECT_STATE" = held ] || return 1
+  holder=$FM_LOCK_INSPECT_PID
+  [ -f "$sidecar" ] && [ ! -L "$sidecar" ] || return 1
+  recorded_pid=$(sed -n '1p' "$sidecar") || return 1
+  recorded_identity=$(sed -n '2p' "$sidecar") || return 1
+  [ "$recorded_pid" = "$holder" ] && [ -n "$recorded_identity" ] || return 1
+  identity=$(fm_session_pid_identity "$holder") || return 1
+  [ "$identity" = "$recorded_identity" ] || return 1
+  provenance=$(sed -n '3p' "$sidecar") || return 1
+  owner_process_independent "$holder" "$1" "$provenance" || return 1
+  # Recheck after the provenance walk so a changing holder cannot borrow it.
+  [ "$(sed -n '1p' "$STATE/.lock" 2>/dev/null)" = "$holder" ] || return 1
+  [ "$(fm_session_pid_identity "$holder")" = "$identity" ]
+}
+
 # The runner's owner guard, which bounds an accidentally orphaned detached
 # runner after its home ends. It revalidates the recorded physical state root
-# and its lease on a bounded cadence and, after two consecutive reads cannot prove
-# both, invokes the identity-gated stop for the runner's whole process group -
+# and owner presence on a bounded cadence and, after two consecutive reads
+# cannot prove both, invokes the identity-gated stop for the runner's whole group -
 # which is what reaches the blocking child and everything that child spawned,
 # exactly as retirement does. A failed verified stop stays on the retry cadence;
 # an absent leader ends the guard without signalling an ambiguous group.
@@ -1526,6 +1615,8 @@ start_owner_guard() {  # <source-id>
 cmd_owner_watchdog() {  # <source-id> <runner-pid> <runner-identity> <ready-file> <state-device> <state-inode>
   local id=${1-} pid=${2-} identity=${3-} ready=${4-} state_device=${5-} state_inode=${6-}
   local lease tick half misses=0 pid_state state_identity current_device current_inode
+  # shellcheck source=bin/fm-session-lock-lib.sh
+  . "$SCRIPT_DIR/fm-session-lock-lib.sh"
   [ "$#" -eq 6 ] || usage
   fm_procevent_source_id_valid "$id" || die "source id must be path-safe: $id"
   case "$pid" in ''|*[!0-9]*) die "runner pid must be a positive integer: $pid" ;; esac
@@ -1578,7 +1669,7 @@ cmd_owner_watchdog() {  # <source-id> <runner-pid> <runner-identity> <ready-file
       || IFS=$'\t' read -r _ current_device current_inode _ _ <<< "$state_identity"
     if [ "$current_device" = "$state_device" ] \
       && [ "$current_inode" = "$state_inode" ] \
-      && fm_procevent_owner_alive "$STATE" "$lease"; then
+      && { owner_lock_present "$pid" || fm_procevent_owner_alive "$STATE" "$lease"; }; then
       misses=0
       continue
     fi
@@ -1713,14 +1804,16 @@ stranded_leaderless_detail() {  # <source-id>
 cmd_reconcile() {
   local rec id published started=0 stopped=0 uncertain=0 failed=0 claim owner pid token identity claim_state stop_state task_pending
   local launch_identity launch_stamp launch_mark unconfirmed entry
+  local self_announce_grace=${FM_PROCEVENT_SELF_ANNOUNCE_GRACE_SECS:-60}
   local -a launched=()
+  case "$self_announce_grace" in ''|*[!0-9]*) self_announce_grace=60 ;; esac
   # Rejected before anything is launched, and by name. A window this command
   # cannot use makes every launch unconfirmable, so validating it later would
   # report a fleet of perfectly healthy runners as `failed=` and blame nothing.
   fm_procevent_launch_confirm_seconds >/dev/null \
     || die "FM_PROCEVENT_LAUNCH_CONFIRM_SECONDS must be whole seconds from $FM_PROCEVENT_LAUNCH_CONFIRM_MIN_SECONDS to $FM_PROCEVENT_LAUNCH_CONFIRM_MAX_SECONDS"
   owner_lease_refresh
-  published=$(publish_pending)
+  published=$(publish_pending '' "$self_announce_grace")
 
   # Stop a runner this home owns whose source is no longer registered. Without
   # this, unregistering a source that never completes leaves its child blocked

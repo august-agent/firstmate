@@ -57,6 +57,31 @@ fm_current_pid() {  # [output-variable]
   fi
 }
 
+fm_pid_zombie() {  # <pid>
+  local pid=$1 proc_root stat_line state
+  local -a stat_fields
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
+  if [ -r "$proc_root/$pid/stat" ]; then
+    stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
+    read -r -a stat_fields <<< "${stat_line##*)}"
+    # Explicit verdicts: a bare `return` after this test yields 0 inside an
+    # EXIT trap on bash 5.2, which made trap-context callers read every live
+    # pid as a zombie. Never collapse this back to a trailing bare return.
+    if [ "${stat_fields[0]:-}" = Z ]; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+  state=$(ps -o stat= -p "$pid" 2>/dev/null) || return 1
+  state=${state#"${state%%[![:space:]]*}"}
+  case "$state" in Z*) return 0 ;; esac
+  return 1
+}
+
 # Fork-free stand-in for `$(date +%s)` on the watcher, drain, and lock paths
 # that read the clock every cycle.
 # printf's %(...)T is a bash 4.2 builtin; stock macOS Bash 3.2 still forks date.
@@ -71,7 +96,9 @@ fm_pid_alive() {
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null || return 1
+  fm_pid_zombie "$pid" && return 1
+  return 0
 }
 
 # Store field 22 of a Linux-compatible /proc stat file (the process start in
@@ -518,6 +545,15 @@ fm_watcher_supervision_verdict() {
   esac
   model=$(fm_supervision_model)
   if [ "$model" = autoarm ]; then
+    # A leftover fresh beat cannot excuse a demonstrably abandoned arm.
+    # Cursor keeps its between-turn grace even after switching from Claude.
+    if fm_autoarm_ledger_read "$state" && [ "$FM_AUTOARM_OUTCOME" = arming ] \
+      && ! fm_autoarm_claim_open "$state" "$grace" \
+      && [ "$("$FM_WAKE_LIB_DIR/fm-harness.sh" 2>/dev/null)" != cursor ] \
+      && ! fm_watcher_healthy "$state" "$watch" "$grace" "$home"; then
+      FM_WATCHER_VERDICT_REASON=no-watcher
+      return 0
+    fi
     if [ "$fresh" = true ] || fm_autoarm_midturn_healthy "$state" "$grace"; then
       FM_WATCHER_VERDICT_OK=true
     fi
@@ -547,6 +583,8 @@ fm_lock_clean_known_files() {
     "$lockdir/fm-home" \
     "$lockdir/pid-identity" \
     "$lockdir/pid-start" \
+    "$lockdir/claude-session" \
+    "$lockdir/complete" \
     "$lockdir/role" \
     "$lockdir/watcher-path" \
     2>/dev/null || true
@@ -2088,26 +2126,24 @@ fm_failure_episode_reset() {
 #     identity is MANDATORY: a claimant that cannot record it does not claim
 #     (continuity falls to the synchronous guard), and the identity is read
 #     from the ledger entry alone - never substituted from any lock - so a
-#     reused pid can never authenticate someone else's stale entry. Line 3 of an
-#     arming entry that recorded owner_session_id is the session-lock identity
-#     of the holder the claim was taken under, read by the session-lock bridge
-#     when the holder is a tagged Windows pid.
+#     reused pid can never authenticate someone else's stale entry. Supervised
+#     claims also record transport_pid on line 1 and its identity on line 3;
+#     both must remain live and match for that claim to be open. Line 3 of a
+#     transport-less arming entry (or line 4 when transport identity occupies
+#     line 3) is the session-lock identity of the holder the claim was taken
+#     under, read by the session-lock bridge when the holder is a tagged
+#     Windows pid.
 #   - A claim is OPEN (fm_autoarm_claim_open) while its outcome is "arming",
 #     its owner pid is alive, its recorded identity successfully recomputes
-#     and matches that pid, its owner is still REACHABLE by its session -
-#     either it DESCENDS from the numeric session-lock pid (state/.lock line 1)
-#     or, for a tagged Windows session-lock pid that is outside the local
-#     process table, its recorded owner_session_id matches the trusted session
-#     id beside that lock (state/.lock-session) WHILE the recorded pid-identity
-#     of the lock holder it claimed under (entry line 3) still recomputes from
-#     the lock's current holder pid. A missing or malformed lock means no
-#     session can receive a rewake. The id signal is the second one
-#     the claiming hook's own admission accepts (fm_session_lock_owned_by_self),
-#     so a background session whose bridge is recycled mid-cycle keeps its live
-#     claim; pinning it to the recorded lock-holder identity is what keeps a
-#     resumed session - same conversation id, new process - from reading its own
-#     dead predecessor's orphan as open, even when that new process reuses the
-#     dead holder's pid number - and it is not STUCK - stuck meaning both the
+#     and matches that pid, its supervising transport (when recorded) is alive
+#     and matches its recorded identity or its owner is still REACHABLE by its
+#     session - either it DESCENDS from the numeric session-lock pid
+#     (state/.lock line 1), its recorded anchor matches the current holder pid
+#     and identity, or for a tagged Windows session-lock pid its recorded
+#     owner_session_id matches the trusted session id beside that lock
+#     (state/.lock-session) while the recorded lock-holder identity still
+#     recomputes from the lock's current holder pid - and it is not STUCK -
+#     stuck meaning both the
 #     ledger entry and the watcher beacon (state/.last-watcher-beat) are older
 #     than the guard grace, which proves the owner hung mid-arm with nothing
 #     supervising (every legitimate arming phase with no watcher is bounded in
@@ -2116,12 +2152,7 @@ fm_failure_episode_reset() {
 #     session exited mid-cycle stays alive, reparented to init, with no parent
 #     to receive its exit 2, so deferring to it leaves the home deaf until a
 #     captain turn (tests/fm-claude-stop-autoarm.test.sh,
-#     test_orphaned_claim_from_dead_session_is_superseded_by_replacement). Such
-#     an orphan fails both signals: it no longer descends from the replacement's
-#     lock pid, and its recorded lock-holder identity is the dead session's,
-#     whichever id the sidecar carries after lock recovery. An entry written by
-#     a build before these fields existed records neither and falls back to the
-#     descent signal alone.
+#     test_orphaned_claim_from_dead_session_is_superseded_by_replacement).
 #     For a firing that names its Claude session, a claim recorded under a
 #     different claude_session is not open either: Claude delivers a hook's
 #     exit-2 rewake to the session that launched it, so a claim from a session
@@ -2200,11 +2231,17 @@ _fm_autoarm_epoch_field() {  # <epoch-file> <field>
 # Parse the current ledger claim. Sets FM_AUTOARM_GEN, FM_AUTOARM_OWNER,
 # FM_AUTOARM_OUTCOME, FM_AUTOARM_SESSION, FM_AUTOARM_RECOVERY,
 # FM_AUTOARM_OWNER_SESSION_ID, FM_AUTOARM_CLAUDE_SESSION (empty for an entry
-# that recorded none), FM_AUTOARM_OWNER_LOCK_IDENTITY (line 3 of the
-# entry: the session-lock identity of the holder as the claim was taken), and
+# that recorded none), FM_AUTOARM_OWNER_LOCK_IDENTITY,
+# FM_AUTOARM_TRANSPORT, FM_AUTOARM_TRANSPORT_IDENTITY,
+# FM_AUTOARM_SESSION_IDENTITY, and
 # FM_AUTOARM_IDENTITY (line 2 of the entry, and ONLY
 # line 2 - identity is never substituted from a lock, so a transient
 # micro-mutex hold or a reused pid can never authenticate a stale entry).
+# FM_AUTOARM_SESSION is the lock holder the entry is bound to: the anchor
+# recorded at claim time on arming entries, the committing session on terminal
+# ones. FM_AUTOARM_SESSION_IDENTITY is the anchor's recorded process identity
+# (line 4, arming entries only): it proves the bound holder is still the same
+# process, so a reused pid number cannot impersonate a dead session.
 fm_autoarm_ledger_read() {  # <state-dir>
   local state=$1 epoch
   epoch="$state/.claude-autoarm-epoch"
@@ -2217,6 +2254,9 @@ fm_autoarm_ledger_read() {  # <state-dir>
   FM_AUTOARM_CLAUDE_SESSION=
   FM_AUTOARM_OWNER_LOCK_IDENTITY=
   FM_AUTOARM_IDENTITY=
+  FM_AUTOARM_TRANSPORT=
+  FM_AUTOARM_TRANSPORT_IDENTITY=
+  FM_AUTOARM_SESSION_IDENTITY=
   FM_AUTOARM_GEN=$(_fm_autoarm_epoch_field "$epoch" epoch) || return 1
   FM_AUTOARM_OWNER=$(_fm_autoarm_epoch_field "$epoch" owner_pid) || return 1
   FM_AUTOARM_OUTCOME=$(_fm_autoarm_epoch_field "$epoch" outcome) || return 1
@@ -2224,11 +2264,19 @@ fm_autoarm_ledger_read() {  # <state-dir>
   FM_AUTOARM_RECOVERY=$(_fm_autoarm_epoch_field "$epoch" recovery_generation 2>/dev/null || true)
   FM_AUTOARM_OWNER_SESSION_ID=$(_fm_autoarm_epoch_field "$epoch" owner_session_id 2>/dev/null || true)
   FM_AUTOARM_CLAUDE_SESSION=$(_fm_autoarm_epoch_field "$epoch" claude_session 2>/dev/null || true)
+  FM_AUTOARM_TRANSPORT=$(_fm_autoarm_epoch_field "$epoch" transport_pid 2>/dev/null || true)
+  FM_AUTOARM_TRANSPORT_IDENTITY=$(sed -n '3p' "$epoch" 2>/dev/null || true)
+  FM_AUTOARM_SESSION_IDENTITY=$(sed -n '4p' "$epoch" 2>/dev/null || true)
+  if [ -n "$FM_AUTOARM_TRANSPORT" ]; then
+    FM_AUTOARM_OWNER_LOCK_IDENTITY=$FM_AUTOARM_SESSION_IDENTITY
+  else
+    FM_AUTOARM_OWNER_LOCK_IDENTITY=${FM_AUTOARM_SESSION_IDENTITY:-$FM_AUTOARM_TRANSPORT_IDENTITY}
+    [ -n "$FM_AUTOARM_SESSION_IDENTITY" ] || FM_AUTOARM_SESSION_IDENTITY=$FM_AUTOARM_TRANSPORT_IDENTITY
+  fi
   case "$FM_AUTOARM_GEN" in
     ''|*[!0-9]*) return 1 ;;
   esac
   FM_AUTOARM_IDENTITY=$(sed -n '2p' "$epoch" 2>/dev/null || true)
-  FM_AUTOARM_OWNER_LOCK_IDENTITY=$(sed -n '3p' "$epoch" 2>/dev/null || true)
   return 0
 }
 
@@ -2272,16 +2320,35 @@ fm_autoarm_claim_open() {  # <state-dir> [grace] [claude-session]
   current=$(fm_pid_identity "$FM_AUTOARM_OWNER" 2>/dev/null) || return 1
   [ -n "$current" ] || return 1
   [ "$current" = "$FM_AUTOARM_IDENTITY" ] || return 1
-  lock_pid=$(sed -n '1p' "$state/.lock" 2>/dev/null || true)
-  _fm_wake_require_session_lock
-  fm_session_pid_valid "$lock_pid" || return 1
-  if ! fm_pid_descends_from "$FM_AUTOARM_OWNER" "$lock_pid"; then
-    [ -n "$FM_AUTOARM_OWNER_SESSION_ID" ] || return 1
-    [ -n "$FM_AUTOARM_OWNER_LOCK_IDENTITY" ] || return 1
-    lock_identity=$(fm_session_pid_identity "$lock_pid" 2>/dev/null) || return 1
-    [ "$lock_identity" = "$FM_AUTOARM_OWNER_LOCK_IDENTITY" ] || return 1
-    recorded=$(fm_session_lock_recorded_session_id "$state" 2>/dev/null || true)
-    [ -n "$recorded" ] && [ "$recorded" = "$FM_AUTOARM_OWNER_SESSION_ID" ] || return 1
+  if [ -n "$FM_AUTOARM_TRANSPORT" ]; then
+    fm_pid_alive "$FM_AUTOARM_TRANSPORT" || return 1
+    [ -n "$FM_AUTOARM_TRANSPORT_IDENTITY" ] || return 1
+    current=$(fm_pid_identity "$FM_AUTOARM_TRANSPORT" 2>/dev/null) || return 1
+    [ "$current" = "$FM_AUTOARM_TRANSPORT_IDENTITY" ] || return 1
+  else
+    _fm_wake_require_session_lock
+    lock_pid=$(sed -n '1p' "$state/.lock" 2>/dev/null || true)
+    lock_pid=${lock_pid%%$'\n'*}
+    if [ -n "$lock_pid" ] && fm_pid_descends_from "$FM_AUTOARM_OWNER" "$lock_pid" 2>/dev/null; then
+      :
+    elif [ -n "$FM_AUTOARM_OWNER_SESSION_ID" ]; then
+      fm_session_pid_valid "$lock_pid" || return 1
+      [ -n "$FM_AUTOARM_OWNER_LOCK_IDENTITY" ] || return 1
+      lock_identity=$(fm_session_pid_identity "$lock_pid" 2>/dev/null) || return 1
+      [ "$lock_identity" = "$FM_AUTOARM_OWNER_LOCK_IDENTITY" ] || return 1
+      recorded=$(fm_session_lock_recorded_session_id "$state" 2>/dev/null || true)
+      [ -n "$recorded" ] && [ "$recorded" = "$FM_AUTOARM_OWNER_SESSION_ID" ] || return 1
+    elif [ -n "$FM_AUTOARM_SESSION" ] && [ "$FM_AUTOARM_SESSION" = "$lock_pid" ] \
+      && [ -n "$FM_AUTOARM_SESSION_IDENTITY" ] \
+      && current=$(fm_session_pid_identity "$lock_pid" 2>/dev/null) \
+      && [ -n "$current" ] && [ "$current" = "$FM_AUTOARM_SESSION_IDENTITY" ]; then
+      :
+    elif [ -z "$FM_AUTOARM_SESSION" ] && [ -z "$FM_AUTOARM_SESSION_IDENTITY" ] \
+      && [ -z "$lock_pid" ]; then
+      :
+    else
+      return 1
+    fi
   fi
   if [ "$(fm_path_age "$epoch")" -ge "$grace" ] \
     && [ "$(fm_path_age "$state/.last-watcher-beat")" -ge "$grace" ]; then
@@ -2342,13 +2409,16 @@ fm_autoarm_session_matches() {  # <state-dir> <identity> [recorded-session-id]
 }
 
 # Atomically publish this process as the owner of generation N+1, under one
+# Atomically publish this process as the owner of generation N+1, under one
 # short micro-mutex hold, recording the claimant's Claude session when it names
 # one (an id outside [A-Za-z0-9._-] is recorded as none). Returns 0 with
 # FM_AUTOARM_MY_GEN set on success, 2 when a competing claimant won the race
 # (the ledger holds a claim open to this session), and 1 when the micro-mutex
 # is contended, the mandatory identity cannot be computed, or the write failed.
-fm_autoarm_claim_next() {  # <state-dir> [grace] [claude-session]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} claude_session=${3:-} lock epoch pid gen identity session_id lock_pid lock_identity tmp interrupted_identity interrupted_session
+# An optional expected generation restricts recovery to that still-arming,
+# abandoned generation under the same mutex.
+fm_autoarm_claim_next() {  # <state-dir> [grace] [claude-session] [expected-abandoned-generation]
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} claude_session=${3:-} expected=${4:-${FM_CLAUDE_AUTOARM_EXPECTED_GEN:-}} lock epoch pid gen identity session_id lock_pid lock_identity tmp transport='' transport_identity='' anchor_pid anchor_identity interrupted_identity interrupted_session
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
@@ -2361,6 +2431,12 @@ fm_autoarm_claim_next() {  # <state-dir> [grace] [claude-session]
   pid=${BASHPID:-$$}
   identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
+  if [ "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" = "$PPID" ]; then
+    transport_identity=${FM_CLAUDE_AUTOARM_TRANSPORT_IDENTITY:-}
+    [ -n "$transport_identity" ] || return 1
+    [ "$(fm_pid_identity "$PPID" 2>/dev/null)" = "$transport_identity" ] || return 1
+    transport=" transport_pid=$PPID"
+  fi
   _fm_wake_require_session_lock
   session_id=$(fm_session_lock_trusted_session_id 2>/dev/null || true)
   case "$session_id" in
@@ -2370,6 +2446,15 @@ fm_autoarm_claim_next() {  # <state-dir> [grace] [claude-session]
   lock_identity=$(fm_session_pid_identity "$lock_pid" 2>/dev/null || true)
   [ -n "$lock_identity" ] || session_id=
   fm_lock_try_acquire "$lock" || return 1
+  # A recovery monitor may only replace the exact abandoned arming generation
+  # it observed. A terminal commit or another claimant wins this race.
+  if [ -n "$expected" ]; then
+    if ! fm_autoarm_ledger_read "$state" || [ "$FM_AUTOARM_GEN" != "$expected" ] \
+      || [ "$FM_AUTOARM_OUTCOME" != arming ]; then
+      fm_lock_release "$lock"
+      return 2
+    fi
+  fi
   if fm_autoarm_claim_open "$state" "$grace" "$claude_session"; then
     fm_lock_release "$lock"
     return 2
@@ -2391,14 +2476,31 @@ fm_autoarm_claim_next() {  # <state-dir> [grace] [claude-session]
     ''|*[!0-9]*) gen=0 ;;
   esac
   gen=$((gen + 1))
+  # Bind the claim to the session holding the lock right now: the anchor pid
+  # (session_pid) plus its process identity (line 4). A later firing without a
+  # supervising transport stays deferred only while this anchor still answers,
+  # so a dead session's orphaned claim cannot hold the home deaf. Recording is
+  # mandatory: without an anchor the entry could never prove its session is
+  # gone, so a lock that cannot be read or identified refuses the claim and
+  # the next firing retries.
+  anchor_pid=${lock_pid%%$'\n'*}
+  anchor_identity=$lock_identity
+  if [ -z "$anchor_pid" ] || [ -z "$anchor_identity" ]; then
+    fm_lock_release "$lock"
+    return 1
+  fi
   tmp="$epoch.tmp.$pid"
+  # session_pid, owner_session_id, and claude_session precede the optional
+  # transport_pid so a fenced entry still ends with transport_pid, which the
+  # hook transport's retry-fence match (bin/fm-claude-stop-autoarm.sh) anchors
+  # at end of line.
   if ! {
-      printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s' \
-        "$gen" "$pid" "$(date +%s)"
+      printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s session_pid=%s' \
+        "$gen" "$pid" "$(date +%s)" "$anchor_pid"
       [ -z "$session_id" ] || printf ' owner_session_id=%s' "$session_id"
       [ -z "$claude_session" ] || printf ' claude_session=%s' "$claude_session"
-      printf '\n%s\n' "$identity"
-      [ -z "$session_id" ] || printf '%s\n' "$lock_identity"
+      [ -z "$transport" ] || printf '%s' "$transport"
+      printf '\n%s\n%s\n%s\n' "$identity" "${transport_identity:-$anchor_identity}" "$anchor_identity"
     } > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$epoch" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     fm_lock_release "$lock"

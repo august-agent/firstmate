@@ -2180,6 +2180,7 @@ for (const message of [
   }
 }
 aborted = false;
+// Pi 1.2.0 opens the dedicated processing run through the custom-event path, carrying the message and no prompt.
 await fire("before_agent_start", { messageType: "custom", message: processingMsg }, abortCtx);
 await fire("agent_start", {}, defaultSessionCtx);
 const openedByRequest = await fire("context", { messages: [...history, processingMsg] }, abortCtx);

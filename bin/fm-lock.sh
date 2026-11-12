@@ -36,6 +36,14 @@
 # the sidecar, as for a line 1 in the ancestry, and a later acquisition
 # re-anchors.
 #
+# state/.lock-identity is published only after an acquisition or confirmed-own
+# acquisition verifies the lock. Its first two lines are that holder's pid and the
+# process-start identity from fm_session_pid_identity. Line 3 records acquisition
+# provenance: independent when FM_PROCEVENT_IN_RUNNER is unset, otherwise
+# process-event. Readers must match the pid and identity; an
+# absent or stale sidecar adds no owner-presence evidence. Atomic replacement
+# under the claim lock keeps partial records from certifying a reused pid.
+#
 # Usage: fm-lock.sh           acquire; exit 1 unless ownership is verified
 #        fm-lock.sh status    print holder and liveness; always exits 0.
 #                             A held lock is not proof the holder is consuming
@@ -198,6 +206,24 @@ publish_lock_session_or_die() {
   exit 1
 }
 
+publish_lock_identity() {  # <verified-holder-pid>
+  local identity tmp provenance=process-event
+  [ "${FM_PROCEVENT_IN_RUNNER+x}" = x ] || provenance=independent
+  identity=$(fm_session_pid_identity "$1") || return 1
+  [ -n "$identity" ] || return 1
+  tmp=$(mktemp "$STATE/.lock-identity.XXXXXX") || return 1
+  if ! { printf '%s\n%s\n%s\n' "$1" "$identity" "$provenance" > "$tmp" && mv -f "$tmp" "$STATE/.lock-identity"; }; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+publish_lock_identity_or_die() {
+  publish_lock_identity "$1" && return 0
+  echo "error: cannot record lock holder process identity; operate read-only until resolved" >&2
+  exit 1
+}
+
 # This session already holds the lock, recorded as pid $1. Line 1 stays exactly
 # as recorded while that pid is alive and in this session's ancestry; only the
 # sidecar is refreshed, under the claim lock, so a /clear re-key inside the same
@@ -227,6 +253,7 @@ confirm_own_lock() {  # <recorded-pid>
       return 0
     fi
     publish_lock_session_or_die
+    publish_lock_identity_or_die "$recorded"
     commit_lock_session
     release_claim_lock
     echo "lock acquired: harness pid $recorded"
@@ -348,6 +375,7 @@ if [ -n "$REANCHOR" ] && fm_autoarm_ledger_read "$STATE" && [ "$FM_AUTOARM_SESSI
   fi
   release_autoarm_lock
 fi
+publish_lock_identity_or_die "$me"
 commit_lock_session
 release_lease_lock
 release_claim_lock

@@ -229,6 +229,29 @@ fm_win_command() {  # <winpid>
   fm_win_normalize_command "$out"
 }
 
+# Process-start identity for a tagged Windows holder (win:<pid>), read from
+# the Windows process table (`ps -W`).
+# The table's STIME column carries only HH:MM:SS with no date, so this
+# identity is weaker than the POSIX starttime-plus-cmdline identity: a pid
+# reused within the same second for the same executable would compare equal.
+# Combining the start time with the full normalized executable path is the
+# finest distinction the platform offers, and it serves the lock sidecar's
+# purpose, which is to notice that the holder changed rather than to prove
+# absolute process continuity.
+fm_win_pid_identity() {  # <win:pid>
+  local winpid=$1 table stime comm
+  winpid=$(fm_win_untag_pid "$winpid") || return 1
+  table=$(ps -W 2>/dev/null) || return 1
+  case "$table" in
+    *WINPID*) ;;
+    *) return 1 ;;
+  esac
+  stime=$(printf '%s\n' "$table" | awk -v w="$winpid" '$4 == w { print $7; exit }')
+  [ -n "$stime" ] || return 1
+  comm=$(fm_win_command "$winpid") || return 1
+  printf 'win-stime=%s command=%s\n' "$stime" "$comm"
+}
+
 # Environment variables through which a verified harness publishes the pid of
 # its own session process. Extend only with a variable confirmed to name the
 # session-long harness process on Windows, because the identity check below is
@@ -634,6 +657,29 @@ EOF
   printf '%s\n' "$outermost"
 }
 
+fm_harness_pid_zombie() {  # <pid>
+  local pid=$1 proc_root stat_line state
+  local -a stat_fields
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
+  if [ -r "$proc_root/$pid/stat" ]; then
+    stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 1
+    read -r -a stat_fields <<< "${stat_line##*)}"
+    # Explicit verdicts: a bare `return` after this test yields 0 inside an
+    # EXIT trap on bash 5.2, which made trap-context callers read every live
+    # pid as a zombie. Never collapse this back to a trailing bare return.
+    if [ "${stat_fields[0]:-}" = Z ]; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+  state=$(ps -o stat= -p "$pid" 2>/dev/null) || return 1
+  state=${state#"${state%%[![:space:]]*}"}
+  case "$state" in Z*) return 0 ;; esac
+  return 1
+}
+
 # True when pid $1 is one of the lines of ancestry list $2.
 fm_harness_pid_listed() {  # <pid> <ancestry-pids>
   local pid
@@ -675,6 +721,10 @@ fm_session_lock_pid_verdict() {
   # live and keep a stale lock from ever being reclaimed - the same
   # permanent read-only wedge this change exists to remove.
   if kill -0 "$pid" 2>/dev/null; then
+    if fm_harness_pid_zombie "$pid"; then
+      FM_SESSION_LOCK_PID_VERDICT=dead
+      return 0
+    fi
     # Alive. Its identity may still be unreadable, and that is the case
     # this verdict exists for: the owner is live, so its lock must not
     # be reclaimed.
@@ -694,7 +744,7 @@ fm_session_lock_pid_verdict() {
   return 0
 }
 
-# True if $1 is a live process that looks like a verified harness.
+# True if $1 is a live, non-zombie process that looks like a verified harness.
 # A tagged Windows pid is answered from the Windows process table, because
 # kill -0 cannot see across that boundary and would report a live harness as
 # dead - which would hand a running session's home to a second one.
@@ -718,16 +768,12 @@ fm_session_pid_alive() {  # <value>
   fm_pid_alive "$1"
 }
 
-# A tagged pid's identity is its Windows pid and executable path rather than a
-# start time. Every reader pairs it with the session sidecar id, which a new
-# session always changes, so a reused Windows pid still reads as a different
-# session.
+# A tagged pid's identity is its Windows start time and normalized executable
+# path (fm_win_pid_identity); any other value goes to fm_pid_identity.
 fm_session_pid_identity() {  # <value>
-  local winpid comm
-  if winpid=$(fm_win_untag_pid "$1"); then
-    comm=$(fm_win_command "$winpid") || return 1
-    printf 'win-pid=%s command=%s\n' "$winpid" "$comm"
-    return 0
+  if fm_win_untag_pid "$1" >/dev/null; then
+    fm_win_pid_identity "$1"
+    return
   fi
   fm_pid_identity "$1"
 }
