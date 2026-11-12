@@ -1533,6 +1533,10 @@ start_owner_guard() {  # <source-id>
 # Unreadable identity, ancestry, or provenance falls back to the lease.
 owner_process_independent() {  # <holder-pid> <runner-pid> <acquisition-provenance>
   local holder=$1 candidate=$1 parent depth=0
+  if fm_win_untag_pid "$holder" >/dev/null; then
+    [ "${3:-}" = independent ]
+    return
+  fi
   while [ "$candidate" -gt 1 ] && [ "$depth" -lt 128 ]; do
     [ "$candidate" != "$2" ] && [ "$candidate" != "$$" ] || return 1
     parent=$(ps -o ppid= -p "$candidate" 2>/dev/null | tr -d '[:space:]') || return 1

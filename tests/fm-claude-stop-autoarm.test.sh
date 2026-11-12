@@ -2967,7 +2967,139 @@ SH
   pass "auto-arm: recovery owner retries advance only their own generation fence and finish bounded"
 }
 
+test_session_replacement_binds_new_recovery_monitor_and_survives_transport_death() {
+  local dir harness owner_before owner_after transport_after i status=0
+  dir=$(make_primary_dir "$TMP_ROOT/session-replacement-recovery")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  cat > "$dir/config/x-mode.env" <<'SH'
+if [ ! -e "$FM_HOME/owner-before-held" ]; then
+  printf '%s\n' "$$" > "$FM_HOME/owner-before-held"
+  while [ ! -e "$FM_HOME/release-before" ]; do sleep 0.05; done
+elif [ ! -e "$FM_HOME/owner-after-held" ]; then
+  printf '%s\n' "$$" > "$FM_HOME/owner-after-held"
+  while [ ! -e "$FM_HOME/release-after" ]; do sleep 0.05; done
+fi
+SH
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    p_before="{\"session_id\":\"sess-before\",\"stop_hook_active\":false}"
+    p_after="{\"session_id\":\"sess-after\",\"stop_hook_active\":false}"
+    printf "%s\n" "$p_before" | FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1 "$FM_HOME/bin/fm-claude-stop-autoarm.sh" > "$FM_HOME/ordinary-before.out" 2>&1 & ordinary_before=$!
+    printf "%s\n" "$p_before" | "$FM_HOME/bin/fm-claude-stop-recovery.sh" > "$FM_HOME/recovery-before.out" 2>&1 & recovery_before=$!
+    while [ ! -s "$FM_HOME/owner-before-held" ] || [ "$(cat "$FM_HOME/state/.claude-autoarm-recovery.lock/claude-session" 2>/dev/null)" != "sess-before" ]; do
+      sleep 0.05
+    done
+    printf "%s\n" "$p_after" | FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1 "$FM_HOME/bin/fm-claude-stop-autoarm.sh" > "$FM_HOME/ordinary-after.out" 2>&1 & ordinary_after=$!
+    printf "%s\n" "$p_after" | "$FM_HOME/bin/fm-claude-stop-recovery.sh" > "$FM_HOME/recovery-after.out" 2>&1 & recovery_after=$!
+    wait "$ordinary_after"; printf "%s\n" "$?" > "$FM_HOME/ordinary-after.rc"
+    wait "$recovery_after"; rc=$?
+    touch "$FM_HOME/release-before" "$FM_HOME/release-after"
+    wait "$ordinary_before"; printf "%s\n" "$?" > "$FM_HOME/ordinary-before.rc"
+    wait "$recovery_before"; printf "%s\n" "$?" > "$FM_HOME/recovery-before.rc"
+    exit "$rc"
+  ' > "$dir/harness.out" 2>&1 &
+  harness=$!
+  owner_before=
+  owner_after=
+  trap 'touch "$dir/release-before" "$dir/release-after"; kill "$harness" ${owner_before:+"$owner_before"} ${owner_after:+"$owner_after"} 2>/dev/null || true; fm_test_cleanup' EXIT
+  for i in $(seq 1 200); do
+    [ -s "$dir/owner-after-held" ] \
+      && [ "$(cat "$dir/state/.claude-autoarm-recovery.lock/claude-session" 2>/dev/null)" = "sess-after" ] \
+      && break
+    sleep 0.1
+  done
+  assert_present "$dir/owner-after-held" "new session never reached its held arming generation"
+  [ "$(cat "$dir/state/.claude-autoarm-recovery.lock/claude-session" 2>/dev/null)" = "sess-after" ] \
+    || fail "new session did not acquire its own recovery monitor"
+  owner_before=$(cat "$dir/owner-before-held")
+  owner_after=$(cat "$dir/owner-after-held")
+  transport_after=$(epoch_field "$dir" transport_pid)
+  [ -n "$transport_after" ] && [ "$transport_after" != "$owner_after" ] \
+    || fail "new session generation did not bind its separate transport"
+  kill -KILL "$transport_after" || fail "could not kill new session notification transport"
+  touch "$dir/release-after"
+  for i in $(seq 1 300); do
+    kill -0 "$harness" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$harness" 2>/dev/null && fail "new session recovery monitor never delivered its wake"
+  wait "$harness" || status=$?
+  expect_code 2 "$status" "new session recovery monitor must return the recovered wake"
+  [ "$(cat "$dir/ordinary-after.rc")" = 137 ] || fail "new session ordinary transport was not killed"
+  [ "$(cat "$dir/recovery-before.rc")" = 0 ] || fail "earlier session monitor woke the abandoned conversation"
+  [ ! -s "$dir/recovery-before.out" ] || fail "earlier session monitor emitted output: $(cat "$dir/recovery-before.out")"
+  [ "$(cat "$dir/ordinary-before.rc")" = 0 ] || fail "superseded earlier session owner did not exit 0"
+  [ ! -s "$dir/ordinary-before.out" ] || fail "superseded earlier session owner emitted output"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "new session transport death did not commit outcome=rewake"
+  [ "$(epoch_field "$dir" claude_session)" = "sess-after" ] \
+    || fail "recovered wake did not preserve the new session id: $(sed -n '1p' "$dir/state/.claude-autoarm-epoch")"
+  assert_contains "$(cat "$dir/recovery-after.out")" 'fixture-win actionable' "new session monitor lost the wake"
+  trap fm_test_cleanup EXIT
+  pass "auto-arm: session replacement acquires a new recovery monitor and recovers transport death on the new conversation"
+}
+
+test_stopfailure_registered_hooks_recover_killed_transport() {
+  local dir harness owner transport i status=0 autoarm_cmd recovery_cmd fail_payload
+  dir=$(make_primary_dir "$TMP_ROOT/stopfailure-killed-transport")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" actionable
+  autoarm_cmd=$(jq -r '.hooks.StopFailure[0].hooks[0].command // empty' "$ROOT/.claude/settings.json")
+  recovery_cmd=$(jq -r '.hooks.StopFailure[0].hooks[1].command // empty' "$ROOT/.claude/settings.json")
+  assert_contains "$autoarm_cmd" "FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=1" "StopFailure auto-arm hook must require recovery readiness"
+  assert_contains "$recovery_cmd" "fm-claude-stop-recovery.sh" "StopFailure must register the independent recovery sibling"
+  fail_payload='{"session_id":"sess-stopfail","hook_event_name":"StopFailure","error":"connection_failed","transcript_path":"/tmp/sess.jsonl"}'
+  cat > "$dir/config/x-mode.env" <<'SH'
+if [ ! -e "$FM_HOME/owner-held" ]; then
+  printf '%s\n' "$$" > "$FM_HOME/owner-held"
+  while [ ! -e "$FM_HOME/release-owner" ]; do sleep 0.1; done
+fi
+SH
+  assert_absent "$dir/state/.claude-autoarm-recovery.lock" "fixture must start with no existing monitor"
+  FM_HOME="$dir" CLAUDE_PROJECT_DIR="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    printf "%s\n" "$3" | bash -c "$1" > "$FM_HOME/ordinary.out" 2>&1 & ordinary=$!
+    printf "%s\n" "$3" | bash -c "$2" > "$FM_HOME/recovery.out" 2>&1 & recovery=$!
+    wait "$ordinary"; printf "%s\n" "$?" > "$FM_HOME/ordinary.rc"
+    wait "$recovery"; rc=$?
+    touch "$FM_HOME/release-owner"
+    exit "$rc"
+  ' _ "$autoarm_cmd" "$recovery_cmd" "$fail_payload" > "$dir/harness.out" 2>&1 &
+  harness=$!
+  owner=
+  trap 'touch "$dir/release-owner"; kill "$harness" ${owner:+"$owner"} 2>/dev/null || true; fm_test_cleanup' EXIT
+  for i in $(seq 1 200); do
+    [ -s "$dir/owner-held" ] && [ -e "$dir/state/.claude-autoarm-recovery.lock/pid" ] && break
+    sleep 0.1
+  done
+  assert_present "$dir/owner-held" "StopFailure ordinary hook never reached its held arming generation"
+  assert_present "$dir/state/.claude-autoarm-recovery.lock/pid" "StopFailure recovery sibling did not start"
+  owner=$(cat "$dir/owner-held")
+  transport=$(epoch_field "$dir" transport_pid)
+  [ -n "$transport" ] && [ "$transport" != "$owner" ] || fail "StopFailure generation did not bind its separate transport"
+  kill -KILL "$transport" || fail "could not kill StopFailure notification transport"
+  kill -0 "$owner" 2>/dev/null || fail "transport kill also killed the isolated StopFailure owner"
+  for i in $(seq 1 300); do
+    kill -0 "$harness" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$harness" 2>/dev/null && fail "StopFailure recovery sibling never delivered its wake"
+  wait "$harness" || status=$?
+  expect_code 2 "$status" "StopFailure recovery transport must return the recovered wake"
+  [ "$(cat "$dir/ordinary.rc")" = 137 ] || fail "StopFailure ordinary transport was not killed"
+  [ "$(epoch_field "$dir" epoch)" -eq 2 ] || fail "StopFailure recovery failed to take one successor generation"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "StopFailure transport death left an abandoned arming generation"
+  assert_present "$dir/state/.claude-autoarm-stopfailure-rewake" "StopFailure recovery did not record the StopFailure cooldown marker"
+  assert_contains "$(cat "$dir/recovery.out")" 'fixture-win actionable' "StopFailure recovery lost the wake"
+  for i in $(seq 1 100); do kill -0 "$owner" 2>/dev/null || break; sleep 0.1; done
+  kill -0 "$owner" 2>/dev/null && fail "superseded detached StopFailure owner did not retire"
+  trap fm_test_cleanup EXIT
+  pass "auto-arm: tracked StopFailure hooks require recovery readiness and survive transport death from a cold home"
+}
+
 test_recovery_owner_retries_keep_the_generation_fence
+test_session_replacement_binds_new_recovery_monitor_and_survives_transport_death
+test_stopfailure_registered_hooks_recover_killed_transport
 
 test_recovery_does_not_replace_concurrent_rewake
 test_recovery_reclaims_reused_monitor_pid

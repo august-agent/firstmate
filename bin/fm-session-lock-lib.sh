@@ -768,16 +768,12 @@ fm_session_pid_alive() {  # <value>
   fm_pid_alive "$1"
 }
 
-# A tagged pid's identity is its Windows pid and executable path rather than a
-# start time. Every reader pairs it with the session sidecar id, which a new
-# session always changes, so a reused Windows pid still reads as a different
-# session.
+# A tagged pid's identity is its Windows start time and normalized executable
+# path (fm_win_pid_identity); any other value goes to fm_pid_identity.
 fm_session_pid_identity() {  # <value>
-  local winpid comm
-  if winpid=$(fm_win_untag_pid "$1"); then
-    comm=$(fm_win_command "$winpid") || return 1
-    printf 'win-pid=%s command=%s\n' "$winpid" "$comm"
-    return 0
+  if fm_win_untag_pid "$1" >/dev/null; then
+    fm_win_pid_identity "$1"
+    return
   fi
   fm_pid_identity "$1"
 }

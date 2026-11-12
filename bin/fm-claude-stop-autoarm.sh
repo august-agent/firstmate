@@ -50,7 +50,7 @@
 #     The generation records both process identities. A second asyncRewake
 #     entry, fm-claude-stop-recovery.sh, monitors abandoned arming claims and
 #     supplies an independent notification channel if the first transport dies.
-#     One home-scoped recovery monitor closes with the ordinary hook;
+#     One session-scoped recovery monitor closes with the ordinary hook;
 #     its session, AFK, and supervision-need gates remain identical. Both native
 #     hooks remain subject to host timeout and session teardown: no hook can
 #     wake a session after every notification transport has been terminated.
@@ -233,6 +233,13 @@ GRACE=${FM_GUARD_GRACE:-$(fm_poll_derived_grace)}
 # or unreadable name behaves as Stop everywhere below.
 PAYLOAD=$(cat 2>/dev/null || true)
 HOOK_EVENT_NAME=$(printf '%s' "$PAYLOAD" | jq -r '.hook_event_name // empty' 2>/dev/null || true)
+HOOK_SESSION=
+if [ -n "$PAYLOAD" ] && command -v jq >/dev/null 2>&1; then
+  HOOK_SESSION=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty | strings' 2>/dev/null || true)
+fi
+case "$HOOK_SESSION" in
+  *[!A-Za-z0-9._-]*) HOOK_SESSION= ;;
+esac
 
 # Cursor loads the tracked Claude settings too. Cursor has no asyncRewake, so if
 # a future Cursor build starts firing the Claude-shaped Stop entry, this arm
@@ -308,31 +315,36 @@ fi
 fm_session_lock_owned_by_self "$STATE" || exit 0
 
 # A second native asyncRewake hook owns an independent notification channel.
-# It stays tokenless until completion, with one recovery monitor per home.
-# Killing the generation owner OR its original hook transport therefore leaves
-# a hook able to reclaim the abandoned generation and deliver its exit-2 wake.
-# The monitor writes identity after acquisition. Missing identity remains an
-# in-progress/uncertain holder; only a positive mismatch permits live-PID reclaim.
+# It stays tokenless until completion, with one recovery monitor per Claude
+# session. Killing the generation owner OR its original hook transport
+# therefore leaves a hook able to reclaim the abandoned generation and deliver
+# its exit-2 wake. The monitor writes its Claude session and identity after
+# acquisition. Missing identity remains an in-progress/uncertain holder; a
+# positive identity mismatch or a changed Claude session permits live reclaim.
 autoarm_recovery_lock_acquire() {
-  local owner pid identity current steal steal_owner acquired rc=1
+  local owner pid identity current owner_session steal steal_owner acquired rc=1
   fm_lock_try_acquire "$RECOVERY_LOCK" && return 0
   owner=$(fm_lock_link_owner "$RECOVERY_LOCK") || return 1
   pid=$(cat "$owner/pid" 2>/dev/null) || return 1
   identity=$(cat "$owner/pid-identity" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
+  owner_session=$(cat "$owner/claude-session" 2>/dev/null || true)
   current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-  [ "$current" != "$identity" ] || return 1
+  [ "$current" != "$identity" ] || [ "$owner_session" != "$HOOK_SESSION" ] || return 1
   steal="$RECOVERY_LOCK.steal"
   fm_lock_try_acquire_steal_mutex "$steal" || return 1
   steal_owner=$FM_LOCK_OWNER_DIR
-  # Revalidate the exact immutable directory, pid, and identity while the steal
-  # mutex excludes replacement claims. Never signal the unrelated live process.
+  # Revalidate the exact immutable directory, pid, identity, and Claude session
+  # while the steal mutex excludes replacement claims. Never signal the
+  # unrelated live process.
   if fm_lock_points_to_owner "$steal" "$steal_owner" \
     && fm_lock_points_to_owner "$RECOVERY_LOCK" "$owner" \
     && [ "$(cat "$owner/pid" 2>/dev/null)" = "$pid" ] \
-    && [ "$(cat "$owner/pid-identity" 2>/dev/null)" = "$identity" ]; then
+    && [ "$(cat "$owner/pid-identity" 2>/dev/null)" = "$identity" ] \
+    && [ "$(cat "$owner/claude-session" 2>/dev/null || true)" = "$owner_session" ]; then
     current=$(fm_pid_identity "$pid" 2>/dev/null) || current=
-    if [ -n "$current" ] && [ "$current" != "$identity" ]; then
+    if [ -n "$current" ] && { [ "$current" != "$identity" ] || [ "$owner_session" != "$HOOK_SESSION" ]; }; then
+      : > "$owner/complete" 2>/dev/null || true
       fm_lock_remove_path "$RECOVERY_LOCK" || true
       if fm_lock_try_create "$RECOVERY_LOCK" "$steal_owner"; then
         acquired=$FM_LOCK_OWNER_DIR
@@ -348,22 +360,28 @@ RECOVERY_LOCK="$STATE/.claude-autoarm-recovery.lock"
 if [ "${FM_CLAUDE_AUTOARM_RECOVERY_WATCH:-0}" = 1 ]; then
   autoarm_recovery_lock_acquire || exit 0
   RECOVERY_OWNER_DIR=$FM_LOCK_OWNER_DIR
-  trap 'rm -f "$RECOVERY_OWNER_DIR/complete"; fm_lock_release "$RECOVERY_LOCK"' EXIT
+  trap 'rm -f "$RECOVERY_OWNER_DIR/complete" "$RECOVERY_OWNER_DIR/claude-session"; fm_lock_release "$RECOVERY_LOCK"' EXIT
+  printf '%s\n' "$HOOK_SESSION" > "$RECOVERY_OWNER_DIR/claude-session" || exit 0
   fm_pid_identity "$$" > "$RECOVERY_OWNER_DIR/pid-identity" || exit 0
   RECOVERY_SEEN_ARM=0
   RECOVERY_START=$(date +%s)
   while fm_session_lock_owned_by_self "$STATE" && [ ! -e "$STATE/.afk" ] && need_supervision; do
     [ ! -e "$RECOVERY_OWNER_DIR/complete" ] || exit 0
+    fm_lock_points_to_owner "$RECOVERY_LOCK" "$RECOVERY_OWNER_DIR" || exit 0
     if fm_autoarm_ledger_read "$STATE"; then
-      if [ "$FM_AUTOARM_OUTCOME" = arming ]; then
-        RECOVERY_SEEN_ARM=1
-        RECOVERY_EXPECTED_GEN=$FM_AUTOARM_GEN
-        if ! fm_autoarm_claim_open "$STATE" "$GRACE"; then
-          FM_CLAUDE_AUTOARM_EXPECTED_GEN="$RECOVERY_EXPECTED_GEN" \
-          FM_CLAUDE_AUTOARM_RECOVERY_WATCH=0 FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=0 \
-            "$SCRIPT_DIR/fm-claude-stop-autoarm.sh" <<< "$PAYLOAD"
-          RECOVERY_RC=$?
-          [ "$RECOVERY_RC" -ne 2 ] || exit 2
+      if [ "$FM_AUTOARM_CLAUDE_SESSION" = "$HOOK_SESSION" ]; then
+        if [ "$FM_AUTOARM_OUTCOME" = arming ]; then
+          RECOVERY_SEEN_ARM=1
+          RECOVERY_EXPECTED_GEN=$FM_AUTOARM_GEN
+          if ! fm_autoarm_claim_open "$STATE" "$GRACE" "$HOOK_SESSION"; then
+            FM_CLAUDE_AUTOARM_EXPECTED_GEN="$RECOVERY_EXPECTED_GEN" \
+            FM_CLAUDE_AUTOARM_RECOVERY_WATCH=0 FM_CLAUDE_AUTOARM_REQUIRE_RECOVERY=0 \
+              "$SCRIPT_DIR/fm-claude-stop-autoarm.sh" <<< "$PAYLOAD"
+            RECOVERY_RC=$?
+            [ "$RECOVERY_RC" -ne 2 ] || exit 2
+          fi
+        elif [ "$RECOVERY_SEEN_ARM" -eq 1 ]; then
+          exit 0
         fi
       elif [ "$RECOVERY_SEEN_ARM" -eq 1 ]; then
         exit 0
@@ -380,9 +398,10 @@ if [ "${FM_CLAUDE_AUTOARM_RECOVERY_WATCH:-0}" = 1 ]; then
 fi
 
 # Native asyncRewake feedback is delivered only after sibling hooks settle.
-# Bind the transport to this monitor's immutable lock directory before claiming,
+# Bind the transport to this session's monitor directory before claiming,
 # and notify that exact monitor when an owned terminal result commits. A newer
-# monitor can never consume an older transport's completion.
+# monitor can never consume an older transport's completion, and a new
+# conversation never adopts an earlier conversation's monitor.
 if [ "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" != "$PPID" ]; then
   FM_CLAUDE_AUTOARM_MONITOR_DIR=
   MONITOR_DEADLINE=$(( $(date +%s) + 5 ))
@@ -390,7 +409,9 @@ if [ "${FM_CLAUDE_AUTOARM_SUPERVISOR_PID:-}" != "$PPID" ]; then
     MONITOR_DIR=$(fm_lock_link_owner "$RECOVERY_LOCK" 2>/dev/null || true)
     MONITOR_PID=$(cat "$MONITOR_DIR/pid" 2>/dev/null || true)
     MONITOR_IDENTITY=$(cat "$MONITOR_DIR/pid-identity" 2>/dev/null || true)
+    MONITOR_SESSION=$(cat "$MONITOR_DIR/claude-session" 2>/dev/null || true)
     if [ -n "$MONITOR_DIR" ] && [ -n "$MONITOR_IDENTITY" ] && [ ! -e "$MONITOR_DIR/complete" ] \
+      && [ "$MONITOR_SESSION" = "$HOOK_SESSION" ] \
       && fm_pid_alive "$MONITOR_PID" \
       && [ "$(fm_pid_identity "$MONITOR_PID" 2>/dev/null)" = "$MONITOR_IDENTITY" ]; then
       FM_CLAUDE_AUTOARM_MONITOR_DIR=$MONITOR_DIR
@@ -509,13 +530,6 @@ SESSION_ID=$(fm_session_lock_recorded_session_id "$STATE" 2>/dev/null || true)
 # earlier session took stops deferring this one (fm_autoarm_claim_open). No
 # payload, no jq, or an id the ledger cannot carry means no session, which
 # keeps the claim's previous behavior.
-HOOK_SESSION=
-if [ -n "$PAYLOAD" ] && command -v jq >/dev/null 2>&1; then
-  HOOK_SESSION=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty | strings' 2>/dev/null || true)
-fi
-case "$HOOK_SESSION" in
-  *[!A-Za-z0-9._-]*) HOOK_SESSION= ;;
-esac
 fm_autoarm_claim_open "$STATE" "$GRACE" "$HOOK_SESSION" && exit 0
 fm_autoarm_claim_next "$STATE" "$GRACE" "$HOOK_SESSION" "${FM_CLAUDE_AUTOARM_EXPECTED_GEN:-}"
 CLAIM_RC=$?

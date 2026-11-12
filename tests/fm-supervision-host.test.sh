@@ -16,23 +16,6 @@ set -u
 # shellcheck source=tests/supervision-host-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/supervision-host-helpers.sh"
 
-# tests/lib.sh's pass, plus suite hygiene for this file's host homes. Hosts,
-# watchers and arms left running pile up across the suite: every later poll
-# loop competes with them for scheduling, which stretches each case's waits
-# without failing them until the whole file outruns its CI job cap. Every case
-# builds its own homes through make_home and never touches another case's
-# home, so stopping all registered homes on each pass is safe; the EXIT trap
-# still owns the final cleanup when a case fails instead of passing.
-pass() {
-  printf 'ok - %s\n' "$1"
-  local home
-  [ -f "$HOMES_FILE" ] || return 0
-  while IFS= read -r home; do
-    [ -n "$home" ] && stop_home_processes "$home"
-  done < "$HOMES_FILE"
-  : > "$HOMES_FILE"
-}
-
 test_park_exit_probe_uses_half_second_child_sleeps() {
   local home host_pid
   home=$(make_home park-cadence attended)

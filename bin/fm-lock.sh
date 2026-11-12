@@ -38,7 +38,7 @@
 #
 # state/.lock-identity is published only after an acquisition or confirmed-own
 # acquisition verifies the lock. Its first two lines are that holder's pid and the
-# process-start identity from fm_pid_identity. Line 3 records acquisition
+# process-start identity from fm_session_pid_identity. Line 3 records acquisition
 # provenance: independent when FM_PROCEVENT_IN_RUNNER is unset, otherwise
 # process-event. Readers must match the pid and identity; an
 # absent or stale sidecar adds no owner-presence evidence. Atomic replacement
