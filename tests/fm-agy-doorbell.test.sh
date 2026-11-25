@@ -123,7 +123,11 @@ case "${1:-}" in
     else
       content=$(cat "$composer_file" 2>/dev/null || true)
     fi
-    printf 'older transcript output\n%s\n' "$rule"
+    if [ -n "${FM_FAKE_TRANSCRIPT_TOKEN:-}" ]; then
+      printf 'Earlier output: ? for shortcuts\n%s\n' "$rule"
+    else
+      printf 'older transcript output\n%s\n' "$rule"
+    fi
     first=1
     if [ -n "$content" ]; then
       while IFS= read -r row || [ -n "$row" ]; do
@@ -399,6 +403,40 @@ test_agy_idle_proof_blocks_unproven_footer() {
   pass "agy composer: only the pinned idle row proves empty"
 }
 
+# A transcript echo of the footer token above the pair proves nothing: with
+# no pinned footer of its own, the screen must read unknown even with a live
+# identity, and the wedge must not fire even with its queued text present.
+test_agy_idle_proof_ignores_transcript_echo() {
+  local dir rec rc cursor state doorbell
+  for cursor in 2 4; do
+    dir=$(setup_case "transcript-cursor$cursor")
+    state=$(FM_FAKE_TRANSCRIPT_TOKEN=1 FM_FAKE_NO_STATUS=1 \
+      FM_FAKE_CURSOR_Y=$cursor composer_state "$dir")
+    [ "$state" = unknown ] \
+      || fail "a transcript echo must read unknown with cursor $cursor, got $state"
+  done
+  dir=$(setup_case wedgeecho)
+  : > "$dir/send.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  printf '%s' "$doorbell" > "$dir/composer.txt"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" \
+    FM_FAKE_TRANSCRIPT_TOKEN=1 FM_FAKE_NO_STATUS=1 FM_FAKE_QUEUED=1 \
+    FM_COMPOSER_HARNESS=agy FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  # The wedge refuses, so the ring takes the ordinary submit path for the
+  # sitting line: without a pinned footer the fake cannot verify the submit,
+  # so the ring defers - but the interrupt must never fire on unproven idle.
+  expect_code 1 "$rc" "an unproven wedge defers without verified submit"
+  case "$(cat "$dir/send.log")" in
+    *Escape*) fail "a transcript echo must never arm the interrupt:$'\n'$(cat "$dir/send.log")" ;;
+  esac
+  pass "agy wedge: a transcript echo never proves idle"
+}
+
 test_agy_ring_skips_foreign_pending() {
   local dir rec rc log
   dir=$(setup_case foreign)
@@ -611,6 +649,7 @@ test_agy_rering_never_stacks_onto_pending
 test_agy_relaunch_composer_check_passes_after_submit
 test_agy_dead_shell_never_reads_empty
 test_agy_idle_proof_blocks_unproven_footer
+test_agy_idle_proof_ignores_transcript_echo
 test_agy_ring_skips_foreign_pending
 test_agy_ring_unknown_composer_defers_without_typing
 test_agy_ring_skips_busy_own_line
