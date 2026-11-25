@@ -757,6 +757,7 @@ test_muse_nudge_no_setsid_fallback() {
   setup_nudge_case nosetsid
   # Shadow the command builtin itself: command -v only checks that a name
   # resolves, so a failing setsid stub would still count as present.
+  # shellcheck disable=SC2329 # invoked indirectly through muse_nudge_spawn's command -v setsid probe
   command() {
     if [ "$1" = "-v" ] && [ "$2" = setsid ]; then return 1; fi
     builtin command "$@"
