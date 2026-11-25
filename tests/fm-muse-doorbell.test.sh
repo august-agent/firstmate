@@ -10,8 +10,8 @@
 #   1. The literal is typed at most twice per record, once per unverified
 #      delivery: a pending mark carries the send outcome, so a later ring
 #      reconciles before typing - an accepted but unverified send defers,
-#      while a failed send retypes only onto a proven empty composer and
-#      only once. A waiting contender proves the lock serializes delivery;
+#      while a failed or submitted-but-unverified send retypes only onto a
+#      proven empty composer and only once. A waiting contender proves the lock serializes delivery;
 #      a stale mark waits for the lock before cleanup. A mark for another record bars typing, except a failed
 #      mark on an empty composer, whose retry is performed for that record
 #      first. A per-record lock serializes concurrent rings across the whole
@@ -710,6 +710,8 @@ test_muse_ring_enter_failure_keeps_mark() {
   expect_code 2 "$rc" "a failed Enter should report the failure, not a deferral"
   [ -f "$dir/state/t1.inbox/.muse-pending" ] \
     || fail "a failed submit must keep its pending mark"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg"$'\t'"failed" ] \
+    || fail "a failed Enter must leave a failed mark"
   [ ! -s "$dir/submitted.log" ] || fail "a failed Enter must not submit"
   PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
     FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
@@ -741,6 +743,8 @@ test_muse_ring_enter_failure_after_fresh_send_keeps_mark() {
   expect_code 2 "$rc" "a failed Enter on a fresh send should report the failure"
   [ -f "$dir/state/t1.inbox/.muse-pending" ] \
     || fail "a fresh send whose Enter failed must keep its pending mark"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg"$'\t'"failed" ] \
+    || fail "a failed Enter on a fresh send must leave a failed mark"
   [ ! -s "$dir/submitted.log" ] || fail "a failed Enter must not submit"
   PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
     FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
@@ -751,6 +755,87 @@ test_muse_ring_enter_failure_after_fresh_send_keeps_mark() {
   expect_code 0 "$rc" "the next ring should submit the protected line"
   assert_contains "$(cat "$dir/submitted.log")" "Firstmate instruction waiting" "the protected line should submit"
   pass "muse ring: a failed Enter on a fresh send keeps its pending mark"
+}
+
+# A failed mark whose line becomes visible again submits without retyping:
+# the mark proves the literal already landed, so reconcile owns it.
+test_muse_ring_failed_mark_recovers_without_retype() {
+  local dir rec rc log literals
+  dir=$(setup_case failedrecover muse)
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  printf '%s' "$doorbell" > "$dir/composer.txt"
+  printf '001.msg\tfailed\n' > "$dir/state/t1.inbox/.muse-pending"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 0 "$rc" "a visible failed line should submit"
+  log=$(cat "$dir/send.log")
+  literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log" || true)
+  [ "$literals" = 0 ] || fail "recovery must not retype, got $literals:$'\n'$log"
+  [ "$(grep -c "KEYS:send-keys -t sess:fm-t1 Enter" "$dir/send.log")" = 1 ] \
+    || fail "recovery should submit with exactly one Enter:$'\n'$log"
+  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "a submitted line must clear its pending mark"
+  pass "muse ring: a failed mark recovers without retyping"
+}
+
+# A submitted-but-unverified mark still owes one retry: with the line gone
+# and the composer proven empty, the next ring retypes once, and the retry's
+# own type consumes the allowance, so a still-unverified line defers after.
+test_muse_ring_retries_submitted_mark_once() {
+  local dir rec rc log literals
+  dir=$(setup_case submittedretry muse)
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  printf '001.msg\tsubmitted\n' > "$dir/state/t1.inbox/.muse-pending"
+  ring_submitted() {
+    PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+      FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+      FM_FAKE_FREEZE_CAPTURE=1 \
+      FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+      inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+      >>"$dir/ring.log" 2>&1
+  }
+  ring_submitted; rc=$?
+  expect_code 1 "$rc" "the retry ring should defer under a frozen capture"
+  ring_submitted; rc=$?
+  expect_code 1 "$rc" "the ring after the retry should defer"
+  log=$(cat "$dir/send.log")
+  literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
+  [ "$literals" = 1 ] || fail "a submitted mark must retype exactly once, got $literals:$'\n'$log"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg" ] \
+    || fail "the retry must consume the allowance back to a plain mark"
+  pass "muse ring: a submitted mark retries once, then defers"
+}
+
+# A submitted mark does not authorize typing over a foreign draft: the
+# composer holds other text, so the ring defers with the mark intact.
+test_muse_ring_submitted_mark_spares_foreign_draft() {
+  local dir rec rc log
+  dir=$(setup_case submittedforeign muse)
+  : > "$dir/send.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  printf 'someone is typing here' > "$dir/composer.txt"
+  printf '001.msg\tsubmitted\n' > "$dir/state/t1.inbox/.muse-pending"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 1 "$rc" "a foreign composer should defer, not submit or type"
+  log=$(cat "$dir/send.log")
+  [ -z "$log" ] || fail "a deferred ring must send no keys:$'\n'$log"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg"$'\t'"submitted" ] \
+    || fail "a deferred ring must keep its submitted mark"
+  pass "muse ring: a submitted mark spares a foreign draft"
 }
 
 test_muse_ring_bounded_after_post_commit_stale() {
@@ -1262,6 +1347,9 @@ test_muse_ring_recovers_post_commit_on_visibility
 test_muse_ring_failed_send_before_commit_retries
 test_muse_ring_enter_failure_keeps_mark
 test_muse_ring_enter_failure_after_fresh_send_keeps_mark
+test_muse_ring_failed_mark_recovers_without_retype
+test_muse_ring_retries_submitted_mark_once
+test_muse_ring_submitted_mark_spares_foreign_draft
 test_muse_ring_skips_busy_own_line
 test_muse_ring_skips_foreign_pending
 test_watcher_muse_rering_spares_foreign_draft

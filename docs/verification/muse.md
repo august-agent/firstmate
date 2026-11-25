@@ -306,9 +306,9 @@ The worker dropped a doorbell whose Enter landed before its text was visible, an
 The inbox ring for this worker now types the doorbell as one literal send, and only then sends Enter as a separate keystroke, retrying Enter without retyping.
 The literal dispatcher covers every backend with a native literal primitive; a backend with no pane to type into stays unsupported and keeps the shared submit path.
 The ring never clears: an advisory capture must not authorize a destructive operation.
-The pending mark carries the send outcome, so a later ring reconciles before typing: an accepted but unverified send defers, while a failed send retypes only onto a proven empty composer and only once - the retry consumes the allowance either way, bounding repeated post-commit failures under a frozen capture to two literals before deferral.
-A mark for another record bars typing: its line is submitted first, or the ring defers, except a failed mark on an empty composer, whose retry runs for that record first.
-A failed Enter keeps the mark and reports the failure, so the next ring resubmits the protected line.
+The pending mark carries the send outcome, so a later ring reconciles before typing: an accepted but unverified send defers, while a failed send - or a submitted one whose Enter went out but stayed unverified - retypes only onto a proven empty composer and only once: the mark becomes "submitted" before the first Enter, is cleared by a completed submission, and becomes "failed" when an Enter keystroke itself fails. The retry consumes the allowance either way, bounding repeated post-commit failures under a frozen capture to two literals before deferral.
+A mark for another record bars typing: its line is submitted first, or the ring defers, except a failed or submitted mark on an empty composer, whose retry runs for that record first.
+A failed Enter leaves a failed mark and reports the failure, so the next ring resubmits the protected line.
 A submit that finds a changed composer defers instead of retrying into it.
 A per-record lock serializes concurrent rings across the whole delivery; a stale lock fails safe into deferral.
 A record still unhandled after a recorded delivery attempt is re-rung as-is, with no interrupt key.
