@@ -403,10 +403,11 @@ fm_task_inbox_muse_settle_secs() {
 # provably gone. The mark is best-effort bookkeeping: losing it only risks
 # the duplication it exists to prevent, never delivery itself - a stuck mark
 # still escalates through the ordinary ladder, which names its age.
-fm_task_inbox_muse_mark_pending() {  # <inbox-dir> <record-path> [failed|submitted]
+fm_task_inbox_muse_mark_pending() {  # <inbox-dir> <record-path> [failed|submitted|retried]
   case "${3:-}" in
     failed) printf '%s\tfailed\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
     submitted) printf '%s\tsubmitted\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
+    retried) printf '%s\tretried\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
     *) printf '%s\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
   esac
 }
@@ -419,12 +420,21 @@ fm_task_inbox_muse_has_pending() {  # <inbox-dir> <record-path>
 # A pending mark that still owes one retry: a failed send, or a submitted one
 # whose Enter went out but was never verified. An accepted-but-unverified
 # send (plain mark) does not qualify: retyping it risks duplicating a line
-# that only the capture has not caught up with yet.
+# that only the capture has not caught up with yet. A spent retry (retried
+# mark) never qualifies again, so one retry cannot re-arm itself.
 fm_task_inbox_muse_mark_retryable() {  # <inbox-dir> <record-path>
   local kind
   fm_task_inbox_muse_has_pending "$1" "$2" || return 1
   kind=$(cut -f2 -s "$1/.muse-pending" 2>/dev/null || true)
   [ "$kind" = failed ] || [ "$kind" = submitted ]
+}
+
+# Mark a send outcome unless the record's retry is already spent: a spent
+# retry stays spent through submit, reconcile, and Enter failures, so one
+# retry never re-arms itself into a literal per ring.
+fm_task_inbox_muse_mark_unless_spent() {  # <inbox-dir> <record-path> <kind>
+  [ "$(cut -f2 -s "$1/.muse-pending" 2>/dev/null || true)" = retried ] && return 0
+  fm_task_inbox_muse_mark_pending "$1" "$2" "$3"
 }
 
 # The sequence number a pending mark names, or nothing when no mark is set.
@@ -470,18 +480,21 @@ fm_task_inbox_muse_clear_pending() {  # <inbox-dir>
 # in "submitted" form, so the next ring retries the attempt instead of
 # typing a duplicate line. A completed submission - a verified-empty composer
 # or both Enters sent - clears the mark: from there the acknowledgement move
-# is the delivery proof and the ladder owns the rest. Returns 0 submitted,
-# 1 deferred on an unverified or changed composer, 2 when an Enter keystroke
-# itself failed.
+# is the delivery proof and the ladder owns the rest. A spent retry stays
+# spent: the submit path never writes over a "retried" mark except to clear
+# it on success. A worker that turns busy before the second Enter goes out
+# keeps the mark and defers: a half-submitted line is not a submission.
+# Returns 0 submitted, 1 deferred on an unverified or changed composer or a
+# worker that turned busy mid-submit, 2 when an Enter keystroke itself failed.
 fm_task_inbox_muse_submit() {  # <inbox-dir> <record-path> <backend> <target> <line> [expected-label]
   local dir=$1 rec=$2 backend=$3 target=$4 line=$5 label=${6:-} cstate settle
   settle=$(fm_task_inbox_muse_settle_secs)
   sleep "$settle"
   fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
   [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ] || return 1
-  fm_task_inbox_muse_mark_pending "$dir" "$rec" submitted
+  fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" submitted
   fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || {
-    fm_task_inbox_muse_mark_pending "$dir" "$rec" failed
+    fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" failed
     return 2
   }
   sleep 0.3
@@ -493,12 +506,16 @@ fm_task_inbox_muse_submit() {  # <inbox-dir> <record-path> <backend> <target> <l
       ;;
     pending)
       fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
-      if [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ]; then
-        fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || {
-          fm_task_inbox_muse_mark_pending "$dir" "$rec" failed
-          return 2
-        }
+      if [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" = busy ]; then
+        # The second Enter never went out and the line is still sitting
+        # there, so this is not a submission: keep the mark and defer
+        # rather than reporting success on a half-submitted line.
+        return 1
       fi
+      fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || {
+        fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" failed
+        return 2
+      }
       fm_task_inbox_muse_clear_pending "$dir"
       return 0
       ;;
@@ -658,8 +675,11 @@ fm_task_inbox_ring_muse() {  # <backend> <target> <record-path> [expected-label]
   # Persistence before input: when the mark cannot be written, sending
   # proceeds without the state that prevents retyping, so refuse instead.
   # A stuck writer escalates through the ordinary ladder rather than
-  # duplicating silently on every re-ring.
-  if ! fm_task_inbox_muse_mark_pending "$dir" "$rec"; then
+  # duplicating silently on every re-ring. A retry records its spent
+  # allowance the same way, so a later deferral never re-arms it.
+  if [ "$RETRY" = 1 ]; then
+    fm_task_inbox_muse_mark_pending "$dir" "$rec" retried || return 2
+  elif ! fm_task_inbox_muse_mark_pending "$dir" "$rec"; then
     return 2
   fi
   fm_backend_send_literal "$backend" "$target" "$line" "$label" >/dev/null 2>&1

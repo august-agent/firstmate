@@ -11,7 +11,8 @@
 #      delivery: a pending mark carries the send outcome, so a later ring
 #      reconciles before typing - an accepted but unverified send defers,
 #      while a failed or submitted-but-unverified send retypes only onto a
-#      proven empty composer and only once. A waiting contender proves the lock serializes delivery;
+#      proven empty composer and only once; a spent retry never retypes.
+#      A waiting contender proves the lock serializes delivery;
 #      a stale mark waits for the lock before cleanup. A mark for another record bars typing, except a failed
 #      mark on an empty composer, whose retry is performed for that record
 #      first. A per-record lock serializes concurrent rings across the whole
@@ -28,7 +29,8 @@
 #   2. A composer holding a foreign draft is skipped without typing or
 #      clearing, so no draft is lost.
 #   3. A composer holding exactly this ring's own doorbell line is submitted
-#      with Enter and never retyped, unless the worker reports busy.
+#      with Enter and never retyped, unless the worker reports busy; a worker
+#      that turns busy mid-submit keeps the mark and defers.
 #   4. An ambiguous composer defers without typing or submitting: a fresh
 #      ring needs a readable empty composer before it types.
 #   5. Any other harness keeps the shared path with no clear.
@@ -72,6 +74,8 @@ inbox_lib() {  # <state> <function> [args...]
 # stale frozen box instead, standing in for a lagging or failed capture. With
 # FM_FAKE_VISIBLE_AFTER=N, the first N-1 captures render empty and later ones
 # show the composer, standing in for a capture that lags the literal send.
+# With FM_FAKE_UNKNOWN_AFTER=N, the Nth and later captures render an
+# unclassifiable screen, standing in for a capture that degrades mid-submit.
 # With FM_FAKE_REQUIRE_SETTLE set, an Enter is ignored unless the fake clock
 # (advanced by the fake sleep) has passed the literal send by
 # FM_FAKE_SETTLE_REQUIRED, standing in for a worker that drops an Enter sent
@@ -166,6 +170,19 @@ case "${1:-}" in
     if [ -n "${FM_FAKE_GARBAGE_CAPTURE:-}" ]; then
       printf 'some unclassifiable screen\nwithout any composer shape\n'
       exit 0
+    fi
+    # With FM_FAKE_UNKNOWN_AFTER=N, the Nth and later captures render an
+    # unclassifiable screen while earlier ones read normally, standing in
+    # for a capture that degrades mid-submit.
+    if [ -n "${FM_FAKE_UNKNOWN_AFTER:-}" ]; then
+      unknown_count_file="${FM_FAKE_CAPTURE_COUNT:-/dev/null}"
+      unknown_count=$(cat "$unknown_count_file" 2>/dev/null || printf 0)
+      unknown_count=$((unknown_count + 1))
+      printf '%s' "$unknown_count" > "$unknown_count_file" 2>/dev/null || true
+      if [ "$unknown_count" -ge "$FM_FAKE_UNKNOWN_AFTER" ]; then
+        printf 'some unclassifiable screen\nwithout any composer shape\n'
+        exit 0
+      fi
     fi
     if [ -n "${FM_FAKE_FREEZE_CAPTURE:-}" ] && [ -z "${FM_FAKE_FROZEN_TEXT:-}" ]; then
       printf '╭────╮\n│    │\n╰────╯\n'
@@ -810,8 +827,8 @@ test_muse_ring_retries_submitted_mark_once() {
   log=$(cat "$dir/send.log")
   literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
   [ "$literals" = 1 ] || fail "a submitted mark must retype exactly once, got $literals:$'\n'$log"
-  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg" ] \
-    || fail "the retry must consume the allowance back to a plain mark"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg"$'\t'"retried" ] \
+    || fail "the retry must record its spent allowance"
   pass "muse ring: a submitted mark retries once, then defers"
 }
 
@@ -836,6 +853,84 @@ test_muse_ring_submitted_mark_spares_foreign_draft() {
   [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg"$'\t'"submitted" ] \
     || fail "a deferred ring must keep its submitted mark"
   pass "muse ring: a submitted mark spares a foreign draft"
+}
+
+# A retry whose submit defers on a degraded capture must not re-arm: the
+# literal was visible, Enter went out, and the post-Enter read is unknown,
+# so the next ring sees an empty composer with a spent mark and defers.
+# The first five captures read normally (reconcile, retry gate, two dispatch
+# re-reads, submit verify) and the sixth - the post-Enter check - degrades.
+test_muse_ring_spent_retry_never_retypes() {
+  local dir rec rc log literals
+  dir=$(setup_case spentretry muse)
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  : > "$dir/count"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  printf '001.msg\tsubmitted\n' > "$dir/state/t1.inbox/.muse-pending"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_FAKE_UNKNOWN_AFTER=6 FM_FAKE_CAPTURE_COUNT="$dir/count" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 1 "$rc" "the retry should defer when the post-Enter capture degrades"
+  assert_contains "$(cat "$dir/submitted.log")" "Firstmate instruction waiting" "the retry should submit before deferring"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >>"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 1 "$rc" "the ring after a spent retry should defer"
+  log=$(cat "$dir/send.log")
+  literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
+  [ "$literals" = 1 ] || fail "a spent retry must never retype, got $literals:$'\n'$log"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg"$'\t'"retried" ] \
+    || fail "the spent retry must stay spent"
+  pass "muse ring: a spent retry never retypes"
+}
+
+# A worker that turns busy before the second Enter is not a submission: the
+# first Enter went out but the line is still sitting there, so the ring
+# keeps the submitted mark and defers instead of reporting success. The
+# frozen capture stands in for the line still sitting there after the fake
+# Enter clears the real file; the counting override turns busy on the third
+# check - the pending-branch gate and the pre-Enter check still see idle.
+test_muse_ring_busy_mid_submit_keeps_mark() {
+  local dir rec rc log enters doorbell
+  dir=$(setup_case busymidsubmit muse)
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  printf '%s' "$doorbell" > "$dir/composer.txt"
+  : > "$dir/busycount"
+  FM_STATE_OVERRIDE="$dir/state" PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_FAKE_FROZEN_TEXT="$doorbell" BUSY_COUNT_FILE="$dir/busycount" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    bash -c '
+      . "$1"
+      fm_backend_busy_state() {
+        n=$(cat "$BUSY_COUNT_FILE" 2>/dev/null || printf 0)
+        [ -n "$n" ] || n=0
+        n=$((n + 1))
+        printf "%s" "$n" > "$BUSY_COUNT_FILE"
+        [ "$n" -ge 3 ] && { printf busy; return 0; }
+        printf idle
+      }
+      fm_task_inbox_ring tmux sess:fm-t1 "$2" fm-t1
+    ' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$rec" >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 1 "$rc" "a submit interrupted by a busy worker should defer, not report success"
+  log=$(cat "$dir/send.log")
+  enters=$(grep -c "KEYS:send-keys -t sess:fm-t1 Enter" "$dir/send.log")
+  [ "$enters" = 1 ] || fail "only the first Enter should go out before the worker turns busy, got $enters:$'\n'$log"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "001.msg"$'\t'"submitted" ] \
+    || fail "a half-submitted line must keep its submitted mark"
+  pass "muse ring: a busy worker mid-submit keeps the mark"
 }
 
 test_muse_ring_bounded_after_post_commit_stale() {
@@ -1350,6 +1445,8 @@ test_muse_ring_enter_failure_after_fresh_send_keeps_mark
 test_muse_ring_failed_mark_recovers_without_retype
 test_muse_ring_retries_submitted_mark_once
 test_muse_ring_submitted_mark_spares_foreign_draft
+test_muse_ring_spent_retry_never_retypes
+test_muse_ring_busy_mid_submit_keeps_mark
 test_muse_ring_skips_busy_own_line
 test_muse_ring_skips_foreign_pending
 test_watcher_muse_rering_spares_foreign_draft
