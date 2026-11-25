@@ -156,6 +156,14 @@ EOF
         printf '? for shortcuts                                   Gemini 3.8 Flash\n'
       fi
     fi
+    case "${FM_FAKE_TRANSCRIPT_TAIL:-}" in
+      quoted)
+        printf 'Quoted output: ? for shortcuts\nStill generating response\n'
+        ;;
+      bare)
+        printf '? for shortcuts\n'
+        ;;
+    esac
     exit 0 ;;
   list-windows) printf 'fm-t1\n'; exit 0 ;;
 esac
@@ -437,6 +445,43 @@ test_agy_idle_proof_ignores_transcript_echo() {
   pass "agy wedge: a transcript echo never proves idle"
 }
 
+# A transcript echo below a stale pair proves nothing either: trailing
+# transcript activity after the echo, or a bare echoed token with no model
+# cell, must both refuse - only the pinned row with its model cell, last,
+# proves idle. The wedge refuses the same screens without interrupting.
+test_agy_idle_proof_rejects_below_pair_echo() {
+  local dir rec rc state cursor doorbell
+  for cursor in 2 4; do
+    dir=$(setup_case "belowpair-quoted-cursor$cursor")
+    state=$(FM_FAKE_NO_STATUS=1 FM_FAKE_TRANSCRIPT_TAIL=quoted \
+      FM_FAKE_CURSOR_Y=$cursor composer_state "$dir")
+    [ "$state" = unknown ] \
+      || fail "trailing transcript must read unknown with cursor $cursor, got $state"
+    dir=$(setup_case "belowpair-bare-cursor$cursor")
+    state=$(FM_FAKE_NO_STATUS=1 FM_FAKE_TRANSCRIPT_TAIL=bare \
+      FM_FAKE_CURSOR_Y=$cursor composer_state "$dir")
+    [ "$state" = unknown ] \
+      || fail "a bare echoed token must read unknown with cursor $cursor, got $state"
+  done
+  dir=$(setup_case wedgeechoedtrail)
+  : > "$dir/send.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  printf '%s' "$doorbell" > "$dir/composer.txt"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" \
+    FM_FAKE_QUEUED=1 FM_FAKE_TRANSCRIPT_TAIL=quoted \
+    FM_COMPOSER_HARNESS=agy FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 1 "$rc" "trailing transcript must defer the wedge"
+  case "$(cat "$dir/send.log")" in
+    *Escape*) fail "trailing transcript must never arm the interrupt:$'\n'$(cat "$dir/send.log")" ;;
+  esac
+  pass "agy idle proof: below-pair echoes never prove idle"
+}
+
 test_agy_ring_skips_foreign_pending() {
   local dir rec rc log
   dir=$(setup_case foreign)
@@ -650,6 +695,7 @@ test_agy_relaunch_composer_check_passes_after_submit
 test_agy_dead_shell_never_reads_empty
 test_agy_idle_proof_blocks_unproven_footer
 test_agy_idle_proof_ignores_transcript_echo
+test_agy_idle_proof_rejects_below_pair_echo
 test_agy_ring_skips_foreign_pending
 test_agy_ring_unknown_composer_defers_without_typing
 test_agy_ring_skips_busy_own_line

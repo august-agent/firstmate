@@ -92,10 +92,9 @@
 #                agy draws the same pair around a bare SHELL `>` prompt row,
 #                which never self-proves: only a live agy identity (herdr
 #                native, tmux foreground process) plus the pinned idle row
-#                with no background task count in the footer rows beneath the
-#                pair reads the stripped pair empty - a transcript echo of
-#                the footer token above the pair proves nothing - and any
-#                other content reads pending.
+#                with no background task count as the last non-blank row
+#                reads the stripped pair empty, and any other content reads
+#                pending.
 #
 # THE COMPOSER FOOTER ZONE (task firstmate-doorbell-vals-pending-p1): a
 # harness draws its own furniture BELOW the composer - a user statusLine, a
@@ -276,30 +275,38 @@ fm_composer_agy_scope() {
 }
 
 # fm_composer_agy_idle_proven: 0 when <screen> shows agy's composer pair
-# selected with the pinned idle status row - the `? for shortcuts` cell -
-# in the footer rows directly beneath its closing separator, and with no
-# nonzero background task count there. This is the positive idle proof the
-# agy `empty` verdict and the queued-wedge recovery both require: no busy
-# footer can ever prove a worker is NOT running (a missing or changed token
-# reads exactly like an idle one), and a transcript echo of the footer token
-# above the pair proves nothing either, so only the pinned row in the actual
-# footer region counts. A row carrying `N task(s)` proves the opposite - the
-# worker is legitimately waiting on its own background job - so it refuses.
-# Reads the ANSI-preserving screen and strips styling itself, so callers
-# pass whatever capture they hold. Runs its own scan and cursorless
+# selected with the pinned idle status row as the last non-blank row - the
+# `? for shortcuts` cell opening that row - and with no nonzero background
+# task count on it. This is the positive idle proof the agy `empty` verdict
+# and the queued-wedge recovery both require. No busy footer can ever prove
+# a worker is NOT running (a missing or changed token reads exactly like an
+# idle one), a transcript echo of the token anywhere but the pinned last
+# row proves nothing either, and a row carrying `N task(s)` proves the
+# opposite - the worker is legitimately waiting on its own background job -
+# so each of those refuses. The TUI pins its status row at the viewport
+# bottom, so anything below it is transcript, and nothing legitimate renders
+# after it. Reads the ANSI-preserving screen and strips styling itself, so
+# callers pass whatever capture they hold. Runs its own scan and cursorless
 # selection, so it decides the same way from the verdict path (which scanned
 # already) and from callers that never scanned.
 fm_composer_agy_idle_proven() {  # <screen>
-  local screen=$1 plain window
+  local screen=$1 plain last
   plain=$(printf '%s\n' "$screen" | fm_composer_strip_ansi)
   _fm_composer_scan_screen "$plain" ''
   _fm_composer_select_cursorless "$plain" "$screen" 0 || return 1
   [ "$FM_COMPOSER_SELECTED_KIND" = pi ] || return 1
-  [ "$FM_COMPOSER_SCAN_PI_CLOSE" -ge 0 ] || return 1
-  window=$(printf '%s\n' "$plain" \
-    | sed -n "$((FM_COMPOSER_SCAN_PI_CLOSE + 2)),$((FM_COMPOSER_SCAN_PI_CLOSE + 5))p")
-  printf '%s\n' "$window" | grep -qF '? for shortcuts' || return 1
-  printf '%s\n' "$window" | grep -qE '[1-9][0-9]* task\(s\)' && return 1
+  last=$(printf '%s\n' "$plain" | grep -v '^[[:space:]]*$' | tail -1)
+  [ -n "$last" ] || return 1
+  fm_composer_normalize_trim_var last
+  # The pinned row opens with the cell and always carries its model cell
+  # after it; a bare echoed token with nothing after it is transcript, not
+  # the footer.
+  case "$last" in
+    '? for shortcuts'*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$last" | grep -qE '^\? for shortcuts[[:space:]]+[^[:space:]]' || return 1
+  printf '%s\n' "$last" | grep -qE '[1-9][0-9]* task\(s\)' && return 1
   return 0
 }
 
@@ -2689,10 +2696,9 @@ _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
   # a shell has no agy foreground process and stays unknown. Proven input
   # stays pending for every live agy state, while only a positively idle agy -
   # live identity, an idle status, AND the pinned idle row with no background
-  # task count in the footer rows beneath the pair - proves an empty
-  # composer. Absence of a busy footer alone never does: a missing or changed
-  # token reads exactly like an idle one, and so does a transcript echo of
-  # the footer token above the pair.
+  # task count as the last non-blank row - proves an empty composer. Absence
+  # of a busy footer alone never does, and neither does a transcript echo of
+  # the footer token anywhere but that pinned last row.
   if [ "$agent" = agy ]; then
     [ "$FM_COMPOSER_SCAN_PI_PAIR_VALID" = 1 ] || { printf 'unknown'; return 0; }
     state=$(_fm_composer_classify_agy_rows "$screen" "$styled")

@@ -136,9 +136,9 @@ agy is included in the session-lock name vocabulary in `bin/fm-session-lock-lib.
 ## Composer: the bare-`>` separated pair, proven by a live agy identity
 
 Byte-level capture of the idle pane shows a bare unstyled `>` between two full-width `─` rules, with an unstyled `? for shortcuts` cell and a dim (`SGR 2`) model cell in the status row below.
-The shared classifier reads that pair through an agy-owned branch of the separated shape: a live agy identity (Herdr's native `agent=agy`, or the anchored `agy` foreground process on tmux) plus the pinned idle row with no background task count proves the stripped pair empty, while any other content reads pending.
+The shared classifier reads that pair through an agy-owned branch of the separated shape: a live agy identity (Herdr's native `agent=agy`, or the anchored `agy` foreground process on tmux) plus the pinned idle row with its model cell and no background task count as the last non-blank row proves the stripped pair empty, while any other content reads pending.
 Absence of a busy footer alone never proves it: a missing or changed token reads exactly like an idle one, so a footerless screen and a `1 task(s)` row both stay unknown.
-The row must sit in the footer rows beneath the selected pair: a transcript echo of the token above the pair proves nothing.
+A transcript echo of the token anywhere but that pinned last row proves nothing, and a bare echoed token with no model cell is transcript, not the footer.
 A pane whose agent died to a shell has no live agy foreground process, so the dead-shell rule still reads it unknown and the relaunch gate still refuses it.
 The doorbell path this unblocks is the shared literal-then-separate-Enter ring: the typed-but-unsubmitted failure (doorbell lines stacking in the composer until one manual Enter submitted them) no longer recurs, because each ring types once, settles, and sends Enter as a separate keystroke, and re-rings submit the waiting line instead of typing another.
 `tests/fm-agy-doorbell.test.sh` pins the portable half (a separate Enter after the settle, no restacking on re-ring, the relaunch empty-composer read passing after the submit, a dead shell staying unknown).
@@ -158,7 +158,7 @@ No automatic quota failover was exercised or claimed; every handoff above was an
 ## Queued wedge: interrupt-alone recovery
 
 A pane that shows `Press up to edit queued messages` with the doorbell still sitting and no running turn is wedged: plain Enter never submits it, and a relaunch fails while the old agent still runs.
-The separate-Enter ring detects that exact state on agy only - the queued text rendered, our line reading back, the rendered busy read idle, while a healthy running turn reads busy and is never interrupted - and sends the control plane's verified single Escape alone, with no text and no Enter in that step; the next ring submits through the ordinary path.
+The separate-Enter ring detects that exact state on agy only - a positively live agent, the queued text rendered, our line reading back, the pinned idle row with its model cell and no background task count as the last non-blank row, and the rendered busy read idle, while a healthy running turn reads busy and a worker on a background job keeps its task count, neither ever interrupted - and sends the control plane's verified single Escape alone, with no text and no Enter in that step; the next ring submits through the ordinary path.
 This is the fork owner's explicit exception to the no-automatic-interrupt rule for re-rings, scoped to this state.
 `tests/fm-agy-doorbell.test.sh` pins the interrupt-alone step, the submit on the next ring, the ladder going quiet after the acknowledgement, and every gate: non-agy, no queued text, busy, and a foreign line.
 Live proof of the recovery needs a genuinely wedged pane and is unproven; the portable fake renders the exact queued text.

@@ -481,10 +481,11 @@ FM_TASK_INBOX_AGY_QUEUED_TEXT='Press up to edit queued messages'
 # The agy queued-wedge check: 0 when this ring must interrupt instead of
 # submitting, 1 when there is no wedge and the caller proceeds, 2 when a
 # wedge was found but its interrupt key could not be delivered. Only the agy
-# harness in this exact queued state ever returns 0: the pane positively
-# shows our doorbell queued behind no running turn - the exact queued text
-# is rendered, our line reads back in the composer, the pinned idle row is
-# proven with no background task count, and the rendered busy read is idle.
+# harness in this exact queued state ever returns 0: a positively live agent
+# whose pane positively shows our doorbell queued behind no running turn -
+# the exact queued text is rendered, our line reads back in the composer,
+# the pinned idle row is proven with no background task count, and the
+# rendered busy read is idle.
 # A healthy running turn reads busy and is never interrupted, and a worker
 # legitimately waiting on its own background job keeps its task-count row
 # and is never interrupted either. This is the one deliberate exception to
@@ -501,6 +502,10 @@ fm_task_inbox_agy_queued_wedge() {  # <backend> <target> <line> [expected-label]
   # Source in the main shell (not in a substitution) so the composer helpers
   # below resolve, matching fm_task_inbox_composer_holds.
   fm_backend_source "$backend" || return 1
+  # Only a positively live agent is ever interrupted: a dead shell keeps no
+  # composer, so nothing here could be a wedge, and an unreadable endpoint
+  # proves nothing either way.
+  [ "$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null)" = alive ] || return 1
   capture=$(fm_backend_capture "$backend" "$target" "${FM_COMPOSER_CAPTURE_LINES:-20}" "$label" 2>/dev/null) || return 1
   printf '%s\n' "$capture" | fm_composer_strip_ansi | grep -qF -- "$FM_TASK_INBOX_AGY_QUEUED_TEXT" || return 1
   fm_composer_agy_idle_proven "$capture" || return 1
