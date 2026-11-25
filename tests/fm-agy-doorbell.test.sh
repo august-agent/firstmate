@@ -143,10 +143,14 @@ EOF
     if [ -n "${FM_FAKE_QUEUED:-}" ]; then
       printf 'Press up to edit queued messages\n'
     fi
-    if [ -n "${FM_FAKE_BUSY:-}" ]; then
-      printf 'esc to cancel                                     Gemini 3.8 Flash\n'
-    else
-      printf '? for shortcuts                                   Gemini 3.8 Flash\n'
+    if [ -n "${FM_FAKE_TASKS:-}" ]; then
+      printf '? for shortcuts   Gemini 3.8 Flash · high · 1 task(s) · /tasks\n'
+    elif [ -z "${FM_FAKE_NO_STATUS:-}" ]; then
+      if [ -n "${FM_FAKE_BUSY:-}" ]; then
+        printf 'esc to cancel                                     Gemini 3.8 Flash\n'
+      else
+        printf '? for shortcuts                                   Gemini 3.8 Flash\n'
+      fi
     fi
     exit 0 ;;
   list-windows) printf 'fm-t1\n'; exit 0 ;;
@@ -376,6 +380,25 @@ test_agy_dead_shell_never_reads_empty() {
   pass "agy composer: a dead shell reads unknown, never empty"
 }
 
+# Positive idle proof, not absence of busy: a blank pair with a background
+# task count, or with no pinned footer at all, must read unknown even with
+# a live agy identity - only the pinned idle row with no task count proves
+# an empty composer.
+test_agy_idle_proof_blocks_unproven_footer() {
+  local dir cursor state
+  for cursor in 2 4; do
+    dir=$(setup_case "taskcount-cursor$cursor")
+    state=$(FM_FAKE_TASKS=1 FM_FAKE_CURSOR_Y=$cursor composer_state "$dir")
+    [ "$state" = unknown ] \
+      || fail "a background task count must read unknown with cursor $cursor, got $state"
+    dir=$(setup_case "nostatus-cursor$cursor")
+    state=$(FM_FAKE_NO_STATUS=1 FM_FAKE_CURSOR_Y=$cursor composer_state "$dir")
+    [ "$state" = unknown ] \
+      || fail "a missing idle footer must read unknown with cursor $cursor, got $state"
+  done
+  pass "agy composer: only the pinned idle row proves empty"
+}
+
 test_agy_ring_skips_foreign_pending() {
   local dir rec rc log
   dir=$(setup_case foreign)
@@ -492,7 +515,7 @@ test_agy_wedge_interrupts_alone_then_submits() {
     || fail "the sitting line must survive the interrupt step"
   [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
     || fail "the interrupt step must leave no submit mark behind"
-  FM_FAKE_QUEUED= ring_agy "$dir" "$rec"; rc=$?
+  FM_FAKE_QUEUED='' ring_agy "$dir" "$rec"; rc=$?
   expect_code 0 "$rc" "the ring after the interrupt should submit"
   log=$(cat "$dir/send.log")
   [ "$(grep -c "KEYS:send-keys -t sess:fm-t1 Enter" "$dir/send.log")" = 1 ] \
@@ -513,7 +536,7 @@ test_agy_wedge_ack_moves_record_quiet() {
   doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
   printf '%s' "$doorbell" > "$dir/composer.txt"
   FM_FAKE_QUEUED=1 ring_agy "$dir" "$rec" >/dev/null 2>&1
-  FM_FAKE_QUEUED= ring_agy "$dir" "$rec" >/dev/null 2>&1; rc=$?
+  FM_FAKE_QUEUED='' ring_agy "$dir" "$rec" >/dev/null 2>&1; rc=$?
   expect_code 0 "$rc" "the recovery submit should succeed"
   mkdir -p "$dir/state/t1.inbox/handled"
   mv "$dir/state/t1.inbox/001.msg" "$dir/state/t1.inbox/handled/"
@@ -534,11 +557,11 @@ test_agy_wedge_gate() {
   rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
   doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
   printf '%s' "$doorbell" > "$dir/composer.txt"
-  wedge_rc() {  # <harness> <queued> <busy> -> helper rc; every knob is set
-    # explicitly per call so nothing leaks between cases.
+  wedge_rc() {  # <harness> <queued> <busy> <tasks> -> helper rc; every knob
+    # is set explicitly per call so nothing leaks between cases.
     PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
       FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" \
-      FM_FAKE_QUEUED="${2:-}" FM_FAKE_BUSY="${3:-}" \
+      FM_FAKE_QUEUED="${2:-}" FM_FAKE_BUSY="${3:-}" FM_FAKE_TASKS="${4:-}" \
       FM_COMPOSER_HARNESS="${1:-agy}" \
       bash -c '. "$0"; fm_task_inbox_agy_queued_wedge tmux sess:fm-t1 "$1" fm-t1' \
       "$ROOT/bin/fm-task-inbox-lib.sh" "$doorbell" >/dev/null 2>&1
@@ -549,6 +572,8 @@ test_agy_wedge_gate() {
   expect_code 1 "$rc" "no queued text must mean no wedge"
   wedge_rc agy 1 1; rc=$?
   expect_code 1 "$rc" "a running turn must never be interrupted"
+  wedge_rc agy 1 '' 1; rc=$?
+  expect_code 1 "$rc" "a background job must never be interrupted"
   [ ! -s "$dir/send.log" ] || fail "a gated-out wedge must send no keys:$'\n'$(cat "$dir/send.log")"
   printf '%s' "someone else queued" > "$dir/composer.txt"
   wedge_rc agy 1; rc=$?
@@ -585,8 +610,8 @@ test_agy_ring_never_retypes_across_rings
 test_agy_rering_never_stacks_onto_pending
 test_agy_relaunch_composer_check_passes_after_submit
 test_agy_dead_shell_never_reads_empty
+test_agy_idle_proof_blocks_unproven_footer
 test_agy_ring_skips_foreign_pending
 test_agy_ring_unknown_composer_defers_without_typing
 test_agy_ring_skips_busy_own_line
 test_separate_enter_harness_gate
-

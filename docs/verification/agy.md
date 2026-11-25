@@ -136,7 +136,8 @@ agy is included in the session-lock name vocabulary in `bin/fm-session-lock-lib.
 ## Composer: the bare-`>` separated pair, proven by a live agy identity
 
 Byte-level capture of the idle pane shows a bare unstyled `>` between two full-width `─` rules, with an unstyled `? for shortcuts` cell and a dim (`SGR 2`) model cell in the status row below.
-The shared classifier reads that pair through an agy-owned branch of the separated shape: a live agy identity (Herdr's native `agent=agy`, or the anchored `agy` foreground process on tmux) plus an idle status proves the stripped pair empty, while any other content reads pending.
+The shared classifier reads that pair through an agy-owned branch of the separated shape: a live agy identity (Herdr's native `agent=agy`, or the anchored `agy` foreground process on tmux) plus the pinned idle row with no background task count proves the stripped pair empty, while any other content reads pending.
+Absence of a busy footer alone never proves it: a missing or changed token reads exactly like an idle one, so a footerless screen and a `1 task(s)` row both stay unknown.
 A pane whose agent died to a shell has no live agy foreground process, so the dead-shell rule still reads it unknown and the relaunch gate still refuses it.
 The doorbell path this unblocks is the shared literal-then-separate-Enter ring: the typed-but-unsubmitted failure (doorbell lines stacking in the composer until one manual Enter submitted them) no longer recurs, because each ring types once, settles, and sends Enter as a separate keystroke, and re-rings submit the waiting line instead of typing another.
 `tests/fm-agy-doorbell.test.sh` pins the portable half (a separate Enter after the settle, no restacking on re-ring, the relaunch empty-composer read passing after the submit, a dead shell staying unknown).

@@ -91,8 +91,9 @@
 #                pair carries the shape and no identity is needed.
 #                agy draws the same pair around a bare SHELL `>` prompt row,
 #                which never self-proves: only a live agy identity (herdr
-#                native, tmux foreground process) plus an idle status reads
-#                the stripped pair empty, and any other content reads pending.
+#                native, tmux foreground process) plus the pinned idle row
+#                with no background task count reads the stripped pair empty,
+#                and any other content reads pending.
 #
 # THE COMPOSER FOOTER ZONE (task firstmate-doorbell-vals-pending-p1): a
 # harness draws its own furniture BELOW the composer - a user statusLine, a
@@ -270,6 +271,26 @@ fm_composer_kiro_scope() {
 # every read exactly as it was before agy existed.
 fm_composer_agy_scope() {
   [ "${FM_COMPOSER_HARNESS:-}" = agy ]
+}
+
+# fm_composer_agy_idle_proven: 0 when <screen> carries agy's pinned idle
+# status row - the `? for shortcuts` cell - with no nonzero background task
+# count, scoped to the last non-blank rows where the TUI pins it. This is the
+# positive idle proof the agy `empty` verdict and the queued-wedge recovery
+# both require: no busy footer can ever prove a worker is NOT running (a
+# missing or changed token reads the same as an idle one), while only the
+# pinned row proves the TUI is parked waiting for input. A row carrying
+# `N task(s)` proves the opposite - the worker is legitimately waiting on
+# its own background job - so it refuses. Reads the ANSI-preserving screen
+# and strips styling itself, so callers pass whatever capture they hold.
+fm_composer_agy_idle_proven() {  # <screen>
+  local screen=$1 tailrows
+  tailrows=$(printf '%s\n' "$screen" | fm_composer_strip_ansi \
+    | grep -v '^[[:space:]]*$' | tail -5)
+  [ -n "$tailrows" ] || return 1
+  printf '%s\n' "$tailrows" | grep -qF '? for shortcuts' || return 1
+  printf '%s\n' "$tailrows" | grep -qE '[1-9][0-9]* task\(s\)' && return 1
+  return 0
 }
 
 # fm_composer_strip_ghost: the ONE fleet-wide ANSI-aware extractor of "real typed
@@ -2656,8 +2677,10 @@ _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
   # which the dead-shell rule would otherwise always read unknown. The live
   # identity above is what keeps that rule honest: a pane whose agent died to
   # a shell has no agy foreground process and stays unknown. Proven input
-  # stays pending for every live agy state, while only an idle agy proves an
-  # empty composer.
+  # stays pending for every live agy state, while only a positively idle agy -
+  # live identity, an idle status, AND the pinned idle row with no background
+  # task count - proves an empty composer. Absence of a busy footer alone
+  # never does: a missing or changed token reads exactly like an idle one.
   if [ "$agent" = agy ]; then
     [ "$FM_COMPOSER_SCAN_PI_PAIR_VALID" = 1 ] || { printf 'unknown'; return 0; }
     state=$(_fm_composer_classify_agy_rows "$screen" "$styled")
@@ -2666,7 +2689,7 @@ _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
       return 0
     fi
     case "$agent_status" in
-      idle) printf 'empty' ;;
+      idle) fm_composer_agy_idle_proven "$screen" && printf 'empty' || printf 'unknown' ;;
       *) printf 'unknown' ;;
     esac
     return 0
