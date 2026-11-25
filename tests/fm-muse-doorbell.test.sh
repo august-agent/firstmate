@@ -11,7 +11,8 @@
 #      delivery: a pending mark carries the send outcome, so a later ring
 #      reconciles before typing - an accepted but unverified send defers,
 #      while a failed send retypes only onto a proven empty composer and
-#      only once. A mark for another record bars typing, except a failed
+#      only once. A waiting contender proves the lock serializes delivery;
+#      a stale mark waits for the lock before cleanup. A mark for another record bars typing, except a failed
 #      mark on an empty composer, whose retry is performed for that record
 #      first. A per-record lock serializes concurrent rings across the whole
 #      delivery, proved by stalling one ring mid-send. The ring never
@@ -654,8 +655,9 @@ test_muse_ring_serializes_concurrent_rings() {
   literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
   [ "$literals" = 1 ] || fail "the two rings must type exactly once in total, got $literals:$'\n'$log"
   submitted=$(cat "$dir/submitted.log")
-  [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 1 ] \
-    || fail "the winning ring should submit the doorbell once:$'\n'$submitted"
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  [ "$submitted" = "$doorbell" ] \
+    || fail "the winning ring should submit exactly the doorbell:$'\n'$submitted"
   pass "muse ring: concurrent rings serialize to one literal"
 }
 
@@ -1006,6 +1008,53 @@ test_watcher_muse_faf_retry_keeps_pending_mark() {
   pass "watcher: a fire-and-forget retry reconciles instead of retyping"
 }
 
+test_muse_ring_waiter_proceeds_after_winner() {
+  local dir rec rc_a rc_b log literals submitted bg_a bg_b gate_wait doorbell
+  dir=$(setup_case waiter muse)
+  mkdir -p "$dir/typegate"
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_FAKE_TYPE_GATE="$dir/typegate" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring-a.log" 2>&1 &
+  bg_a=$!
+  gate_wait=0
+  while [ ! -e "$dir/typegate/arrived" ] && [ "$gate_wait" -lt 100 ]; do
+    /bin/sleep 0.1
+    gate_wait=$((gate_wait + 1))
+  done
+  [ -e "$dir/typegate/arrived" ] || fail "the first ring never entered delivery"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring-b.log" 2>&1 &
+  bg_b=$!
+  /bin/sleep 1
+  kill -0 "$bg_a" 2>/dev/null || fail "the first ring should still hold the lock while stalled"
+  kill -0 "$bg_b" 2>/dev/null || fail "the waiter should block instead of failing fast"
+  : > "$dir/typegate/go"
+  wait "$bg_a"; rc_a=$?
+  wait "$bg_b"; rc_b=$?
+  expect_code 0 "$rc_a" "the first ring should submit once released"
+  expect_code 0 "$rc_b" "the waiter should proceed once the winner releases"
+  log=$(cat "$dir/send.log")
+  case "$log" in
+    *TYPE-GATE-TIMEOUT*) fail "no gate may time out:$'\n'$log" ;;
+  esac
+  literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
+  [ "$literals" = 2 ] || fail "the waiter retypes only after the winner submitted, got $literals:$'\n'$log"
+  submitted=$(cat "$dir/submitted.log")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  [ "$submitted" = "$doorbell"$'\n'"$doorbell" ] \
+    || fail "both turns must submit in order:$'\n'$submitted"
+  pass "muse ring: a waiting contender proceeds after the winner"
+}
+
 test_muse_ring_defers_on_held_lock() {
   local dir rec rc log lock holder
   dir=$(setup_case heldlock muse)
@@ -1030,6 +1079,32 @@ test_muse_ring_defers_on_held_lock() {
     *"Firstmate instruction waiting"*) fail "a deferred ring must not type:$'\n'$log" ;;
   esac
   pass "muse ring: a held lock defers the ring without typing"
+}
+
+test_muse_stale_mark_cleanup_waits_for_lock() {
+  local dir state holder
+  dir=$(setup_case stalelock muse)
+  state="$dir/state"
+  rec=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 "please continue")
+  mkdir -p "$state/t1.inbox/handled"
+  mv "$state/t1.inbox/001.msg" "$state/t1.inbox/handled/"
+  printf '001.msg\n' > "$state/t1.inbox/.muse-pending"
+  FM_STATE_OVERRIDE="$state" PATH="$dir/fakebin:$PATH" \
+    bash -c '. "$1"; fm_task_inbox_muse_take_ring_lock "$2/t1.inbox" && /bin/sleep 30' \
+    _ "$ROOT/bin/fm-task-inbox-lib.sh" "$state" &
+  holder=$!
+  /bin/sleep 1
+  FM_TASK_INBOX_LOCK_WAIT_SECS=0 FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_task_inbox_due_action "$2" t1 >/dev/null' \
+    _ "$ROOT/bin/fm-task-inbox-lib.sh" "$state"
+  [ -f "$state/t1.inbox/.muse-pending" ] \
+    || { kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null || true
+         fail "cleanup must not delete a mark while another ring holds the lock"; }
+  kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null || true
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_task_inbox_due_action "$2" t1 >/dev/null' \
+    _ "$ROOT/bin/fm-task-inbox-lib.sh" "$state"
+  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "the stale mark should clear once the lock is free"
+  pass "inbox: a stale pending mark waits for the lock before cleanup"
 }
 
 test_muse_stale_note_names_old_marks() {
@@ -1196,8 +1271,10 @@ test_other_harness_ring_sends_no_clear
 test_watcher_muse_rering_redelivers
 test_watcher_muse_first_ring_rings_plainly
 test_muse_ring_serializes_concurrent_rings
+test_muse_ring_waiter_proceeds_after_winner
 test_muse_ring_retries_failed_older_record_first
 test_muse_ring_stale_capture_submit_does_not_retry
+test_muse_stale_mark_cleanup_waits_for_lock
 test_muse_ring_defers_on_unreadable_composer_with_mark
 test_muse_ring_bounds_repeated_post_commit_failures
 test_muse_ring_barrier_for_other_record

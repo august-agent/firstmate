@@ -509,10 +509,12 @@ fm_task_inbox_muse_reconcile() {  # <inbox-dir> <backend> <target> <line> [expec
 
 # The per-record ring lock: <inbox-dir>/.muse-ring.lock, held across one
 # whole ring delivery by the dispatcher so two racing rings cannot interleave
-# a check and a type. A waiter blocks for the bounded lock wait, then sees
-# the winner's mark and reconciles instead of typing; when the wait expires
-# it defers to the next grace. A lock orphaned by a killed ring fails safe
-# the same way: deferred rings keep escalating through the ordinary ladder.
+# a check and a type. A waiter blocks for the bounded lock wait; when it
+# gets the lock it re-reads state under mutual exclusion and usually finds
+# the winner's mark and reconciles, or a clean composer and types exactly
+# once. When the wait expires it defers to the next grace. A lock orphaned
+# by a killed ring fails safe the same way: the holder check reclaims locks
+# whose owner is dead, and anything still held only delays the next attempt.
 # Returns 0 with the lock held, 1 when it is held elsewhere or cannot be
 # taken; the caller releases with fm_lock_release.
 fm_task_inbox_muse_take_ring_lock() {  # <inbox-dir>
@@ -866,10 +868,16 @@ fm_task_inbox_due_action() {  # <state-dir> <task-id>
     # A pending mark outlives this reset while its record is still unhandled:
     # oldest_unhandled skips fire-and-forget records, so an empty ladder here
     # does not mean the inbox is empty, and dropping the mark would let the
-    # fire-and-forget retry below retype onto an unverified literal.
-    if ! mark_seq=$(fm_task_inbox_muse_pending_seq "$dir" 2>/dev/null) \
-      || [ ! -f "$dir/$mark_seq.msg" ]; then
-      rm -f "$dir/.muse-pending" 2>/dev/null || true
+    # fire-and-forget retry below retype onto an unverified literal. The
+    # check and removal run under the ring lock so a concurrent ring cannot
+    # publish a new mark in between; on contention the cleanup waits for the
+    # next poll.
+    if FM_TASK_INBOX_LOCK_WAIT_SECS=0 fm_task_inbox_muse_take_ring_lock "$dir" 2>/dev/null; then
+      if ! mark_seq=$(fm_task_inbox_muse_pending_seq "$dir" 2>/dev/null) \
+        || [ ! -f "$dir/$mark_seq.msg" ]; then
+        rm -f "$dir/.muse-pending" 2>/dev/null || true
+      fi
+      fm_lock_release "$dir/.muse-ring.lock"
     fi
     # The one retry ring exists only while config/wait-no-turns is present.
     # Absent, a mark is left untouched and the inbox stays quiet, as before.
