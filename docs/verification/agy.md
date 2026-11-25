@@ -162,6 +162,7 @@ The separate-Enter ring detects that exact state on agy only - a positively live
 This is the fork owner's explicit exception to the no-automatic-interrupt rule for re-rings, scoped to this state.
 `tests/fm-agy-doorbell.test.sh` pins the interrupt-alone step, the submit on the next ring, the ladder going quiet after the acknowledgement, and every gate: non-agy, no queued text, busy, and a foreign line.
 Live proof of the recovery needs a genuinely wedged pane and is unproven; the portable fake renders the exact queued text.
+Byte-perfect mimicry of the whole footer stack as the viewport bottom is the documented limit of single-screen evidence: no rendered check can tell it from the live footer, so a false interrupt costs at most one Escape into a pane presenting as fully idle, paced by the ladder, and the live matrix guard remains the tripwire for vendor chrome changes instead.
 
 ## Primary and secondmate integration
 
