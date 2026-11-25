@@ -544,14 +544,15 @@ fm_task_inbox_muse_stale_note() {  # <state-dir> <task-id>
 # before typing: an accepted but unverified send defers, while a failed send
 # retypes only onto a proven empty composer and only once - the retry is
 # marked accepted either way, bounding a post-commit failure under a frozen
-# capture to two literals. A mark for another record bars typing entirely:
-# its line is submitted first, or the ring defers. A lagging capture is not proof the send was lost
+# capture to two literals. A mark for another record bars typing: its line
+# is submitted first, its failed send is retried onto an empty composer, or
+# the ring defers. A lagging capture is not proof the send was lost
 # and a second literal would concatenate onto the first. Only a backend with
 # no literal primitive falls back to the shared path, because no input was
 # attempted there. This path never clears:
 # an advisory capture must not authorize a destructive operation. A composer
 # proven to hold other text is skipped exactly like the generic path, and an
-# ambiguous composer keeps the generic type-through path. Returns 0 rang, 1
+# unreadable composer defers without typing at all. Returns 0 rang, 1
 # skipped or deferred on a protected or unverified composer, 2 the send
 # failed, 3 the endpoint is positively dead or missing. Like the generic path,
 # no return value proves delivery; the acknowledgement move into handled/ is
@@ -618,11 +619,11 @@ fm_task_inbox_ring_muse() {  # <backend> <target> <record-path> [expected-label]
       fi
       return 1
       ;;
-    empty) : ;;
-    *)
-      fm_task_inbox_ring_submit "$backend" "$target" "$rec" "$label"
-      return
-      ;;
+    # An ambiguous composer falls through with an empty one, but the recheck
+    # below only authorizes typing onto a proven empty composer: anything
+    # else reconciles without typing, so an unreadable composer defers
+    # instead of risking input onto a draft nobody can see.
+    empty|*) : ;;
   esac
   # The dispatcher serializes rings across this window, so no second ring can
   # interleave its own check and type: re-check under the held lock anyway,

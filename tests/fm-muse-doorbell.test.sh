@@ -28,7 +28,8 @@
 #      clearing, so no draft is lost.
 #   3. A composer holding exactly this ring's own doorbell line is submitted
 #      with Enter and never retyped, unless the worker reports busy.
-#   4. An ambiguous composer keeps the shared type-through path with no clear.
+#   4. An ambiguous composer defers without typing or submitting: a fresh
+#      ring needs a readable empty composer before it types.
 #   5. Any other harness keeps the shared path with no clear.
 #   6. A re-ring with a recorded delivery attempt resubmits the swallowed
 #      line without retyping and without extra keys; the ladder still
@@ -318,45 +319,27 @@ test_muse_ring_submits_own_pending_line() {
   pass "muse ring: its own pending line is submitted with Enter and never retyped"
 }
 
-test_muse_ring_unknown_composer_keeps_shared_path() {
-  local dir state rec rc log
-  dir="$TMP_ROOT/unknown"
-  mkdir -p "$dir/state"
-  fb="$dir/fakebin"; mkdir -p "$fb"
-  cat > "$fb/tmux" <<'SH'
-#!/usr/bin/env bash
-set -u
-case "${1:-}" in
-  send-keys)
-    printf 'KEYS:%s\n' "$*" >> "${FM_SEND_LOG:-/dev/null}"
-    exit 0 ;;
-  display-message)
-    for a in "$@"; do case "$a" in *cursor_y*) printf '1\n'; exit 0 ;; esac; done
-    printf 'fakepane\n'; exit 0 ;;
-  capture-pane)
-    printf 'some unclassifiable screen\nwithout any composer shape\n'
-    exit 0 ;;
-  list-windows) printf 'fm-t1\n'; exit 0 ;;
-esac
-exit 0
-SH
-  chmod +x "$fb/tmux"
-  fm_write_meta "$dir/state/t1.meta" "window=sess:fm-t1" "kind=ship" "harness=muse"
-  state="$dir/state"
+test_muse_ring_unknown_composer_defers_without_typing() {
+  local dir rec rc log
+  dir=$(setup_case unknown muse)
   : > "$dir/send.log"
-  rec=$(inbox_lib "$state" fm_task_inbox_write "$state" t1 "please continue")
-  PATH="$fb:$PATH" FM_SEND_LOG="$dir/send.log" FM_COMPOSER_HARNESS=muse \
-    FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
-    inbox_lib "$state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+  printf '%s' "a human draft" > "$dir/composer.txt"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" \
+    FM_FAKE_GARBAGE_CAPTURE=1 \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
     >"$dir/ring.log" 2>&1
   rc=$?
-  expect_code 0 "$rc" "a muse ring on an ambiguous composer should fall back to the shared path"
+  expect_code 1 "$rc" "an unreadable composer must defer without typing or submitting"
   log=$(cat "$dir/send.log")
-  case "$log" in
-    *"C-u"*) fail "the fallback path must not clear an ambiguous composer:$'\n'$log" ;;
-  esac
-  assert_contains "$log" "Firstmate instruction waiting" "the fallback path should still type the doorbell"
-  pass "muse ring: an ambiguous composer keeps the shared type-through path with no clear"
+  [ -z "$log" ] || fail "an unreadable composer must see no keys at all:$'\n'$log"
+  [ "$(cat "$dir/composer.txt")" = "a human draft" ] \
+    || fail "nothing may be typed onto an unreadable composer"
+  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "a ring that typed nothing must leave no pending mark"
+  pass "muse ring: an unreadable composer defers without typing"
 }
 
 test_other_harness_ring_sends_no_clear() {
@@ -1208,7 +1191,7 @@ test_muse_ring_skips_busy_own_line
 test_muse_ring_skips_foreign_pending
 test_watcher_muse_rering_spares_foreign_draft
 test_muse_ring_submits_own_pending_line
-test_muse_ring_unknown_composer_keeps_shared_path
+test_muse_ring_unknown_composer_defers_without_typing
 test_other_harness_ring_sends_no_clear
 test_watcher_muse_rering_redelivers
 test_watcher_muse_first_ring_rings_plainly

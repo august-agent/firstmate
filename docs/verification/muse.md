@@ -317,7 +317,8 @@ A restoration landing between the final verify and Enter is still submitted: not
 The guarantee is one submission per verified read with no retry into observed change.
 A frozen capture can still misread the post-Enter check, which is why the ladder escalation remains the backstop.
 A stuck mark annotates the escalation with how long the literal went unverified.
-The foreign-draft and ambiguous-composer guards keep their meaning: a proven foreign draft still skips without typing, and an ambiguous composer keeps the shared type-through path.
+The foreign-draft guard keeps its meaning: a proven foreign draft still skips without typing.
+An ambiguous composer defers without typing or submitting: only a readable empty composer authorizes a fresh send.
 
 ```
 $ bash bin/fm-test-run.sh tests/fm-muse-doorbell.test.sh tests/fm-task-inbox.test.sh tests/fm-send-inbox.test.sh
