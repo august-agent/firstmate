@@ -148,7 +148,8 @@ muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
   gen="$(date +%s)-$$-$RANDOM$RANDOM"
   (
     # Own process group when the platform allows it, so a timeout can stop
-    # the whole tree and not just the waiting shell.
+    # the whole tree and not just the waiting shell. Without setsid the
+    # fallback below terminates the wrapper and its direct child only.
     if command -v setsid >/dev/null 2>&1; then
       setsid "$@" >"$dir/.muse-nudge-action-out" 2>&1 &
     else
@@ -173,13 +174,18 @@ muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
 # 0 when the recorded action pid is still the process that was spawned (the
 # hygiene lstart comparison, which defeats pid reuse), 1 otherwise.
 muse_nudge_action_alive() {  # <inbox-dir>
-  local pid started live_start
+  local pid started live_start pstat
   [ -f "$1/.muse-nudge-action-pid" ] || return 1
   pid=$(sed -n '1p' "$1/.muse-nudge-action-pid" 2>/dev/null || true)
   started=$(sed -n '2p' "$1/.muse-nudge-action-pid" 2>/dev/null || true)
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$started" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
+  # A zombie still answers kill -0 with a matching start time but is already
+  # dead: treat it as gone so a reaped-but-unwaited child cannot hold the
+  # ladder forever.
+  pstat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+  case "$pstat" in Z*) return 1 ;; esac
   live_start=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
   [ -n "$live_start" ] && [ "$live_start" = "$started" ]
 }
@@ -478,19 +484,25 @@ muse_nudge_collect() {  # <inbox-dir>
     now=$(date +%s)
     mtime=$(fm_path_mtime "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$mtime$now" in ''|*[!0-9]*) ;; *) [ $(( now - mtime )) -le "$timeout" ] && return 0 ;; esac
-    # Timed out while verifiably alive: stop the whole process group before
-    # releasing the ladder, so a late delivery cannot land on a worker this
-    # ladder no longer tracks. The group id is the control child's pid, which
-    # setsid made a group leader; without setsid it is just the child and
-    # the group kill fails closed into the plain wrapper kill below it.
-    # Best effort only: an unkillable survivor is accepted as a documented
-    # residual (an interrupt landing late on an idle worker cancels nothing,
-    # and a spent relaunch never re-fires). The ladder still advances as
-    # unknown rather than stalling on a stuck control plane.
+    # Timed out while verifiably alive: stop the whole process group first,
+    # then the recorded wrapper, then check. A process that survives both is
+    # unkillable from here: keep tracking it and block any overlapping
+    # action until it terminates, rather than advancing the ladder under a
+    # live control verb.
     cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
     case "$cpid" in ''|*[!0-9]*) : ;; *) kill -TERM -- "-$cpid" 2>/dev/null || true ;; esac
     pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+    sleep 1
+    if muse_nudge_action_alive "$dir"; then
+      case "$cpid" in ''|*[!0-9]*) : ;; *) kill -KILL -- "-$cpid" 2>/dev/null || true ;; esac
+      case "$pid" in ''|*[!0-9]*) : ;; *) kill -KILL "$pid" 2>/dev/null || true ;; esac
+      sleep 1
+    fi
+    if muse_nudge_action_alive "$dir"; then
+      triage_log "muse auto-nudge: timed-out control action will not stop; holding the ladder"
+      return 0
+    fi
     muse_nudge_action_clear "$dir"
     printf 'unknown'
     return 0

@@ -226,7 +226,7 @@ Strikes 2 and 3 reserve first, then run the control plane in the background and 
 The ladder is additive: counting, waking, and timer resets proceed exactly as without it, and the strike state is a durable per-task file in the task inbox directory that survives watcher restarts.
 A strike never fires for a paused, terminal, actively-working, captain-held, or secondmate lane, or while a captain call is open, and the follow-up steer rechecks the guards.
 An acknowledged steer or a terminal task resets the ladder; a spent ladder lapses on busy work, an acknowledged steer, or a pane hash that no longer matches the spent one.
-Thirty-three behavior checks pin the rung math, the pure strike selection, the guard matrix, the continuous-idleness veto including uninspectable trees and a late start after a vetoed rung, the async reservation and generation-tracked collection without replay, the no-overlap and timeout-kill rules, the wait-evidence recheck, the corrupt-state fail-safe, the anchor fallback chain, the steer text and relaunch note, and every strike, collection, and poll transition.
+Thirty-five behavior checks pin the rung math, the pure strike selection, the guard matrix, the continuous-idleness veto including uninspectable trees and a late start after a vetoed rung, the async reservation and generation-tracked collection without replay, the no-overlap and timeout-kill rules, the wait-evidence recheck, the corrupt-state fail-safe, the anchor fallback chain, the steer text and relaunch note, and every strike, collection, and poll transition.
 
 ```
 $ bash bin/fm-test-run.sh tests/fm-muse-nudge.test.sh

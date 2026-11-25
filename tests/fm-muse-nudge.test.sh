@@ -707,6 +707,61 @@ test_muse_nudge_strike_three_waits_for_live_action() {
   pass "muse nudge: strike 3 waits for a live action"
 }
 
+test_muse_nudge_spawn_refuses_live_action() {
+  local sleeper rc
+  setup_nudge_case spawnrefuses
+  mkdir -p "$STATE/t1.inbox"
+  sleep 30 &
+  sleeper=$!
+  {
+    printf '%s\n' "$sleeper"
+    ps -o lstart= -p "$sleeper" 2>/dev/null | sed 's/^[[:space:]]*//'
+    printf 'Gspawn\n'
+  } > "$STATE/t1.inbox/.muse-nudge-action-pid"
+  muse_nudge_strike sess:fm-t1 t1 2 15 001.msg
+  rc=$?
+  expect_code 1 "$rc" "a spawn must refuse while an action is live, got rc $rc"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "a refused spawn must not touch the control plane"
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  pass "muse nudge: a live action blocks a fresh spawn"
+}
+
+test_muse_nudge_timeout_kills_process_group() {
+  local tries
+  setup_nudge_case timeoutgroup
+  muse_nudge_write "$STATE" t1 2 001.msg inflight 15 || fail "setup write should succeed"
+  cat > "$NUDGE_DIR/control-tree" <<'SH'
+#!/bin/sh
+echo $$ > "${FM_CONTROL_PIDFILE:-/dev/null}"
+sleep 300 &
+echo $! > "${FM_CONTROL_CHILDPID:-/dev/null}"
+wait
+SH
+  chmod +x "$NUDGE_DIR/control-tree"
+  export FM_CONTROL_BIN="$NUDGE_DIR/control-tree"
+  export FM_CONTROL_PIDFILE="$NUDGE_DIR/tree.pid"
+  export FM_CONTROL_CHILDPID="$NUDGE_DIR/tree-child.pid"
+  export FM_MUSE_NUDGE_ACTION_TIMEOUT=1
+  : > "$NUDGE_DIR/control.log"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  wait_for_action_rc "$STATE/t1.inbox" 2>/dev/null || true
+  sleep 2
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a timed-out action should advance without replay"
+  tries=0
+  while [ -f "$NUDGE_DIR/tree-child.pid" ] && kill -0 "$(cat "$NUDGE_DIR/tree-child.pid")" 2>/dev/null && [ "$tries" -lt 50 ]; do
+    sleep 0.1
+    tries=$(( tries + 1 ))
+  done
+  if [ -f "$NUDGE_DIR/tree-child.pid" ] && kill -0 "$(cat "$NUDGE_DIR/tree-child.pid")" 2>/dev/null; then
+    fail "a timed-out action tree should be signalled to stop"
+  fi
+  export FM_MUSE_NUDGE_ACTION_TIMEOUT=300
+  pass "muse nudge: a timed-out action tree is signalled to stop"
+}
+
 test_muse_nudge_anchor_fallback_chain() {
   local old_path anchor mtime now
   setup_nudge_case anchorfallback
@@ -840,6 +895,8 @@ test_muse_nudge_worktree_uninspectable_vetoes
 test_muse_nudge_collect_generation
 test_muse_nudge_followup_wait_evidence
 test_muse_nudge_strike_three_waits_for_live_action
+test_muse_nudge_spawn_refuses_live_action
+test_muse_nudge_timeout_kills_process_group
 test_muse_nudge_anchor_fallback_chain
 test_muse_nudge_timeout_kills_action
 test_muse_nudge_collect_empty_rc
