@@ -473,11 +473,6 @@ fm_task_inbox_muse_clear_pending() {  # <inbox-dir>
   rm -f "$1/.muse-pending" 2>/dev/null
 }
 
-# The exact vendor text of an agy input row queued behind a turn that never
-# submits it. Matched as a fixed string on the ANSI-stripped capture, never
-# as a pattern, so no harness output can reshape it.
-FM_TASK_INBOX_AGY_QUEUED_TEXT='Press up to edit queued messages'
-
 # The agy queued-wedge check: 0 when this ring must interrupt instead of
 # submitting, 1 when there is no wedge and the caller proceeds, 2 when a
 # wedge was found but its interrupt key could not be delivered. Only the agy
@@ -507,7 +502,7 @@ fm_task_inbox_agy_queued_wedge() {  # <backend> <target> <line> [expected-label]
   # proves nothing either way.
   [ "$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null)" = alive ] || return 1
   capture=$(fm_backend_capture "$backend" "$target" "${FM_COMPOSER_CAPTURE_LINES:-20}" "$label" 2>/dev/null) || return 1
-  printf '%s\n' "$capture" | fm_composer_strip_ansi | grep -qF -- "$FM_TASK_INBOX_AGY_QUEUED_TEXT" || return 1
+  printf '%s\n' "$capture" | fm_composer_strip_ansi | grep -qF -- "$FM_COMPOSER_AGY_QUEUED_TEXT" || return 1
   fm_composer_agy_idle_proven "$capture" || return 1
   fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
   rendered=$(fm_backend_rendered_busy_state "$backend" "$target" agy 2>/dev/null) || rendered=unknown

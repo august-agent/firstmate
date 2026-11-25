@@ -144,6 +144,9 @@ EOF
       printf '> \n'
     fi
     printf '%s\n' "$rule"
+    if [ -n "${FM_FAKE_TRANSCRIPT_MID:-}" ]; then
+      printf 'Transcript continues below the stale composer\n'
+    fi
     if [ -n "${FM_FAKE_QUEUED:-}" ]; then
       printf 'Press up to edit queued messages\n'
     fi
@@ -482,6 +485,36 @@ test_agy_idle_proof_rejects_below_pair_echo() {
   pass "agy idle proof: below-pair echoes never prove idle"
 }
 
+# Intervening transcript between the pair and the footer proves the pair is
+# stale scrollback: the live footer stands directly beneath the composer,
+# with only a queued row allowed between them.
+test_agy_idle_proof_rejects_intervening_transcript() {
+  local dir rec rc state cursor doorbell
+  for cursor in 2 4; do
+    dir=$(setup_case "midtranscript-cursor$cursor")
+    state=$(FM_FAKE_TRANSCRIPT_MID=1 FM_FAKE_CURSOR_Y=$cursor composer_state "$dir")
+    [ "$state" = unknown ] \
+      || fail "intervening transcript must read unknown with cursor $cursor, got $state"
+  done
+  dir=$(setup_case wedgemidtrail)
+  : > "$dir/send.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  printf '%s' "$doorbell" > "$dir/composer.txt"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" \
+    FM_FAKE_QUEUED=1 FM_FAKE_TRANSCRIPT_MID=1 \
+    FM_COMPOSER_HARNESS=agy FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 1 "$rc" "intervening transcript must defer the wedge"
+  case "$(cat "$dir/send.log")" in
+    *Escape*) fail "intervening transcript must never arm the interrupt:$'\n'$(cat "$dir/send.log")" ;;
+  esac
+  pass "agy idle proof: intervening transcript never proves idle"
+}
+
 test_agy_ring_skips_foreign_pending() {
   local dir rec rc log
   dir=$(setup_case foreign)
@@ -696,6 +729,7 @@ test_agy_dead_shell_never_reads_empty
 test_agy_idle_proof_blocks_unproven_footer
 test_agy_idle_proof_ignores_transcript_echo
 test_agy_idle_proof_rejects_below_pair_echo
+test_agy_idle_proof_rejects_intervening_transcript
 test_agy_ring_skips_foreign_pending
 test_agy_ring_unknown_composer_defers_without_typing
 test_agy_ring_skips_busy_own_line

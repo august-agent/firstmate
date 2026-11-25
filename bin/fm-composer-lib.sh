@@ -274,29 +274,48 @@ fm_composer_agy_scope() {
   [ "${FM_COMPOSER_HARNESS:-}" = agy ]
 }
 
+# The exact vendor text of an agy input row queued behind a turn. It is the
+# one transcript-shaped row the footer walk below tolerates, because the
+# live TUI renders it between the composer and the status row while a
+# queued message waits. Matched as a fixed string, never as a pattern.
+FM_COMPOSER_AGY_QUEUED_TEXT='Press up to edit queued messages'
+
 # fm_composer_agy_idle_proven: 0 when <screen> shows agy's composer pair
 # selected with the pinned idle status row as the last non-blank row - the
-# `? for shortcuts` cell opening that row - and with no nonzero background
-# task count on it. This is the positive idle proof the agy `empty` verdict
-# and the queued-wedge recovery both require. No busy footer can ever prove
-# a worker is NOT running (a missing or changed token reads exactly like an
-# idle one), a transcript echo of the token anywhere but the pinned last
-# row proves nothing either, and a row carrying `N task(s)` proves the
-# opposite - the worker is legitimately waiting on its own background job -
-# so each of those refuses. The TUI pins its status row at the viewport
-# bottom, so anything below it is transcript, and nothing legitimate renders
-# after it. Reads the ANSI-preserving screen and strips styling itself, so
-# callers pass whatever capture they hold. Runs its own scan and cursorless
-# selection, so it decides the same way from the verdict path (which scanned
-# already) and from callers that never scanned.
+# `? for shortcuts` cell opening that row, its model cell after it, no
+# nonzero background task count on it - and with nothing between the pair's
+# closing separator and that row but blank rows or the queued row above.
+# This is the positive idle proof the agy `empty` verdict and the
+# queued-wedge recovery both require. No busy footer can ever prove a worker
+# is NOT running (a missing or changed token reads exactly like an idle
+# one), a transcript echo of the token anywhere but the pinned last row
+# proves nothing either, a bare echo with no model cell is transcript, a
+# row carrying `N task(s)` proves the opposite - the worker is legitimately
+# waiting on its own background job - and any intervening transcript row
+# between the pair and the footer proves the pair is stale scrollback. The
+# TUI pins its status row at the viewport bottom, so anything below it is
+# transcript, and nothing legitimate renders after it. Reads the
+# ANSI-preserving screen and strips styling itself, so callers pass whatever
+# capture they hold. Runs its own scan and cursorless selection, so it
+# decides the same way from the verdict path (which scanned already) and
+# from callers that never scanned.
 fm_composer_agy_idle_proven() {  # <screen>
-  local screen=$1 plain last
+  local screen=$1 plain last last_idx r row
   plain=$(printf '%s\n' "$screen" | fm_composer_strip_ansi)
   _fm_composer_scan_screen "$plain" ''
   _fm_composer_select_cursorless "$plain" "$screen" 0 || return 1
   [ "$FM_COMPOSER_SELECTED_KIND" = pi ] || return 1
-  last=$(printf '%s\n' "$plain" | grep -v '^[[:space:]]*$' | tail -1)
-  [ -n "$last" ] || return 1
+  last_idx=0
+  r=0
+  while IFS= read -r row; do
+    fm_composer_normalize_trim_var row
+    [ -n "$row" ] && last_idx=$r
+    r=$((r + 1))
+  done <<EOF
+$plain
+EOF
+  [ "$last_idx" -gt "$FM_COMPOSER_SCAN_PI_CLOSE" ] || return 1
+  last=$(_fm_composer_screen_row "$last_idx" "$plain")
   fm_composer_normalize_trim_var last
   # The pinned row opens with the cell and always carries its model cell
   # after it; a bare echoed token with nothing after it is transcript, not
@@ -307,6 +326,15 @@ fm_composer_agy_idle_proven() {  # <screen>
   esac
   printf '%s\n' "$last" | grep -qE '^\? for shortcuts[[:space:]]+[^[:space:]]' || return 1
   printf '%s\n' "$last" | grep -qE '[1-9][0-9]* task\(s\)' && return 1
+  r=$((FM_COMPOSER_SCAN_PI_CLOSE + 1))
+  while [ "$r" -lt "$last_idx" ]; do
+    row=$(_fm_composer_screen_row "$r" "$plain")
+    fm_composer_normalize_trim_var row
+    if [ -n "$row" ] && [ "$row" != "$FM_COMPOSER_AGY_QUEUED_TEXT" ]; then
+      return 1
+    fi
+    r=$((r + 1))
+  done
   return 0
 }
 
