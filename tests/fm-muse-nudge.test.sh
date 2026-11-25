@@ -401,6 +401,30 @@ test_muse_nudge_ack_no_resteer() {
   pass "muse nudge: an acknowledged steer never earns an immediate re-steer"
 }
 
+test_muse_nudge_ack_timestamp_suppresses_restrike() {
+  local rc rec
+  setup_nudge_case acktimestamp
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
+  rc=$?
+  expect_code 0 "$rc" "strike 1 should fire on rung 4, got rc $rc"
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  [ -n "$rec" ] || fail "strike 1 should record its steer"
+  touch -d "@$(( $(date +%s) - 3600 ))" "$STATE/t1.inbox/$rec"
+  mkdir -p "$STATE/t1.inbox/handled"
+  mv "$STATE/t1.inbox/$rec" "$STATE/t1.inbox/handled/"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "an acknowledged steer should reset the ladder"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 1 "$rc" "an old message acked now must not re-strike at once, got rc $rc"
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a suppressed restrike should write nothing"
+  touch -d "@$(( $(date +%s) - 3600 ))" "$STATE/t1.inbox/handled/$rec"
+  muse_nudge_tick sess:fm-t1 t1 6 hAAA
+  rc=$?
+  expect_code 0 "$rc" "an old acknowledgement should allow a fresh steer, got rc $rc"
+  pass "muse nudge: ack observation time suppresses an immediate restrike"
+}
+
 test_muse_nudge_tick_corrupt_state_fails_safe() {
   setup_nudge_case corruptstate
   mkdir -p "$STATE/t1.inbox"
@@ -727,6 +751,56 @@ test_muse_nudge_spawn_refuses_live_action() {
   pass "muse nudge: a live action blocks a fresh spawn"
 }
 
+test_muse_nudge_ack_timestamp_suppresses_restrike() {
+  local rc rec
+  setup_nudge_case acktimestamp
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
+  rc=$?
+  expect_code 0 "$rc" "strike 1 should fire on rung 4, got rc $rc"
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  [ -n "$rec" ] || fail "strike 1 should record its steer"
+  touch -d "@$(( $(date +%s) - 7200 ))" "$STATE/t1.inbox/$rec"
+  mkdir -p "$STATE/t1.inbox/handled"
+  mv "$STATE/t1.inbox/$rec" "$STATE/t1.inbox/handled/"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" 2>/dev/null || true)" = "" ] || fail "an acknowledged steer should reset the ladder"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 1 "$rc" "an old message acked now must not re-strike at once, got rc $rc"
+  touch -d "@$(( $(date +%s) - 7200 ))" "$STATE/t1.inbox/handled/$rec"
+  muse_nudge_tick sess:fm-t1 t1 6 hAAA
+  rc=$?
+  expect_code 0 "$rc" "an old acknowledgement should allow a fresh steer, got rc $rc"
+  pass "muse nudge: ack observation time suppresses an immediate restrike"
+}
+
+test_muse_nudge_no_setsid_fallback() {
+  local rc mode tries
+  setup_nudge_case nosetsid
+  # Shadow the command builtin itself: command -v only checks that a name
+  # resolves, so a failing setsid stub would still count as present.
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = setsid ]; then return 1; fi
+    builtin command "$@"
+  }
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
+  rc=$?
+  expect_code 0 "$rc" "strike 1 needs no process group, got rc $rc"
+  muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 0 "$rc" "strike 2 must spawn without setsid, got rc $rc"
+  tries=0
+  while [ ! -f "$STATE/t1.inbox/.muse-nudge-action-cpid" ] && [ "$tries" -lt 50 ]; do
+    sleep 0.1
+    tries=$(( tries + 1 ))
+  done
+  mode=$(sed -n '3p' "$STATE/t1.inbox/.muse-nudge-action-cpid" 2>/dev/null || true)
+  [ "$mode" = child ] || fail "without setsid the action should record child mode, got $mode"
+  unset -f command
+  pass "muse nudge: strikes work without setsid via direct-child fallback"
+}
+
 test_muse_nudge_timeout_kills_process_group() {
   local tries
   setup_nudge_case timeoutgroup
@@ -901,6 +975,8 @@ test_muse_nudge_anchor_fallback_chain
 test_muse_nudge_timeout_kills_action
 test_muse_nudge_collect_empty_rc
 test_muse_nudge_strike_three_collected
+test_muse_nudge_ack_timestamp_suppresses_restrike
+test_muse_nudge_no_setsid_fallback
 test_muse_nudge_rungs_default
 test_muse_nudge_next_strike_matrix
 test_muse_nudge_file_roundtrip

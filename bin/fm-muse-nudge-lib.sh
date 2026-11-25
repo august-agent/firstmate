@@ -152,11 +152,13 @@ muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
     # fallback below terminates the wrapper and its direct child only.
     if command -v setsid >/dev/null 2>&1; then
       setsid "$@" >"$dir/.muse-nudge-action-out" 2>&1 &
+      cpid=$!
+      printf '%s\n%s\n%s\n' "$cpid" "$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//')" group >"$dir/.muse-nudge-action-cpid" 2>/dev/null
     else
       "$@" >"$dir/.muse-nudge-action-out" 2>&1 &
+      cpid=$!
+      printf '%s\n%s\n%s\n' "$cpid" "$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)" child >"$dir/.muse-nudge-action-cpid" 2>/dev/null
     fi
-    cpid=$!
-    printf '%s\n' "$cpid" >"$dir/.muse-nudge-action-cpid" 2>/dev/null
     wait "$cpid"
     status=$?
     printf '%s %s\n' "$gen" "$status" >"$dir/.muse-nudge-action-tmp.$gen" 2>/dev/null \
@@ -461,7 +463,7 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
 # with no result, or one older than the action timeout, reconciles as unknown
 # without replaying the verb; a live one keeps waiting. Always reports 0.
 muse_nudge_collect() {  # <inbox-dir>
-  local dir=$1 rc rcgen pidgen timeout now mtime pid cpid
+  local dir=$1 rc rcgen pidgen timeout now mtime pid cpid cstarted cmode clive
   dir=${dir%/}
   if [ -f "$dir/.muse-nudge-action-rc" ]; then
     rc=$(cat "$dir/.muse-nudge-action-rc" 2>/dev/null || true)
@@ -484,18 +486,40 @@ muse_nudge_collect() {  # <inbox-dir>
     now=$(date +%s)
     mtime=$(fm_path_mtime "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$mtime$now" in ''|*[!0-9]*) ;; *) [ $(( now - mtime )) -le "$timeout" ] && return 0 ;; esac
-    # Timed out while verifiably alive: stop the whole process group first,
-    # then the recorded wrapper, then check. A process that survives both is
-    # unkillable from here: keep tracking it and block any overlapping
-    # action until it terminates, rather than advancing the ladder under a
-    # live control verb.
+    # Timed out while verifiably alive: stop the recorded control process
+    # first (process group when setsid isolated it, direct pid otherwise -
+    # the recorded mode selects the signal target), then the waiting wrapper.
+    # The cpid kill fires only after verifying the recorded start time still
+    # matches, so a reused pid is never signalled. A process that survives
+    # both is unkillable from here: keep tracking it and block any
+    # overlapping action until it terminates, rather than advancing the
+    # ladder under a live control verb.
     cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
-    case "$cpid" in ''|*[!0-9]*) : ;; *) kill -TERM -- "-$cpid" 2>/dev/null || true ;; esac
+    cstarted=$(sed -n '2p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+    cmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+    clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+    if [ -n "$cpid" ] && [ -n "$cstarted" ] && [ "$clive" = "$cstarted" ]; then
+      if [ "$cmode" = group ]; then
+        kill -TERM -- "-$cpid" 2>/dev/null || true
+      else
+        kill -TERM "$cpid" 2>/dev/null || true
+      fi
+    fi
     pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
     sleep 1
     if muse_nudge_action_alive "$dir"; then
-      case "$cpid" in ''|*[!0-9]*) : ;; *) kill -KILL -- "-$cpid" 2>/dev/null || true ;; esac
+      cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+      cstarted=$(sed -n '2p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+      cmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+      clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+      if [ -n "$cpid" ] && [ -n "$cstarted" ] && [ "$clive" = "$cstarted" ]; then
+        if [ "$cmode" = group ]; then
+          kill -KILL -- "-$cpid" 2>/dev/null || true
+        else
+          kill -KILL "$cpid" 2>/dev/null || true
+        fi
+      fi
       case "$pid" in ''|*[!0-9]*) : ;; *) kill -KILL "$pid" 2>/dev/null || true ;; esac
       sleep 1
     fi
@@ -544,7 +568,14 @@ muse_nudge_poll() {  # <window> <task> <idle-now> <pane-hash>
   fi
   if [ -n "$rec" ]; then
     handled=$(fm_task_inbox_handled_dir "$STATE" "$task")
-    if [ -e "$handled/$rec" ]; then muse_nudge_clear "$STATE" "$task"; return 0; fi
+    if [ -e "$handled/$rec" ]; then
+      # Stamp the acknowledgement observation time: mv preserves the
+      # message's own mtime, so without this the recency check below would
+      # read creation time instead of ack time.
+      touch "$handled/$rec" 2>/dev/null || true
+      muse_nudge_clear "$STATE" "$task"
+      return 0
+    fi
   fi
   if [ "$strike" = 3 ]; then
     # A spent ladder never re-fires, but its relaunch outcome is still worth
