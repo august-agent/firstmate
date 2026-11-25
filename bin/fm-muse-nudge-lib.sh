@@ -623,8 +623,13 @@ muse_nudge_collect() {  # <inbox-dir>
     fi
     # The control is dead or unverifiable: stop a lingering wrapper, clear
     # the tracking, and reconcile as unknown without replaying the verb.
-    pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
-    case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+    # The wrapper is signalled only when its recorded identity still
+    # matches: its number may have been recycled since it died, and an
+    # unrelated replacement process must never be signalled.
+    if muse_nudge_action_alive "$dir"; then
+      pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
+      case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+    fi
     muse_nudge_action_clear "$dir"
     printf 'unknown'
     return 0

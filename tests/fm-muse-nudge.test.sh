@@ -1056,6 +1056,50 @@ SH
   pass "muse nudge: a completed action notes its surviving group"
 }
 
+test_muse_nudge_timeout_never_signals_recycled_wrapper() {
+  local rc tries cpid repl gen pidfile cpidfile
+  setup_nudge_case timeoutrecycled
+  cat > "$NUDGE_DIR/control-tree" <<'SH'
+#!/bin/sh
+printf 'CONTROL:%s\n' "$*" >> "${FM_CONTROL_LOG:-/dev/null}"
+sleep 300 &
+wait
+SH
+  chmod +x "$NUDGE_DIR/control-tree"
+  export FM_CONTROL_BIN="$NUDGE_DIR/control-tree"
+  # Strike 1 on file so rung 5 dispatches a real strike-2 action.
+  muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 0 "$rc" "rung 5 with strike 1 on file must dispatch strike 2, got rc $rc"
+  pidfile="$STATE/t1.inbox/.muse-nudge-action-pid"
+  cpidfile="$STATE/t1.inbox/.muse-nudge-action-cpid"
+  tries=0
+  while [ ! -f "$cpidfile" ] && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$(( tries + 1 )); done
+  [ -f "$cpidfile" ] || fail "dispatch must record the control pid"
+  cpid=$(sed -n '1p' "$cpidfile")
+  kill -0 "$cpid" 2>/dev/null || fail "the control must be alive before the timeout"
+  # Recycle the wrapper number: point the pid file at a live unrelated
+  # process with a start time that cannot match it.
+  sleep 300 &
+  repl=$!
+  kill -0 "$repl" 2>/dev/null || fail "the replacement process must be alive"
+  gen=$(sed -n '3p' "$pidfile")
+  printf '%s\n%s\n%s\n' "$repl" "recycled-wrapper-start" "$gen" > "$pidfile"
+  touch -d "@$(( $(date +%s) - 600 ))" "$pidfile"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  # The surviving control is stopped, the strike advances, but the
+  # replacement process must never have been signalled.
+  kill -0 "$cpid" 2>/dev/null && fail "a timed-out control must still be stopped"
+  kill -0 "$repl" 2>/dev/null || fail "cleanup must never signal a recycled wrapper number"
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "cleanup should advance without replay, got $(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")"
+  [ ! -f "$pidfile" ] || fail "cleanup must clear its tracking"
+  kill -KILL "$repl" 2>/dev/null || true
+  wait "$repl" 2>/dev/null || true
+  pass "muse nudge: cleanup never signals a recycled wrapper number"
+}
+
 test_muse_nudge_timeout_kills_process_group() {
   local rc tries cpid pidfile cpidfile
   setup_nudge_case timeoutgroup
@@ -1243,6 +1287,7 @@ test_muse_nudge_timeout_holds_unkillable_action
 test_muse_nudge_timeout_wrapper_dead_still_stops_control
 test_muse_nudge_timeout_kills_reaped_leader_orphans
 test_muse_nudge_done_notes_surviving_group
+test_muse_nudge_timeout_never_signals_recycled_wrapper
 test_muse_nudge_anchor_fallback_chain
 test_muse_nudge_timeout_kills_action
 test_muse_nudge_collect_empty_rc
