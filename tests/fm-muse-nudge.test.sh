@@ -907,6 +907,155 @@ SH
   pass "muse nudge: an unkillable action holds the ladder until it dies"
 }
 
+test_muse_nudge_timeout_wrapper_dead_still_stops_control() {
+  local rc tries wpid cpid pidfile cpidfile
+  setup_nudge_case timeoutwrapperdead
+  cat > "$NUDGE_DIR/control-stubborn" <<'SH'
+#!/bin/sh
+# Ignores TERM, and children inherit the disposition, so only KILL stops
+# this control and its child.
+trap '' TERM
+printf 'CONTROL:%s\n' "$*" >> "${FM_CONTROL_LOG:-/dev/null}"
+sleep 300 &
+wait
+SH
+  chmod +x "$NUDGE_DIR/control-stubborn"
+  export FM_CONTROL_BIN="$NUDGE_DIR/control-stubborn"
+  # Strike 1 on file so rung 5 dispatches a real strike-2 action.
+  muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 0 "$rc" "rung 5 with strike 1 on file must dispatch strike 2, got rc $rc"
+  pidfile="$STATE/t1.inbox/.muse-nudge-action-pid"
+  cpidfile="$STATE/t1.inbox/.muse-nudge-action-cpid"
+  tries=0
+  while [ ! -f "$cpidfile" ] && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$(( tries + 1 )); done
+  [ -f "$cpidfile" ] || fail "dispatch must record the control pid"
+  wpid=$(sed -n '1p' "$pidfile")
+  cpid=$(sed -n '1p' "$cpidfile")
+  kill -0 "$cpid" 2>/dev/null || fail "the control must be alive before the timeout"
+  # Reap the waiter while its isolated control survives: a restart or an
+  # outside kill does exactly this.
+  kill -KILL "$wpid" 2>/dev/null || fail "the test must be able to stop the wrapper"
+  sleep 0.5
+  muse_nudge_action_alive "$STATE/t1.inbox" && fail "the wrapper must be gone"
+  touch -d "@$(( $(date +%s) - 600 ))" "$pidfile"
+  # Shadow kill so signals to the recorded control never land: the ladder
+  # must hold on the surviving control, not discard it with its wrapper.
+  SHADOW_TARGET="$cpid"
+  kill() {
+    local a intercept=no
+    for a in "$@"; do
+      case "$a" in
+        "$SHADOW_TARGET"|"-$SHADOW_TARGET") intercept=yes ;;
+      esac
+    done
+    if [ "$intercept" = yes ]; then return 0; fi
+    builtin kill "$@"
+  }
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ -f "$STATE/t1.inbox/.muse-nudge-action-held" ] || fail "a surviving control must hold the ladder without its wrapper"
+  [ -f "$pidfile" ] || fail "a held action must keep its tracking"
+  [ -f "$cpidfile" ] || fail "a held action must keep its control tracking"
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|inflight|15" ] \
+    || fail "a held action must keep the strike pending, got $(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")"
+  muse_nudge_spawn "$STATE" t1 "$FM_CONTROL_BIN" t1 interrupt
+  expect_code 1 "$?" "a surviving control must refuse a fresh spawn without its wrapper"
+  assert_contains "$(cat "$TRIAGE_LOG")" "holding the ladder" "the hold must be logged"
+  # Real signals stop the survivor: the hold resolves into unknown and the
+  # ladder advances, even though the wrapper is long gone.
+  unset -f kill
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  kill -0 "$cpid" 2>/dev/null && fail "the surviving control must die once signals land"
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a stopped survivor should advance without replay, got $(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")"
+  [ ! -f "$STATE/t1.inbox/.muse-nudge-action-held" ] || fail "a resolved hold must clear its marker"
+  [ ! -f "$pidfile" ] || fail "a resolved hold must clear its tracking"
+  unset SHADOW_TARGET
+  pass "muse nudge: a dead wrapper never discards a surviving control"
+}
+
+test_muse_nudge_timeout_kills_reaped_leader_orphans() {
+  local rc tries cpid child pidfile cpidfile
+  setup_nudge_case timeoutorphans
+  cat > "$NUDGE_DIR/control-orphan" <<'SH'
+#!/bin/sh
+# The leader takes the default TERM, but its child ignores it: reaping the
+# leader must not read as the whole tree being dead.
+printf 'CONTROL:%s\n' "$*" >> "${FM_CONTROL_LOG:-/dev/null}"
+( trap '' TERM; exec sleep 300 ) &
+echo $! > "${FM_CONTROL_CHILDPID:-/dev/null}"
+wait
+SH
+  chmod +x "$NUDGE_DIR/control-orphan"
+  export FM_CONTROL_BIN="$NUDGE_DIR/control-orphan"
+  export FM_CONTROL_CHILDPID="$NUDGE_DIR/orphan-child.pid"
+  # Strike 1 on file so rung 5 dispatches a real strike-2 action.
+  muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 0 "$rc" "rung 5 with strike 1 on file must dispatch strike 2, got rc $rc"
+  pidfile="$STATE/t1.inbox/.muse-nudge-action-pid"
+  cpidfile="$STATE/t1.inbox/.muse-nudge-action-cpid"
+  tries=0
+  while [ ! -f "$NUDGE_DIR/orphan-child.pid" ] && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$(( tries + 1 )); done
+  [ -f "$cpidfile" ] || fail "dispatch must record the control pid"
+  cpid=$(sed -n '1p' "$cpidfile")
+  child=$(cat "$NUDGE_DIR/orphan-child.pid")
+  kill -0 "$cpid" 2>/dev/null || fail "the leader must be alive before the timeout"
+  kill -0 "$child" 2>/dev/null || fail "the child must be alive before the timeout"
+  touch -d "@$(( $(date +%s) - 600 ))" "$pidfile"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  # The child ignores TERM, so only a group KILL after the leader's reap
+  # leaves it dead.
+  tries=0
+  while kill -0 "$child" 2>/dev/null && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$(( tries + 1 )); done
+  if kill -0 "$child" 2>/dev/null; then
+    kill -KILL "$child" 2>/dev/null || true
+    fail "a reaped leader must not spare its orphan from KILL"
+  fi
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a stopped tree should advance without replay, got $(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")"
+  [ ! -f "$pidfile" ] || fail "a resolved action must clear its tracking"
+  [ ! -f "$cpidfile" ] || fail "a resolved action must clear its control tracking"
+  pass "muse nudge: a reaped leader never spares its orphans from KILL"
+}
+
+test_muse_nudge_done_notes_surviving_group() {
+  local rc tries child pidfile cpidfile
+  setup_nudge_case donesurvivors
+  cat > "$NUDGE_DIR/control-stray" <<'SH'
+#!/bin/sh
+# The leader exits at once, leaving a live child behind.
+printf 'CONTROL:%s\n' "$*" >> "${FM_CONTROL_LOG:-/dev/null}"
+( trap '' TERM; exec sleep 60 ) &
+echo $! > "${FM_CONTROL_CHILDPID:-/dev/null}"
+exit 0
+SH
+  chmod +x "$NUDGE_DIR/control-stray"
+  export FM_CONTROL_BIN="$NUDGE_DIR/control-stray"
+  export FM_CONTROL_CHILDPID="$NUDGE_DIR/stray-child.pid"
+  muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 0 "$rc" "rung 5 with strike 1 on file must dispatch strike 2, got rc $rc"
+  pidfile="$STATE/t1.inbox/.muse-nudge-action-pid"
+  cpidfile="$STATE/t1.inbox/.muse-nudge-action-cpid"
+  tries=0
+  while [ ! -f "$STATE/t1.inbox/.muse-nudge-action-rc" ] && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$(( tries + 1 )); done
+  [ -f "$STATE/t1.inbox/.muse-nudge-action-rc" ] || fail "a fast control must report its outcome"
+  child=$(cat "$NUDGE_DIR/stray-child.pid")
+  kill -0 "$child" 2>/dev/null || fail "the stray child must outlive its leader"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  assert_contains "$(cat "$TRIAGE_LOG")" "surviving group members" "survivors must be noted before the outcome is accepted"
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a completed action should advance, got $(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")"
+  [ ! -f "$pidfile" ] || fail "a completed action must clear its tracking"
+  kill -0 "$child" 2>/dev/null || fail "the done path must not stop survivors on its own"
+  kill -KILL "$child" 2>/dev/null || true
+  pass "muse nudge: a completed action notes its surviving group"
+}
+
 test_muse_nudge_timeout_kills_process_group() {
   local rc tries cpid pidfile cpidfile
   setup_nudge_case timeoutgroup
@@ -1091,6 +1240,9 @@ test_muse_nudge_spawn_refuses_live_action
 test_muse_nudge_timeout_kills_process_group
 test_muse_nudge_timeout_kills_uncooperative_action
 test_muse_nudge_timeout_holds_unkillable_action
+test_muse_nudge_timeout_wrapper_dead_still_stops_control
+test_muse_nudge_timeout_kills_reaped_leader_orphans
+test_muse_nudge_done_notes_surviving_group
 test_muse_nudge_anchor_fallback_chain
 test_muse_nudge_timeout_kills_action
 test_muse_nudge_collect_empty_rc

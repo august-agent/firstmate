@@ -138,8 +138,9 @@ muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
   dir=$(fm_task_inbox_dir "$state" "$task")
   # Never overlap control actions: a still-running recorded action blocks a
   # new spawn, whatever the strike file says, so an in-flight verb is never
-  # orphaned by a fresh reservation.
-  if muse_nudge_action_alive "$dir"; then
+  # orphaned by a fresh reservation. A verifiably live control counts even
+  # when its wrapper is gone.
+  if muse_nudge_action_tracked "$dir"; then
     triage_log "muse auto-nudge: a control action is already running for $task; not starting another"
     return 1
   fi
@@ -198,11 +199,27 @@ muse_nudge_action_clear() {  # <inbox-dir>
   rm -f "$1"/.muse-nudge-action-tmp.* "$1"/.muse-nudge-action-rc "$1"/.muse-nudge-action-out "$1"/.muse-nudge-action-pid "$1"/.muse-nudge-action-cpid "$1"/.muse-nudge-action-held 2>/dev/null
 }
 
-# 0 when the recorded control process is verifiably alive. The recorded
-# start time must still match, so a reused pid never counts as the control
-# surviving; in group mode the group itself is probed, catching children
-# that outlive their leader. Nothing is signalled here, so an unverifiable
-# identity simply reads as not alive.
+# 0 when process group <pgid> still has a live member. A zombie-only group
+# reads as dead. A failed scan reads as alive: holding is safer than
+# clearing under a possibly-live tree.
+muse_nudge_group_live() {  # <pgid>
+  local pgid=$1 members
+  case "$pgid" in ''|*[!0-9]*) return 1 ;; esac
+  members=$(ps -e -o pgid=,stat= 2>/dev/null) || return 0
+  [ -n "$members" ] || return 0
+  printf '%s\n' "$members" | awk -v g="$pgid" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit (f ? 0 : 1) }'
+}
+
+# 0 when the recorded control action is verifiably alive, independently of
+# the waiting wrapper (a restart or a kill can reap the waiter while its
+# isolated control survives). Identity is always verified first: the
+# recorded start time must match before anything counts, so a reused pid
+# never reads as the control surviving and its group is never probed. A
+# live leader means the action is alive; a zombie leader, or a reaped one
+# whose number is demonstrably unreused, leaves only the isolated group to
+# speak, probed for live non-zombie members so orphans outliving their
+# leader still count while a zombie-only group reads as dead. Nothing is
+# signalled here, so an unverifiable identity simply reads as not alive.
 muse_nudge_control_alive() {  # <inbox-dir>
   local dir=$1 cpid cstarted cmode clive pstat
   dir=${dir%/}
@@ -211,25 +228,31 @@ muse_nudge_control_alive() {  # <inbox-dir>
   cmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
   [ -n "$cpid" ] && [ -n "$cstarted" ] || return 1
   case "$cpid" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$cpid" 2>/dev/null || return 1
-  # A zombie still answers kill -0 with a matching start time but is already
-  # dead: only a live group around it still counts as the action surviving.
-  pstat=$(ps -o stat= -p "$cpid" 2>/dev/null | tr -d '[:space:]' || true)
-  case "$pstat" in Z*) : ;; *)
-    clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-    [ -n "$clive" ] && [ "$clive" = "$cstarted" ] && return 0
-    return 1
-    ;;
-  esac
+  clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+  if [ -n "$clive" ] && [ "$clive" = "$cstarted" ]; then
+    # The recorded leader is verifiably ours. A live leader means the
+    # action is alive; a zombie one leaves the group to speak.
+    pstat=$(ps -o stat= -p "$cpid" 2>/dev/null | tr -d '[:space:]' || true)
+    case "$pstat" in Z*) : ;; *) return 0 ;; esac
+  else
+    # The leader is gone or the number was reused. Only a demonstrably
+    # unreused number keeps a group probe attributable: a reused pid shows
+    # a different start time, and its group is not ours.
+    [ -z "$clive" ] || return 1
+  fi
+  # A zombie leader or a reaped one with possible orphans: only an
+  # isolated group can still be ours, probed for live members.
   [ "$cmode" = group ] || return 1
-  kill -0 -- "-$cpid" 2>/dev/null
+  muse_nudge_group_live "$cpid"
 }
 
-# Signal the recorded control process, never the waiting wrapper: the
-# process group when setsid isolated it, the direct pid otherwise. Signals
-# nothing unless the recorded start time still matches, so a reused pid is
-# never signalled. Reports 0 when a signal was sent, 1 when there was
-# nothing safe to signal.
+# Signal the recorded control action, never the waiting wrapper. A
+# verified leader is signalled by group when setsid isolated it, by direct
+# pid otherwise; a reaped leader with surviving orphans is still
+# stoppable, because a pgid dies with its last member, so a live one here
+# is still ours. Signals nothing unverifiable: a reused pid is never
+# signalled. Reports 0 when a signal was sent, 1 when there was nothing
+# safe to signal.
 muse_nudge_control_signal() {  # <inbox-dir> <signal>
   local dir=$1 sig=$2 cpid cstarted cmode clive
   dir=${dir%/}
@@ -239,13 +262,32 @@ muse_nudge_control_signal() {  # <inbox-dir> <signal>
   [ -n "$cpid" ] && [ -n "$cstarted" ] || return 1
   case "$cpid" in ''|*[!0-9]*) return 1 ;; esac
   clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-  [ -n "$clive" ] && [ "$clive" = "$cstarted" ] || return 1
-  if [ "$cmode" = group ]; then
-    kill "-$sig" -- "-$cpid" 2>/dev/null || true
-  else
-    kill "-$sig" "$cpid" 2>/dev/null || true
+  if [ -n "$clive" ] && [ "$clive" = "$cstarted" ]; then
+    # Verified ours, zombie or not: the group signal also sweeps live
+    # children of a zombie leader.
+    if [ "$cmode" = group ]; then
+      kill "-$sig" -- "-$cpid" 2>/dev/null || true
+    else
+      kill "-$sig" "$cpid" 2>/dev/null || true
+    fi
+    return 0
   fi
-  return 0
+  # A reaped leader with surviving orphans: stoppable only when the number
+  # is demonstrably unreused, so the live group is provably still ours.
+  if [ -z "$clive" ] && [ "$cmode" = group ] && muse_nudge_group_live "$cpid"; then
+    kill "-$sig" -- "-$cpid" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+# 0 when a control action is still tracked as running: a live wrapper, or a
+# verifiably live control whose wrapper is gone (a watcher restart or an
+# outside kill can reap the waiter while its isolated control survives).
+# Gates spawning and strike 3 alike, so a survivor is never overlapped or
+# spent past.
+muse_nudge_action_tracked() {  # <inbox-dir>
+  muse_nudge_action_alive "$1" || muse_nudge_control_alive "$1"
 }
 
 # Drop strike state. Absent state is already clean.
@@ -482,8 +524,9 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
   # the poll path first, which advances the ladder once its outcome lands.
   [ "$pending" != inflight ] || return 1
   # A strike-3 relaunch must not overlap a still-running action either: it
-  # waits for collection or timeout like everything else.
-  if [ "$next" = 3 ] && muse_nudge_action_alive "$(fm_task_inbox_dir "$STATE" "$task")"; then
+  # waits for collection or timeout like everything else. A verifiably live
+  # control counts even when its wrapper is gone.
+  if [ "$next" = 3 ] && muse_nudge_action_tracked "$(fm_task_inbox_dir "$STATE" "$task")"; then
     triage_log "muse auto-nudge holding strike 3 for $task: a control action is still running"
     return 1
   fi
@@ -510,12 +553,13 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
 # the strike file for the caller to advance. A result is accepted only when
 # its generation matches the recorded action, so a late result from a
 # superseded action can never be collected as the current one. A dead action
-# with no result, or one older than the action timeout, reconciles as unknown
-# without replaying the verb; a live one keeps waiting. A timed-out action
-# whose control refuses to die reports held so the caller keeps the strike
-# pending instead of advancing. Always reports 0.
+# with no result reconciles as unknown without replaying the verb; a live
+# one keeps waiting, and liveness counts a verifiably live control even when
+# its wrapper is gone. A timed-out action whose control refuses to die
+# reports held so the caller keeps the strike pending instead of advancing.
+# Always reports 0.
 muse_nudge_collect() {  # <inbox-dir>
-  local dir=$1 rc rcgen pidgen timeout now mtime pid cpid cstarted cmode clive
+  local dir=$1 rc rcgen pidgen timeout now mtime pid mcpid mcmode mclive
   dir=${dir%/}
   if [ -f "$dir/.muse-nudge-action-rc" ]; then
     rc=$(cat "$dir/.muse-nudge-action-rc" 2>/dev/null || true)
@@ -523,6 +567,16 @@ muse_nudge_collect() {  # <inbox-dir>
     pidgen=$(sed -n '3p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$rc" in ?*" "[0-9]*)
       if [ -n "$rcgen" ] && [ -n "$pidgen" ] && [ "$rcgen" = "$pidgen" ]; then
+        # A completed verb may still have group members outliving it: note
+        # them for the supervisor, then accept the verb's own outcome. Only
+        # a demonstrably unreused number keeps the probe attributable, so a
+        # reused pid never reports another group's members as survivors.
+        mcpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+        mcmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+        mclive=$(ps -o lstart= -p "$mcpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+        if [ "$mcmode" = group ] && [ -z "$mclive" ] && muse_nudge_group_live "$mcpid"; then
+          triage_log "muse auto-nudge: a completed action left surviving group members; accepting its outcome"
+        fi
         muse_nudge_action_clear "$dir"
         printf 'done:%s' "${rc#* }"
         return 0
@@ -530,24 +584,18 @@ muse_nudge_collect() {  # <inbox-dir>
       ;;
     esac
   fi
-  # No result file: a live action keeps waiting, anything else reconciles as
-  # unknown without replaying the verb - including the crash window between
-  # the reservation write and the spawn, where no pid file exists at all.
+  # No result file. Liveness is tracked independently of the waiting
+  # wrapper: a restart or a kill can reap the waiter while its isolated
+  # control survives, and that survivor must be stopped, not discarded.
   # Reports "held" while a timed-out control refuses to die, so the caller
   # keeps the strike pending instead of advancing under a live verb.
-  if [ -f "$dir/.muse-nudge-action-pid" ] && muse_nudge_action_alive "$dir"; then
+  # Always reports 0.
+  if [ -f "$dir/.muse-nudge-action-pid" ] && muse_nudge_action_tracked "$dir"; then
     timeout=$(muse_nudge_action_timeout)
     now=$(date +%s)
     mtime=$(fm_path_mtime "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$mtime$now" in ''|*[!0-9]*) ;; *) [ $(( now - mtime )) -le "$timeout" ] && return 0 ;; esac
-    # Timed out while verifiably alive: stop the recorded control process
-    # first (process group when setsid isolated it, direct pid otherwise -
-    # the recorded mode selects the signal target), then the waiting wrapper.
-    # The cpid kill fires only after verifying the recorded start time still
-    # matches, so a reused pid is never signalled. A process that survives
-    # both is unkillable from here: keep tracking it and block any
-    # overlapping action until it terminates, rather than advancing the
-    # ladder under a live control verb. Escalation and hold decisions key on
+    # Timed out with something alive. Escalation and hold decisions key on
     # control liveness, never on the wrapper: TERM routinely reaps the
     # wrapper while a separately-isolated control ignores it, and trusting
     # the wrapper would clear tracking under a live control and reopen the
@@ -556,21 +604,25 @@ muse_nudge_collect() {  # <inbox-dir>
     # once it becomes killable again. A control that still refuses to die
     # reports "held" so the caller keeps the strike pending instead of
     # advancing; the hold is logged once and stays quiet afterwards, with
-    # the eventual resolution line closing the bracket. Always reports 0.
-    muse_nudge_control_signal "$dir" TERM || true
-    sleep 1
+    # the eventual resolution line closing the bracket.
     if muse_nudge_control_alive "$dir"; then
-      muse_nudge_control_signal "$dir" KILL || true
+      muse_nudge_control_signal "$dir" TERM || true
       sleep 1
-    fi
-    if muse_nudge_control_alive "$dir"; then
-      if [ ! -f "$dir/.muse-nudge-action-held" ]; then
-        : > "$dir/.muse-nudge-action-held" 2>/dev/null || true
-        triage_log "muse auto-nudge: timed-out control action will not stop; holding the ladder"
+      if muse_nudge_control_alive "$dir"; then
+        muse_nudge_control_signal "$dir" KILL || true
+        sleep 1
       fi
-      printf 'held'
-      return 0
+      if muse_nudge_control_alive "$dir"; then
+        if [ ! -f "$dir/.muse-nudge-action-held" ]; then
+          : > "$dir/.muse-nudge-action-held" 2>/dev/null || true
+          triage_log "muse auto-nudge: timed-out control action will not stop; holding the ladder"
+        fi
+        printf 'held'
+        return 0
+      fi
     fi
+    # The control is dead or unverifiable: stop a lingering wrapper, clear
+    # the tracking, and reconcile as unknown without replaying the verb.
     pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
     muse_nudge_action_clear "$dir"
