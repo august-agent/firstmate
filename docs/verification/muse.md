@@ -299,3 +299,25 @@ The 1.3 key reorder was such a change for the old prefix matcher, and the turn-t
 A build that ever split one turn across several runs would make a settled log ambiguous, which is a classifier change rather than a note in this file.
 
 The portable counterparts that run in ordinary CI are `tests/fm-muse-harness.test.sh`, `tests/fm-tmux-agent-liveness.test.sh`, `tests/fm-composer-lib.test.sh`, and `tests/fm-composer-ghost.test.sh`.
+
+### Doorbell reliability (2026-11-24)
+
+The worker dropped a doorbell whose Enter landed before its text was visible, and a steer typed onto a restored prompt submitted garbled.
+The inbox ring for this worker now types the doorbell as one literal send, and only then sends Enter as a separate keystroke, retrying Enter without retyping.
+The literal dispatcher covers every backend with a native literal primitive; a backend with no pane to type into stays unsupported and keeps the shared submit path.
+The ring never clears: an advisory capture must not authorize a destructive operation.
+The pending mark carries the send outcome, so a later ring reconciles before typing: an accepted but unverified send defers, while a failed send retypes only onto a proven empty composer and only once - the retry consumes the allowance either way, bounding repeated post-commit failures under a frozen capture to two literals before deferral.
+A mark for another record bars typing entirely: its line is submitted first, or the ring defers.
+A failed Enter keeps the mark and reports the failure, so the next ring resubmits the protected line; a submit that finds a changed composer defers instead of retrying into it.
+A per-record lock serializes concurrent rings and jolts across the whole delivery; a stale lock fails safe into deferral.
+A record still unhandled after a recorded delivery attempt is re-rung behind one press of the verified interrupt key, with no clear.
+The jolt settles and requires the line to read back twice before the ring, so a restoration landing after the guard capture only defers; an unconfirmed jolt defers while spending one ladder attempt through the shared bookkeeping-failure path, which also reports an unwritable ladder as a stale wake.
+The jolt runs only where the composer provably holds the ring's own line, re-verified under its lock before pressing; even a raced guard cannot destroy a draft, and a restoration racing the submit itself is contained by the no-retry-on-change rule, which reports a deferral instead of a send failure.
+A mark for another record bars typing until that record's line submits or the mark proves stale.
+A stuck mark annotates the escalation with how long the literal went unverified.
+The foreign-draft and ambiguous-composer guards keep their meaning on both paths: a proven foreign draft still skips without typing or jolting, and an ambiguous composer keeps the shared type-through path with no jolt.
+
+```
+$ bash bin/fm-test-run.sh tests/fm-muse-doorbell.test.sh tests/fm-task-inbox.test.sh tests/fm-send-inbox.test.sh
+FM_TEST_SUMMARY total=3 failed=0 skipped_gate=0
+```
