@@ -313,7 +313,9 @@ A submit that finds a changed composer defers instead of retrying into it.
 A per-record lock serializes concurrent rings across the whole delivery; a stale lock fails safe into deferral.
 A record still unhandled after a recorded delivery attempt is re-rung as-is, with no interrupt key.
 An automatic re-ring interrupt was removed because a restoration racing the final verify can submit a foreign prompt, which no capture spacing can rule out.
-A restoration landing between the final verify and Enter is still submitted once: nothing can interlock a terminal keypress, so the guarantee there is single submission with no retry and no clear, and the post-Enter check refuses to retry into the changed composer.
+A restoration landing between the final verify and Enter is still submitted: nothing can interlock a terminal keypress.
+The guarantee is one submission per verified read with no retry into observed change.
+A frozen capture can still misread the post-Enter check, which is why the ladder escalation remains the backstop.
 A stuck mark annotates the escalation with how long the literal went unverified.
 The foreign-draft and ambiguous-composer guards keep their meaning: a proven foreign draft still skips without typing, and an ambiguous composer keeps the shared type-through path.
 

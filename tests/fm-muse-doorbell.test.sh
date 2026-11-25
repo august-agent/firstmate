@@ -13,12 +13,14 @@
 #      while a failed send retypes only onto a proven empty composer and
 #      only once. A mark for another record bars typing entirely. A
 #      per-record lock serializes concurrent rings across the whole
-#      delivery. The ring never clears: even a proven empty composer
+#      delivery, proved by stalling one ring mid-send. The ring never
+#      clears: even a proven empty composer
 #      is typed onto, and a stale empty capture keeps a hidden draft. A
 #      lagging capture defers submission instead of concatenating a second
 #      literal, and recovers once visibility catches up. A fake clock proves
 #      Enter waits out the settle. Submit and reconcile propagate deferrals
 #      distinctly from send failures, and a failed Enter keeps its mark. A
+#      restoration racing the submit is delivered once without retry. A
 #      post-commit failure with frozen captures duplicates at most once; a
 #      stuck mark annotates the escalation.
 #   2. A composer holding a foreign draft is skipped without typing or
@@ -74,8 +76,9 @@ inbox_lib() {  # <state> <function> [args...]
 # composer text to FM_FAKE_SUBMITTED. With FM_FAKE_LITERAL_FAIL=1 a literal
 # send lands in the composer but still reports failure, standing in for a
 # transport error after commit; with =2 it fails without landing. With
-# FM_FAKE_CAPTURE_GATE=N, each capture waits until N captures have arrived,
-# forcing concurrent rings through the same check.
+# FM_FAKE_TYPE_GATE set to a directory, a literal send stalls inside delivery
+# - the dispatcher lock is already held there - until that directory gains a
+# go file, logging TYPE-GATE-TIMEOUT instead of hanging on a stall.
 make_muse_stubs() {  # <dir> -> echoes fakebin dir
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -99,6 +102,18 @@ case "${1:-}" in
       esac
     done
     if [ "$literal" = 1 ]; then
+      # A type gate stalls the send inside delivery (the dispatcher lock is
+      # already held): the test releases it by creating the go file, and a
+      # timeout is logged loudly instead of hanging the suite.
+      if [ -n "${FM_FAKE_TYPE_GATE:-}" ]; then
+        : > "${FM_FAKE_TYPE_GATE:?}/arrived"
+        gate_wait=0
+        while [ ! -e "${FM_FAKE_TYPE_GATE:?}/go" ] && [ "$gate_wait" -lt 100 ]; do
+          /bin/sleep 0.1
+          gate_wait=$((gate_wait + 1))
+        done
+        [ -e "${FM_FAKE_TYPE_GATE:?}/go" ] || printf 'TYPE-GATE-TIMEOUT\n' >> "$send_log"
+      fi
       printf '%s' "$text" >> "$composer_file"
       printf '%s' "$(cat "${FM_FAKE_CLOCK:-/dev/null}" 2>/dev/null || printf 0)" \
         > "${FM_FAKE_LITERAL_CLOCK:-/dev/null}" 2>/dev/null || true
@@ -145,27 +160,20 @@ case "${1:-}" in
     done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane)
-    if [ -n "${FM_FAKE_CAPTURE_GATE:-}" ]; then
-      gate_count="${FM_FAKE_GATE_COUNT:-/dev/null}"
-      gate_seen=$(cat "$gate_count" 2>/dev/null || printf 0)
-      gate_seen=$((gate_seen + 1))
-      printf '%s' "$gate_seen" > "$gate_count" 2>/dev/null || true
-      gate_wait=0
-      while [ "$gate_seen" -lt "$FM_FAKE_CAPTURE_GATE" ] && [ "$gate_wait" -lt 50 ]; do
-        /bin/sleep 0.1
-        gate_seen=$(cat "$gate_count" 2>/dev/null || printf 0)
-        gate_wait=$((gate_wait + 1))
-      done
-    fi
     if [ -n "${FM_FAKE_GARBAGE_CAPTURE:-}" ]; then
       printf 'some unclassifiable screen\nwithout any composer shape\n'
       exit 0
     fi
-    if [ -n "${FM_FAKE_FREEZE_CAPTURE:-}" ]; then
+    if [ -n "${FM_FAKE_FREEZE_CAPTURE:-}" ] && [ -z "${FM_FAKE_FROZEN_TEXT:-}" ]; then
       printf '╭────╮\n│    │\n╰────╯\n'
       exit 0
     fi
-    if [ -n "${FM_FAKE_VISIBLE_AFTER:-}" ]; then
+    if [ -n "${FM_FAKE_FROZEN_TEXT:-}" ]; then
+      content=$FM_FAKE_FROZEN_TEXT
+    else
+      content=$(cat "$composer_file" 2>/dev/null || true)
+    fi
+    if [ -n "${FM_FAKE_VISIBLE_AFTER:-}" ] && [ -z "${FM_FAKE_FROZEN_TEXT:-}" ]; then
       count_file="${FM_FAKE_CAPTURE_COUNT:-/dev/null}"
       count=$(cat "$count_file" 2>/dev/null || printf 0)
       count=$((count + 1))
@@ -175,7 +183,6 @@ case "${1:-}" in
         exit 0
       fi
     fi
-    content=$(cat "$composer_file" 2>/dev/null || true)
     if [ -n "$content" ]; then
       # Byte-exact border sized to the content: tr would transliterate the
       # multibyte rule per byte under a C locale, so repeat the glyph with
@@ -623,34 +630,48 @@ test_muse_ring_failed_send_before_commit_retries() {
 }
 
 test_muse_ring_serializes_concurrent_rings() {
-  local dir rec rc1 rc2 log literals submitted bg1 bg2
+  local dir rec rc_a rc_b log literals submitted bg_a gate_wait
   dir=$(setup_case concurrent muse)
+  mkdir -p "$dir/typegate"
   : > "$dir/send.log"
   : > "$dir/submitted.log"
-  : > "$dir/gate"
   rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
-  ring_once() {
-    PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
-      FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
-      FM_FAKE_FREEZE_CAPTURE=1 \
-      FM_FAKE_CAPTURE_GATE=2 FM_FAKE_GATE_COUNT="$dir/gate" \
-      FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
-      inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
-      >"$dir/ring.log" 2>&1
-  }
-  ring_once & bg1=$!
-  ring_once & bg2=$!
-  wait "$bg1"; rc1=$?
-  wait "$bg2"; rc2=$?
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_FAKE_TYPE_GATE="$dir/typegate" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring-a.log" 2>&1 &
+  bg_a=$!
+  gate_wait=0
+  while [ ! -e "$dir/typegate/arrived" ] && [ "$gate_wait" -lt 100 ]; do
+    /bin/sleep 0.1
+    gate_wait=$((gate_wait + 1))
+  done
+  [ -e "$dir/typegate/arrived" ] || fail "the first ring never entered delivery"
+  kill -0 "$bg_a" 2>/dev/null || fail "the first ring should still hold the lock while stalled"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_TASK_INBOX_LOCK_WAIT_SECS=0 \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring-b.log" 2>&1
+  rc_b=$?
+  expect_code 1 "$rc_b" "the second ring must defer without entering the guarded check"
   log=$(cat "$dir/send.log")
+  case "$log" in
+    *TYPE-GATE-TIMEOUT*) fail "no gate may time out:$'\n'$log" ;;
+  esac
+  [ ! -s "$dir/composer.txt" ] \
+    || fail "nothing may be typed while the first ring holds the lock:$'\n'$(cat "$dir/composer.txt")"
+  : > "$dir/typegate/go"
+  wait "$bg_a"; rc_a=$?
+  expect_code 0 "$rc_a" "the first ring should submit once released"
   literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
-  [ "$literals" = 1 ] || fail "two rings racing the same empty composer must type exactly once, got $literals:$'\n'$log"
-  expect_code 1 "$rc1" "the first racing ring should defer on its frozen capture"
-  expect_code 1 "$rc2" "the second racing ring should defer on its frozen capture"
-  [ ! -s "$dir/submitted.log" ] \
-    || fail "neither racing ring should submit while visibility stays unproven"
-  [ -f "$dir/state/t1.inbox/.muse-pending" ] \
-    || fail "the single typed literal should stay marked"
+  [ "$literals" = 1 ] || fail "the two rings must type exactly once in total, got $literals:$'\n'$log"
+  submitted=$(cat "$dir/submitted.log")
+  [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 1 ] \
+    || fail "the winning ring should submit the doorbell once:$'\n'$submitted"
   pass "muse ring: concurrent rings serialize to one literal"
 }
 
@@ -823,6 +844,32 @@ test_muse_ring_barrier_for_other_record() {
   [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 2 ] \
     || fail "both doorbells should submit in order:$'\n'$(cat "$dir/submitted.log")"
   pass "muse ring: another record's pending mark bars typing"
+}
+
+test_muse_ring_stale_capture_submit_does_not_retry() {
+  local dir rec rc log submitted doorbell
+  dir=$(setup_case staleseen muse)
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  printf '%s%s' "$doorbell" "cancelled: do the thing" > "$dir/composer.txt"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_FAKE_FROZEN_TEXT="$doorbell" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 0 "$rc" "a verified line submits even when the capture cannot see a change"
+  log=$(cat "$dir/send.log")
+  [ "$(grep -c "KEYS:send-keys -t sess:fm-t1 Enter" "$dir/send.log")" = 2 ] \
+    || fail "a swallowed first Enter is retried once, no more:$'\n'$log"
+  submitted=$(cat "$dir/submitted.log")
+  assert_contains "$submitted" "cancelled: do the thing" "the submitted line carries what was actually there"
+  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "a submitted line must clear its pending mark"
+  pass "muse ring: a stale capture still submits once without retrying into change"
 }
 
 test_muse_ring_defers_on_unreadable_composer_with_mark() {
@@ -1123,9 +1170,10 @@ test_other_harness_ring_sends_no_clear
 test_watcher_muse_rering_redelivers
 test_watcher_muse_first_ring_rings_plainly
 test_muse_ring_serializes_concurrent_rings
+test_muse_ring_stale_capture_submit_does_not_retry
+test_muse_ring_defers_on_unreadable_composer_with_mark
 test_muse_ring_bounds_repeated_post_commit_failures
 test_muse_ring_barrier_for_other_record
-test_muse_ring_defers_on_unreadable_composer_with_mark
 test_muse_ring_bounded_after_post_commit_stale
 test_muse_ring_defers_on_held_lock
 test_muse_ring_dead_endpoint_beats_held_lock
