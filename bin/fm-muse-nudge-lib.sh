@@ -195,7 +195,57 @@ muse_nudge_action_alive() {  # <inbox-dir>
 # Drop every action outcome file for a task, including orphaned per-generation
 # temp files a killed action may have left behind.
 muse_nudge_action_clear() {  # <inbox-dir>
-  rm -f "$1"/.muse-nudge-action-tmp.* "$1"/.muse-nudge-action-rc "$1"/.muse-nudge-action-out "$1"/.muse-nudge-action-pid "$1"/.muse-nudge-action-cpid 2>/dev/null
+  rm -f "$1"/.muse-nudge-action-tmp.* "$1"/.muse-nudge-action-rc "$1"/.muse-nudge-action-out "$1"/.muse-nudge-action-pid "$1"/.muse-nudge-action-cpid "$1"/.muse-nudge-action-held 2>/dev/null
+}
+
+# 0 when the recorded control process is verifiably alive. The recorded
+# start time must still match, so a reused pid never counts as the control
+# surviving; in group mode the group itself is probed, catching children
+# that outlive their leader. Nothing is signalled here, so an unverifiable
+# identity simply reads as not alive.
+muse_nudge_control_alive() {  # <inbox-dir>
+  local dir=$1 cpid cstarted cmode clive pstat
+  dir=${dir%/}
+  cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+  cstarted=$(sed -n '2p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+  cmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+  [ -n "$cpid" ] && [ -n "$cstarted" ] || return 1
+  case "$cpid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$cpid" 2>/dev/null || return 1
+  # A zombie still answers kill -0 with a matching start time but is already
+  # dead: only a live group around it still counts as the action surviving.
+  pstat=$(ps -o stat= -p "$cpid" 2>/dev/null | tr -d '[:space:]' || true)
+  case "$pstat" in Z*) : ;; *)
+    clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+    [ -n "$clive" ] && [ "$clive" = "$cstarted" ] && return 0
+    return 1
+    ;;
+  esac
+  [ "$cmode" = group ] || return 1
+  kill -0 -- "-$cpid" 2>/dev/null
+}
+
+# Signal the recorded control process, never the waiting wrapper: the
+# process group when setsid isolated it, the direct pid otherwise. Signals
+# nothing unless the recorded start time still matches, so a reused pid is
+# never signalled. Reports 0 when a signal was sent, 1 when there was
+# nothing safe to signal.
+muse_nudge_control_signal() {  # <inbox-dir> <signal>
+  local dir=$1 sig=$2 cpid cstarted cmode clive
+  dir=${dir%/}
+  cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+  cstarted=$(sed -n '2p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+  cmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+  [ -n "$cpid" ] && [ -n "$cstarted" ] || return 1
+  case "$cpid" in ''|*[!0-9]*) return 1 ;; esac
+  clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+  [ -n "$clive" ] && [ "$clive" = "$cstarted" ] || return 1
+  if [ "$cmode" = group ]; then
+    kill "-$sig" -- "-$cpid" 2>/dev/null || true
+  else
+    kill "-$sig" "$cpid" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # Drop strike state. Absent state is already clean.
@@ -461,7 +511,9 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
 # its generation matches the recorded action, so a late result from a
 # superseded action can never be collected as the current one. A dead action
 # with no result, or one older than the action timeout, reconciles as unknown
-# without replaying the verb; a live one keeps waiting. Always reports 0.
+# without replaying the verb; a live one keeps waiting. A timed-out action
+# whose control refuses to die reports held so the caller keeps the strike
+# pending instead of advancing. Always reports 0.
 muse_nudge_collect() {  # <inbox-dir>
   local dir=$1 rc rcgen pidgen timeout now mtime pid cpid cstarted cmode clive
   dir=${dir%/}
@@ -481,6 +533,8 @@ muse_nudge_collect() {  # <inbox-dir>
   # No result file: a live action keeps waiting, anything else reconciles as
   # unknown without replaying the verb - including the crash window between
   # the reservation write and the spawn, where no pid file exists at all.
+  # Reports "held" while a timed-out control refuses to die, so the caller
+  # keeps the strike pending instead of advancing under a live verb.
   if [ -f "$dir/.muse-nudge-action-pid" ] && muse_nudge_action_alive "$dir"; then
     timeout=$(muse_nudge_action_timeout)
     now=$(date +%s)
@@ -493,40 +547,32 @@ muse_nudge_collect() {  # <inbox-dir>
     # matches, so a reused pid is never signalled. A process that survives
     # both is unkillable from here: keep tracking it and block any
     # overlapping action until it terminates, rather than advancing the
-    # ladder under a live control verb.
-    cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
-    cstarted=$(sed -n '2p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
-    cmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
-    clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-    if [ -n "$cpid" ] && [ -n "$cstarted" ] && [ "$clive" = "$cstarted" ]; then
-      if [ "$cmode" = group ]; then
-        kill -TERM -- "-$cpid" 2>/dev/null || true
-      else
-        kill -TERM "$cpid" 2>/dev/null || true
+    # ladder under a live control verb. Escalation and hold decisions key on
+    # control liveness, never on the wrapper: TERM routinely reaps the
+    # wrapper while a separately-isolated control ignores it, and trusting
+    # the wrapper would clear tracking under a live control and reopen the
+    # spawn gate onto a survivor. Signals are retried on every poll while
+    # the timeout persists, so a transiently unkillable control is stopped
+    # once it becomes killable again. A control that still refuses to die
+    # reports "held" so the caller keeps the strike pending instead of
+    # advancing; the hold is logged once and stays quiet afterwards, with
+    # the eventual resolution line closing the bracket. Always reports 0.
+    muse_nudge_control_signal "$dir" TERM || true
+    sleep 1
+    if muse_nudge_control_alive "$dir"; then
+      muse_nudge_control_signal "$dir" KILL || true
+      sleep 1
+    fi
+    if muse_nudge_control_alive "$dir"; then
+      if [ ! -f "$dir/.muse-nudge-action-held" ]; then
+        : > "$dir/.muse-nudge-action-held" 2>/dev/null || true
+        triage_log "muse auto-nudge: timed-out control action will not stop; holding the ladder"
       fi
+      printf 'held'
+      return 0
     fi
     pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
-    sleep 1
-    if muse_nudge_action_alive "$dir"; then
-      cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
-      cstarted=$(sed -n '2p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
-      cmode=$(sed -n '3p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
-      clive=$(ps -o lstart= -p "$cpid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-      if [ -n "$cpid" ] && [ -n "$cstarted" ] && [ "$clive" = "$cstarted" ]; then
-        if [ "$cmode" = group ]; then
-          kill -KILL -- "-$cpid" 2>/dev/null || true
-        else
-          kill -KILL "$cpid" 2>/dev/null || true
-        fi
-      fi
-      case "$pid" in ''|*[!0-9]*) : ;; *) kill -KILL "$pid" 2>/dev/null || true ;; esac
-      sleep 1
-    fi
-    if muse_nudge_action_alive "$dir"; then
-      triage_log "muse auto-nudge: timed-out control action will not stop; holding the ladder"
-      return 0
-    fi
     muse_nudge_action_clear "$dir"
     printf 'unknown'
     return 0
@@ -617,6 +663,11 @@ muse_nudge_poll() {  # <window> <task> <idle-now> <pane-hash>
       unknown)
         muse_nudge_write "$STATE" "$task" 2 "$rec" 1 "$mins" || return 0
         triage_log "muse auto-nudge strike 2/3: interrupt outcome unknown for $task; proceeding without replay"
+        ;;
+      held)
+        # The control is still alive and tracked: keep the strike pending
+        # without advancing, logging, or re-firing. The transition was
+        # already logged where the hold was taken.
         ;;
     esac
     return 0
