@@ -3,6 +3,7 @@
 #
 # Sourced by bin/fm-watch.sh and tests. No side effects on source beyond its
 # sourced libraries.
+# shellcheck disable=SC2153 # STATE is the sourcing host's state directory.
 _FM_MUSE_NUDGE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-watch-key-lib.sh
 . "$_FM_MUSE_NUDGE_LIB_DIR/fm-watch-key-lib.sh"
@@ -121,21 +122,32 @@ muse_nudge_action_timeout() {
 # Spawn a control-plane verb in the background, recording its pid for the
 # hygiene-style liveness check. The reservation (PENDING=inflight) is written
 # by the caller BEFORE this runs, so a crash between spawn and result never
-# looks like a strike that never happened. Result files land in the task
-# inbox dir: .muse-nudge-action-rc (exit code), .muse-nudge-action-out
-# (output), .muse-nudge-action-pid ("pid\tlstart"). Never blocks.
+# looks like a strike that never happened. Every spawn mints a generation id
+# recorded alongside the pid, and the result carries it too and is published
+# atomically, so a late result can never be collected as another action's
+# outcome. Result files land in the task inbox dir: .muse-nudge-action-out,
+# .muse-nudge-action-rc ("<gen> <exit>", via a temp file plus rename), and
+# .muse-nudge-action-pid (pid, lstart, and gen on three lines). Never blocks;
+# prior action files are cleared first so a stale result cannot be misread.
 muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
-  local state=$1 task=$2 dir pid started
+  local state=$1 task=$2 dir pid started gen
   dir=$(fm_task_inbox_dir "$state" "$task")
   muse_nudge_action_clear "$dir" || true
   shift 2
+  gen="$(date +%s)-$$-$RANDOM$RANDOM"
   (
     "$@" >"$dir/.muse-nudge-action-out" 2>&1
-    echo "$?" >"$dir/.muse-nudge-action-rc"
+    status=$?
+    printf '%s %s\n' "$gen" "$status" >"$dir/.muse-nudge-action-tmp" 2>/dev/null \
+      && mv "$dir/.muse-nudge-action-tmp" "$dir/.muse-nudge-action-rc"
   ) >/dev/null 2>&1 &
   pid=$!
   started=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-  printf '%s\t%s\n' "$pid" "$started" >"$dir/.muse-nudge-action-pid" 2>/dev/null || return 1
+  {
+    printf '%s\n' "$pid"
+    printf '%s\n' "$started"
+    printf '%s\n' "$gen"
+  } >"$dir/.muse-nudge-action-pid" 2>/dev/null || return 1
 }
 
 # 0 when the recorded action pid is still the process that was spawned (the
@@ -143,8 +155,8 @@ muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
 muse_nudge_action_alive() {  # <inbox-dir>
   local pid started live_start
   [ -f "$1/.muse-nudge-action-pid" ] || return 1
-  pid=$(cut -f1 "$1/.muse-nudge-action-pid" 2>/dev/null || true)
-  started=$(cut -f2- "$1/.muse-nudge-action-pid" 2>/dev/null || true)
+  pid=$(sed -n '1p' "$1/.muse-nudge-action-pid" 2>/dev/null || true)
+  started=$(sed -n '2p' "$1/.muse-nudge-action-pid" 2>/dev/null || true)
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$started" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
@@ -245,23 +257,45 @@ muse_nudge_do_steer() {  # <window> <task> <text>
 # its count survives write deferrals, so a strike additionally requires a
 # continuous quiet window. Fails closed: an anchor that cannot be set or a
 # worktree that cannot be read skips the strike.
-muse_nudge_continuously_idle() {  # <task> <idle-secs>
-  local task=$1 idle=$2 anchor now
+muse_nudge_worktree_quiet() {  # <task> <idle-secs> -> 0 quiet, 1 writes, 2 uninspectable
+  local task=$1 idle=$2 wt kind now anchor hit bound maxdepth names name rc
+  local -a prune=()
+  [ -n "$task" ] || return 2
+  wt=$(grep '^worktree=' "$STATE/$task.meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  [ -n "$wt" ] && [ -d "$wt" ] || return 2
+  kind=$(grep '^kind=' "$STATE/$task.meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  [ "$kind" != secondmate ] || return 2
+  if [ -e "$wt/.fm-secondmate-home" ] || [ -L "$wt/.fm-secondmate-home" ]; then
+    return 2
+  fi
   now=$(date +%s)
-  case "$now" in ''|*[!0-9]*) return 1 ;; esac
-  # The anchor lives in STATE rather than the inbox dir so an unreadable or
-  # unwritable inbox fails the strike at its own reservation write, where the
-  # poll path can tell the two failures apart.
-  anchor=$(mktemp "$STATE/.muse-nudge-anchor.XXXXXX" 2>/dev/null) || return 1
+  case "$now" in ''|*[!0-9]*) return 2 ;; esac
+  anchor=$(mktemp "$STATE/.muse-nudge-anchor.XXXXXX" 2>/dev/null) || return 2
   if ! touch -d "@$(( now - idle ))" "$anchor" 2>/dev/null; then
     rm -f "$anchor"
-    return 1
+    return 2
   fi
-  if crew_worktree_written_since "$task" "$STATE" "$anchor"; then
-    rm -f "$anchor"
-    return 1
+  read -r -a names <<< "$FM_WORKTREE_WRITE_PRUNE"
+  for name in ${names[@]+"${names[@]}"}; do
+    [ "${#prune[@]}" -eq 0 ] || prune+=( -o )
+    prune+=( -name "$name" )
+  done
+  bound=$FM_WORKTREE_WRITE_TIMEOUT
+  case "$bound" in ''|*[!0-9]*|0) bound=10 ;; esac
+  maxdepth=$FM_WORKTREE_WRITE_MAXDEPTH
+  case "$maxdepth" in ''|*[!0-9]*) maxdepth=6 ;; esac
+  if [ "${#prune[@]}" -gt 0 ]; then
+    hit=$(fm_run_timed "$bound" find "$wt" -xdev -maxdepth "$maxdepth" \
+      \( "${prune[@]}" \) -prune -o -type f -newer "$anchor" -print -quit 2>/dev/null)
+    rc=$?
+  else
+    hit=$(fm_run_timed "$bound" find "$wt" -xdev -maxdepth "$maxdepth" \
+      -type f -newer "$anchor" -print -quit 2>/dev/null)
+    rc=$?
   fi
   rm -f "$anchor"
+  [ "$rc" -eq 0 ] || return 2
+  [ -n "$hit" ] && return 1
   return 0
 }
 
@@ -289,13 +323,13 @@ muse_nudge_strike() {  # <window> <task> <strike> <idle-minutes> [rec] [pane-has
       triage_log "muse auto-nudge strike 2/3: interrupting $task in the background, steer follows on idle plus a clear composer (idle ${mins}m)"
       ;;
     3)
+      # The note travels as an argument, never as a file the background job
+      # would have to race the parent to read: the spawn returns at once and
+      # the path it was given must already be stable.
       text=$(muse_nudge_note "$STATE" "$task" "$mins" 3)
-      newrec=$(mktemp "$STATE/.muse-nudge-note.XXXXXX") || return 1
-      printf '%s\n' "$text" > "$newrec" || { rm -f "$newrec"; return 1; }
-      note_bin=$(muse_nudge_control_bin) || { rm -f "$newrec"; return 1; }
-      muse_nudge_write "$STATE" "$task" 3 "$rec" "" "$mins" "$hash" || { rm -f "$newrec"; return 1; }
-      muse_nudge_spawn "$STATE" "$task" "$note_bin" "$task" relaunch --note-file "$newrec" || return 1
-      rm -f "$newrec"
+      note_bin=$(muse_nudge_control_bin) || return 1
+      muse_nudge_write "$STATE" "$task" 3 "$rec" "" "$mins" "$hash" || return 1
+      muse_nudge_spawn "$STATE" "$task" "$note_bin" "$task" relaunch --note "$text" || return 1
       triage_log "muse auto-nudge strike 3/3: relaunching $task in the background with a progress note (idle ${mins}m)"
       ;;
     *) return 1 ;;
@@ -331,8 +365,14 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
   [ "$pending" != inflight ] || return 1
   # Eligibility is continuous proven idleness, not the rung count alone: a
   # worktree write restarts the rung timer while the count survives, so only
-  # a quiet window covering the whole threshold authorizes a strike.
-  muse_nudge_continuously_idle "$task" "$idle" || return 1
+  # a quiet window covering the whole threshold authorizes a strike. An
+  # uninspectable tree vetoes too, and says so in triage.
+  muse_nudge_worktree_quiet "$task" "$idle"
+  case "$?" in
+    0) : ;;
+    1) return 1 ;;
+    *) triage_log "muse auto-nudge holding strike $next for $task: worktree not inspectable"; return 1 ;;
+  esac
   mins=$(( idle / 60 ))
   case "$next" in
     1) muse_nudge_strike "$win" "$task" 1 "$mins" ;;
@@ -341,20 +381,28 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
   esac
 }
 
-# Collect one in-flight control action. Reports the outcome on stdout -
+# Collect one in-flight control action. Reports the outcome on stdout:
 # "done:0", "done:<rc>", or "unknown" - and clears the action files, leaving
-# the strike file for the caller to advance. A dead action with no result, or
-# one older than the action timeout, reconciles as unknown without replaying
-# the verb; a live one keeps waiting. Always reports 0.
+# the strike file for the caller to advance. A result is accepted only when
+# its generation matches the recorded action, so a late result from a
+# superseded action can never be collected as the current one. A dead action
+# with no result, or one older than the action timeout, reconciles as unknown
+# without replaying the verb; a live one keeps waiting. Always reports 0.
 muse_nudge_collect() {  # <inbox-dir>
-  local dir=$1 rc timeout age now mtime
+  local dir=$1 rc rcgen pidgen timeout now mtime
   dir=${dir%/}
   if [ -f "$dir/.muse-nudge-action-rc" ]; then
     rc=$(cat "$dir/.muse-nudge-action-rc" 2>/dev/null || true)
-    case "$rc" in ''|*[!0-9]*) rc=unknown ;; esac
-    muse_nudge_action_clear "$dir"
-    printf 'done:%s' "$rc"
-    return 0
+    rcgen=${rc%% *}
+    pidgen=$(sed -n '3p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
+    case "$rc" in ?*" "[0-9]*)
+      if [ -n "$rcgen" ] && [ -n "$pidgen" ] && [ "$rcgen" = "$pidgen" ]; then
+        muse_nudge_action_clear "$dir"
+        printf 'done:%s' "${rc#* }"
+        return 0
+      fi
+      ;;
+    esac
   fi
   # No result file: a live action keeps waiting, anything else reconciles as
   # unknown without replaying the verb - including the crash window between
@@ -393,6 +441,16 @@ muse_nudge_poll() {  # <window> <task> <idle-now> <pane-hash>
     if [ -e "$handled/$rec" ]; then muse_nudge_clear "$STATE" "$task"; return 0; fi
   fi
   if [ "$strike" = 3 ]; then
+    # A spent ladder never re-fires, but its relaunch outcome is still worth
+    # one log line: collect without touching the spent state.
+    dir=$(fm_task_inbox_dir "$STATE" "$task")
+    if [ -e "$dir/.muse-nudge-action-pid" ] || [ -e "$dir/.muse-nudge-action-rc" ]; then
+      outcome=$(muse_nudge_collect "$dir")
+      case "$outcome" in
+        done:*|unknown)
+          triage_log "muse auto-nudge strike 3/3: relaunch $outcome for $task; ladder stays spent" ;;
+      esac
+    fi
     # A spent ladder lapses on fresh activity, not on the rung timer the
     # escalation path resets after every rung: busy work, an acknowledged
     # steer (above), or a pane hash that no longer matches the spent one.
