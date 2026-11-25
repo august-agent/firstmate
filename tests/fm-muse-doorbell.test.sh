@@ -31,6 +31,9 @@
 #      line without retyping and without extra keys; the ladder still
 #      paces every attempt and escalates an unhandled record on schedule.
 #   7. The ring-attempt count tells a first delivery from a re-ring.
+#   8. A fire-and-forget retry reconciles instead of retyping: the ladder
+#      reset keeps a pending mark whose record is still unhandled, and
+#      visibility recovery submits exactly one doorbell.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -890,6 +893,46 @@ test_muse_ring_refuses_unwritable_mark() {
   pass "muse ring: an unwritable pending mark refuses the send"
 }
 
+test_watcher_muse_faf_retry_keeps_pending_mark() {
+  local dir rec rc log literals submitted
+  dir=$(setup_muse_watch_case faffrozen 0)
+  mkdir -p "$dir/home/config"
+  : > "$dir/home/config/wait-no-turns"
+  mkdir -p "$dir/state/t1.inbox/handled"
+  mv "$dir/state/t1.inbox/001.msg" "$dir/state/t1.inbox/handled/"
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue" fire-and-forget)
+  touch -t 202001010000 "$rec"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_FAKE_FREEZE_CAPTURE=1 \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 >/dev/null 2>&1
+  [ -f "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "the enqueue-time ring should leave a pending mark"
+  inbox_lib "$dir/state" fm_task_inbox_mark_retry "$dir/state" t1 "$rec" >/dev/null
+  touch -t 202001010000 "$dir/state/t1.inbox/.retry-ring"
+  FM_FAKE_FREEZE_CAPTURE=1 muse_steer_check "$dir"
+  log=$(cat "$dir/send.log")
+  literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
+  [ "$literals" = 1 ] || fail "the fire-and-forget retry must not retype onto the unverified literal, got $literals:$'\n'$log"
+  [ -f "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "the ladder reset must keep a mark whose record is still unhandled"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 >/dev/null 2>&1
+  rc=$?
+  expect_code 0 "$rc" "recovery on visibility should submit"
+  submitted=$(cat "$dir/submitted.log")
+  [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 1 ] \
+    || fail "recovery should submit exactly one doorbell:$'\n'$submitted"
+  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "a submitted line must clear its pending mark"
+  pass "watcher: a fire-and-forget retry reconciles instead of retyping"
+}
+
 test_muse_ring_defers_on_held_lock() {
   local dir rec rc log lock holder
   dir=$(setup_case heldlock muse)
@@ -1089,6 +1132,7 @@ test_muse_ring_dead_endpoint_beats_held_lock
 test_muse_ring_refuses_unwritable_mark
 test_muse_stale_note_names_old_marks
 test_watcher_muse_escalation_names_stale_mark
+test_watcher_muse_faf_retry_keeps_pending_mark
 test_backend_send_literal_routes_paseo
 test_backend_send_literal_refuses_panes_without
 test_ring_count_tells_first_from_rering

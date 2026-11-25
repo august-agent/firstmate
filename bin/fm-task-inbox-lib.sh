@@ -837,10 +837,18 @@ fm_task_inbox_clear_retry() {  # <state-dir> <task-id> <record-path>
 # An empty inbox also resets the ladder bookkeeping so the next message starts
 # a fresh ladder.
 fm_task_inbox_due_action() {  # <state-dir> <task-id>
-  local dir oldest base now grace max ladder rec_base count last
+  local dir oldest base now grace max ladder rec_base count last mark_seq
   dir=$(fm_task_inbox_dir "$1" "$2")
   if ! oldest=$(fm_task_inbox_oldest_unhandled "$1" "$2"); then
-    rm -f "$dir/.ring-state" "$dir/.escalated" "$dir/.busy-state" "$dir/.muse-pending" 2>/dev/null || true
+    rm -f "$dir/.ring-state" "$dir/.escalated" "$dir/.busy-state" 2>/dev/null || true
+    # A pending mark outlives this reset while its record is still unhandled:
+    # oldest_unhandled skips fire-and-forget records, so an empty ladder here
+    # does not mean the inbox is empty, and dropping the mark would let the
+    # fire-and-forget retry below retype onto an unverified literal.
+    if ! mark_seq=$(fm_task_inbox_muse_pending_seq "$dir" 2>/dev/null) \
+      || [ ! -f "$dir/$mark_seq.msg" ]; then
+      rm -f "$dir/.muse-pending" 2>/dev/null || true
+    fi
     # The one retry ring exists only while config/wait-no-turns is present.
     # Absent, a mark is left untouched and the inbox stays quiet, as before.
     if [ -e "${FM_CONFIG_OVERRIDE:-${FM_HOME:-}/config}/wait-no-turns" ]; then
