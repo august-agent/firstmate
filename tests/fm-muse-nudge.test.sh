@@ -401,30 +401,6 @@ test_muse_nudge_ack_no_resteer() {
   pass "muse nudge: an acknowledged steer never earns an immediate re-steer"
 }
 
-test_muse_nudge_ack_timestamp_suppresses_restrike() {
-  local rc rec
-  setup_nudge_case acktimestamp
-  muse_nudge_tick sess:fm-t1 t1 4 hAAA
-  rc=$?
-  expect_code 0 "$rc" "strike 1 should fire on rung 4, got rc $rc"
-  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
-  [ -n "$rec" ] || fail "strike 1 should record its steer"
-  touch -d "@$(( $(date +%s) - 3600 ))" "$STATE/t1.inbox/$rec"
-  mkdir -p "$STATE/t1.inbox/handled"
-  mv "$STATE/t1.inbox/$rec" "$STATE/t1.inbox/handled/"
-  muse_nudge_poll sess:fm-t1 t1 1 hAAA
-  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "an acknowledged steer should reset the ladder"
-  muse_nudge_tick sess:fm-t1 t1 5 hAAA
-  rc=$?
-  expect_code 1 "$rc" "an old message acked now must not re-strike at once, got rc $rc"
-  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a suppressed restrike should write nothing"
-  touch -d "@$(( $(date +%s) - 3600 ))" "$STATE/t1.inbox/handled/$rec"
-  muse_nudge_tick sess:fm-t1 t1 6 hAAA
-  rc=$?
-  expect_code 0 "$rc" "an old acknowledgement should allow a fresh steer, got rc $rc"
-  pass "muse nudge: ack observation time suppresses an immediate restrike"
-}
-
 test_muse_nudge_tick_corrupt_state_fails_safe() {
   setup_nudge_case corruptstate
   mkdir -p "$STATE/t1.inbox"
@@ -771,6 +747,8 @@ test_muse_nudge_ack_timestamp_suppresses_restrike() {
   muse_nudge_tick sess:fm-t1 t1 6 hAAA
   rc=$?
   expect_code 0 "$rc" "an old acknowledgement should allow a fresh steer, got rc $rc"
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  [ "$rec" = "002.msg" ] || fail "the fresh steer should take the next sequence, got $rec"
   pass "muse nudge: ack observation time suppresses an immediate restrike"
 }
 
@@ -799,6 +777,36 @@ test_muse_nudge_no_setsid_fallback() {
   [ "$mode" = child ] || fail "without setsid the action should record child mode, got $mode"
   unset -f command
   pass "muse nudge: strikes work without setsid via direct-child fallback"
+}
+
+test_muse_nudge_timeout_kills_uncooperative_action() {
+  local tries
+  setup_nudge_case timeoutkill9
+  export FM_MUSE_NUDGE_ACTION_TIMEOUT=1
+  cat > "$NUDGE_DIR/control-stubborn" <<'SH'
+#!/bin/sh
+trap '' TERM
+echo $$ > "${FM_CONTROL_PIDFILE:-/dev/null}"
+sleep 300 &
+echo $! > "${FM_CONTROL_CHILDPID:-/dev/null}"
+wait
+SH
+  chmod +x "$NUDGE_DIR/control-stubborn"
+  export FM_CONTROL_BIN="$NUDGE_DIR/control-stubborn"
+  export FM_CONTROL_PIDFILE="$NUDGE_DIR/stubborn.pid"
+  export FM_CONTROL_CHILDPID="$NUDGE_DIR/stubborn-child.pid"
+  muse_nudge_write "$STATE" t1 2 001.msg inflight 15 || fail "setup write should succeed"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA >/dev/null
+  wait_for_action_rc "$STATE/t1.inbox" 2>/dev/null || true
+  sleep 2
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a TERM-ignoring action should advance after KILL, got $(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")"
+  if [ -f "$NUDGE_DIR/stubborn.pid" ] && kill -0 "$(cat "$NUDGE_DIR/stubborn.pid")" 2>/dev/null; then
+    fail "a TERM-ignoring wrapper must be killed"
+  fi
+  export FM_MUSE_NUDGE_ACTION_TIMEOUT=300
+  pass "muse nudge: a TERM-ignoring action is killed, then the ladder advances"
 }
 
 test_muse_nudge_timeout_kills_process_group() {
@@ -971,6 +979,7 @@ test_muse_nudge_followup_wait_evidence
 test_muse_nudge_strike_three_waits_for_live_action
 test_muse_nudge_spawn_refuses_live_action
 test_muse_nudge_timeout_kills_process_group
+test_muse_nudge_timeout_kills_uncooperative_action
 test_muse_nudge_anchor_fallback_chain
 test_muse_nudge_timeout_kills_action
 test_muse_nudge_collect_empty_rc
