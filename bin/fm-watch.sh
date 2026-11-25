@@ -614,9 +614,8 @@ inbox_steer_busy() {  # <window> <backend> <task> <tail40>
   fi
 }
 
-# Record one ladder attempt after a ring delivery, sharing the bookkeeping
-# failure path between ordinary rings and deferred jolts: a concurrently
-# removed record refreshes the ladder and reports done, while an unwritable
+# Record one ladder attempt after a ring delivery: a concurrently removed
+# record refreshes the ladder and reports done, while an unwritable
 # ladder with the record still unhandled wakes the bookkeeping failure so a
 # stuck ladder can never retry silently forever. Returns 0 to continue the
 # delivery, 1 when the check is already done.
@@ -635,29 +634,6 @@ inbox_steer_note_ring_attempt() {  # <window> <task> <record>
     wake "$reason"
   fi
   return 0
-}
-
-# A muse re-ring jolted first: the worker drops a doorbell whose Enter lands
-# before its text is visible, so a record still unhandled after a recorded
-# delivery attempt is re-rung behind one press of the harness's verified
-# interrupt key, which jolts a wedged worker back into reading the line
-# already sitting in its composer. The jolt never clears and it settles and
-# re-verifies before the ring, so a restoration landing after the guard
-# capture only defers; it runs only where the composer provably holds the
-# ring's own line, never over a foreign draft, an ambiguous composer, or a
-# merely empty one. Only the watcher takes this step, never the enqueue-time
-# ring. A jolt the worker does not confirm skips the ring and spends one
-# ladder attempt, so the record still escalates on schedule: recovery stays
-# paced, never spinning.
-inbox_steer_muse_jolt() {  # <harness> <backend> <window> <record-path> <label>
-  local harness=$1 backend=$2 w=$3 rec=$4 label=$5
-  if FM_COMPOSER_HARNESS="$harness" \
-    fm_task_inbox_muse_jolt "$harness" "$backend" "$w" "$rec" "$label"; then
-    triage_log "steer-inbox muse re-ring jolt confirmed"
-    return 0
-  fi
-  triage_log "steer-inbox muse re-ring jolt unconfirmed; deferring the ring"
-  return 1
 }
 
 # Steering-inbox loss detection, one cheap check per recorded window per poll.
@@ -715,16 +691,6 @@ inbox_steer_check() {  # <window> <task>
   case "$verb" in
     ring)
       ring_rc=0
-      if [ "$(window_harness "$w")" = muse ] \
-        && [ "$(fm_task_inbox_ring_count "$STATE" "$task" "$rec")" -ge 1 ] \
-        && FM_COMPOSER_HARNESS=muse \
-          fm_task_inbox_muse_may_jolt "$backend" "$w" "$rec" "$(window_label "$w")"; then
-        if ! inbox_steer_muse_jolt muse "$backend" "$w" "$rec" "$(window_label "$w")"; then
-          inbox_steer_note_ring_attempt "$w" "$task" "$rec" \
-            && triage_log "steer-inbox delivery attempt: $task ${rec##*/} result=jolt-unconfirmed"
-          return 0
-        fi
-      fi
       FM_COMPOSER_HARNESS=$(window_harness "$w") \
         fm_task_inbox_ring "$backend" "$w" "$rec" "$(window_label "$w")" || ring_rc=$?
       if [ "$ring_rc" -eq 3 ]; then

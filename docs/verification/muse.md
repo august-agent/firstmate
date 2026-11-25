@@ -308,14 +308,14 @@ The literal dispatcher covers every backend with a native literal primitive; a b
 The ring never clears: an advisory capture must not authorize a destructive operation.
 The pending mark carries the send outcome, so a later ring reconciles before typing: an accepted but unverified send defers, while a failed send retypes only onto a proven empty composer and only once - the retry consumes the allowance either way, bounding repeated post-commit failures under a frozen capture to two literals before deferral.
 A mark for another record bars typing entirely: its line is submitted first, or the ring defers.
-A failed Enter keeps the mark and reports the failure, so the next ring resubmits the protected line; a submit that finds a changed composer defers instead of retrying into it.
-A per-record lock serializes concurrent rings and jolts across the whole delivery; a stale lock fails safe into deferral.
-A record still unhandled after a recorded delivery attempt is re-rung behind one press of the verified interrupt key, with no clear.
-The jolt settles and requires the line to read back twice before the ring, so a restoration landing after the guard capture only defers; an unconfirmed jolt defers while spending one ladder attempt through the shared bookkeeping-failure path, which also reports an unwritable ladder as a stale wake.
-The jolt runs only where the composer provably holds the ring's own line, re-verified under its lock before pressing; even a raced guard cannot destroy a draft. A restoration landing between the final verify and Enter is still submitted once: nothing can interlock a terminal keypress, so the guarantee there is single submission with no retry and no clear, and the post-Enter check refuses to retry into the changed composer.
-A mark for another record bars typing until that record's line submits or the mark proves stale.
+A failed Enter keeps the mark and reports the failure, so the next ring resubmits the protected line.
+A submit that finds a changed composer defers instead of retrying into it.
+A per-record lock serializes concurrent rings across the whole delivery; a stale lock fails safe into deferral.
+A record still unhandled after a recorded delivery attempt is re-rung as-is, with no interrupt key.
+An automatic re-ring interrupt was removed because a restoration racing the final verify can submit a foreign prompt, which no capture spacing can rule out.
+A restoration landing between the final verify and Enter is still submitted once: nothing can interlock a terminal keypress, so the guarantee there is single submission with no retry and no clear, and the post-Enter check refuses to retry into the changed composer.
 A stuck mark annotates the escalation with how long the literal went unverified.
-The foreign-draft and ambiguous-composer guards keep their meaning on both paths: a proven foreign draft still skips without typing or jolting, and an ambiguous composer keeps the shared type-through path with no jolt.
+The foreign-draft and ambiguous-composer guards keep their meaning: a proven foreign draft still skips without typing, and an ambiguous composer keeps the shared type-through path.
 
 ```
 $ bash bin/fm-test-run.sh tests/fm-muse-doorbell.test.sh tests/fm-task-inbox.test.sh tests/fm-send-inbox.test.sh

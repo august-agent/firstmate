@@ -102,10 +102,6 @@ _FM_TASK_INBOX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_FM_TASK_INBOX_LIB_DIR/fm-wake-lib.sh"
 # shellcheck source=/dev/null
 . "$_FM_TASK_INBOX_LIB_DIR/fm-backend.sh"
-# The interrupt-key table for the re-ring jolt; a pure function owner with no
-# source-time side effects, kept as an analysis boundary like the two above.
-# shellcheck source=/dev/null
-. "$_FM_TASK_INBOX_LIB_DIR/fm-control-lib.sh"
 
 FM_TASK_INBOX_SCHEMA='fm-task-inbox.v1'
 FM_TASK_INBOX_GRACE_DEFAULT=90
@@ -461,16 +457,23 @@ fm_task_inbox_muse_clear_pending() {  # <inbox-dir>
   rm -f "$1/.muse-pending" 2>/dev/null
 }
 
-# Submit a visible muse doorbell line: one Enter, then a second only when the
-# line is still sitting there unchanged and the worker is not busy. Callers
-# prove visibility first; this helper only avoids retyping. A composer that
-# changed under the first Enter - a restored prompt landing late, a draft
-# appearing, an unreadable capture - is never retried into: it reports a
-# deferral so the next ring re-reads instead of submitting into changed
-# content. Returns 0 submitted, 1 deferred on a changed composer, 2 when an
-# Enter keystroke itself failed.
+# Submit a muse doorbell line: settle first, then one Enter only when the
+# line reads back visible, then a second only when it is still sitting there
+# unchanged and the worker is not busy. The pre-Enter settle owns the
+# visibility contract for every caller - reconcile paths, failed sends,
+# and fresh deliveries alike submit through here, so no Enter goes out in
+# the same tick as the typed text. A composer that changed under the first
+# Enter - a restored prompt landing late, a draft appearing, an unreadable
+# capture - is never retried into: it reports a deferral so the next ring
+# re-reads instead of submitting into changed content. Returns 0 submitted,
+# 1 deferred on an unverified or changed composer, 2 when an Enter keystroke
+# itself failed.
 fm_task_inbox_muse_submit() {  # <backend> <target> <line> [expected-label]
-  local backend=$1 target=$2 line=$3 label=${4:-} cstate
+  local backend=$1 target=$2 line=$3 label=${4:-} cstate settle
+  settle=$(fm_task_inbox_muse_settle_secs)
+  sleep "$settle"
+  fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
+  [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ] || return 1
   fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || return 2
   sleep 0.3
   cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
@@ -516,52 +519,6 @@ fm_task_inbox_muse_take_ring_lock() {  # <inbox-dir>
   fm_task_inbox_lock_acquire "$1/.muse-ring.lock" || return 1
 }
 
-# A muse re-ring jolt: a single press of the harness's verified interrupt key,
-# with no composer clear. It jolts a wedged worker whose composer already
-# holds the ring's own line back into reading it. The key comes from the
-# control-plane capability table, never improvised here, and only a
-# single-press adapter is jolted: a multi-press sequence owns arm and hazard
-# logic this jolt must not half-run. The press is asynchronous - the worker
-# may restore its cancelled prompt after it - so the jolt holds the same
-# per-record lock as the ring, settles, and requires the line to read back
-# twice in a row: a restoration landing anywhere in that window fails the
-# second read and the jolt reports unconfirmed instead of authorizing a
-# submit. Because nothing is cleared, a raced restoration can only defer,
-# never destroy. A restoration landing between the last read and the caller's
-# Enter remains possible in principle; the submit path contains it by never
-# retrying into a changed composer. Returns 0 when the press landed and the
-# line read back stable, 1 otherwise.
-fm_task_inbox_muse_jolt() {  # <harness> <backend> <target> <record-path> [expected-label]
-  local key line settle target=$3 rec=$4 label=${5:-} dir cstate
-  key=$(fm_control_interrupt_key "$1") || return 1
-  [ "$(fm_control_interrupt_repeat "$1")" = 1 ] || return 1
-  line=$(fm_task_inbox_doorbell_line "$rec") || return 1
-  dir=${rec%/*}
-  fm_task_inbox_muse_take_ring_lock "$dir" || return 1
-  cstate=$(fm_backend_composer_state "$2" "$target" "$label" 2>/dev/null) || cstate=unknown
-  if [ "$cstate" != pending ] \
-    || ! fm_task_inbox_composer_holds "$2" "$target" "$line" "$label"; then
-    fm_lock_release "$dir/.muse-ring.lock"
-    return 1
-  fi
-  fm_backend_send_key "$2" "$target" "$key" "$label" >/dev/null 2>&1 || {
-    fm_lock_release "$dir/.muse-ring.lock"; return 1
-  }
-  settle=$(fm_task_inbox_muse_settle_secs)
-  sleep "$settle"
-  if ! fm_task_inbox_composer_holds "$2" "$target" "$line" "$label"; then
-    fm_lock_release "$dir/.muse-ring.lock"
-    return 1
-  fi
-  sleep "$settle"
-  if fm_task_inbox_composer_holds "$2" "$target" "$line" "$label"; then
-    fm_lock_release "$dir/.muse-ring.lock"
-    return 0
-  fi
-  fm_lock_release "$dir/.muse-ring.lock"
-  return 1
-}
-
 # A stuck muse literal named for the supervisor: when a record with a pending
 # mark escalates, the mark's age says how long the line went unverified. Empty
 # when there is no mark or it is younger than the ladder's own budget horizon
@@ -576,25 +533,6 @@ fm_task_inbox_muse_stale_note() {  # <state-dir> <task-id>
   horizon=$(( $(fm_task_inbox_ring_max) * $(fm_task_inbox_grace_secs) ))
   [ "$age" -ge "$horizon" ] || return 1
   printf ' (its doorbell literal went unverified for %ss; the composer may never have shown it)' "$age"
-}
-
-# Whether jolting before a muse re-ring is worthwhile: only when the composer
-# provably holds exactly this ring's own doorbell line - a previous delivery
-# whose Enter never landed. Every other verdict refuses: a proven foreign
-# draft, an ambiguous or unreadable composer, and a merely empty one, where a
-# plain re-ring is the proportionate step. Returns 0 when the jolt may
-# proceed, 1 when it must not.
-fm_task_inbox_muse_may_jolt() {  # <backend> <target> <record-path> [expected-label]
-  local backend=$1 target=$2 rec=$3 label=${4:-} line cstate
-  line=$(fm_task_inbox_doorbell_line "$rec") || return 1
-  cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || return 1
-  case "$cstate" in
-    pending)
-      fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label"
-      return
-      ;;
-    *) return 1 ;;
-  esac
 }
 
 # The muse doorbell path: the muse worker drops a doorbell whose Enter lands
@@ -619,7 +557,7 @@ fm_task_inbox_muse_may_jolt() {  # <backend> <target> <record-path> [expected-la
 # no return value proves delivery; the acknowledgement move into handled/ is
 # the only delivery proof.
 fm_task_inbox_ring_muse() {  # <backend> <target> <record-path> [expected-label]
-  local backend=$1 target=$2 rec=$3 label=${4:-} line cstate settle dir rc RETRY seq
+  local backend=$1 target=$2 rec=$3 label=${4:-} line cstate dir rc RETRY seq
   case "$(fm_backend_agent_state "$backend" "$target" 2>/dev/null || true)" in
     dead|missing) return 3 ;;
   esac
@@ -721,12 +659,8 @@ fm_task_inbox_ring_muse() {  # <backend> <target> <record-path> [expected-label]
       fi
       ;;
   esac
-  settle=$(fm_task_inbox_muse_settle_secs)
-  sleep "$settle"
-  if ! fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label"; then
-    sleep "$settle"
-    fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
-  fi
+  # The submit path owns the settle-and-verify sequence, so every Enter -
+  # fresh, reconciled, or retried - waits out the same settle first.
   fm_task_inbox_muse_submit "$backend" "$target" "$line" "$label"
   rc=$?
   case "$rc" in

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/fm-muse-doorbell.test.sh - muse doorbell reliability: the harness-scoped
-# delivery path in bin/fm-task-inbox-lib.sh and the watcher's jolt-first
-# re-ring in bin/fm-watch.sh.
+# delivery path in bin/fm-task-inbox-lib.sh and the watcher's plain re-ring
+# in bin/fm-watch.sh.
 #
 # The muse worker drops a doorbell whose Enter lands before its text is
 # visible. The muse ring path therefore types the doorbell as one literal send,
@@ -12,8 +12,8 @@
 #      reconciles before typing - an accepted but unverified send defers,
 #      while a failed send retypes only onto a proven empty composer and
 #      only once. A mark for another record bars typing entirely. A
-#      per-record lock serializes concurrent rings and jolts across the
-#      whole delivery. The ring never clears: even a proven empty composer
+#      per-record lock serializes concurrent rings across the whole
+#      delivery. The ring never clears: even a proven empty composer
 #      is typed onto, and a stale empty capture keeps a hidden draft. A
 #      lagging capture defers submission instead of concatenating a second
 #      literal, and recovers once visibility catches up. A fake clock proves
@@ -27,16 +27,9 @@
 #      with Enter and never retyped, unless the worker reports busy.
 #   4. An ambiguous composer keeps the shared type-through path with no clear.
 #   5. Any other harness keeps the shared path with no clear.
-#   6. The watcher jolts a muse worker before a re-ring only over the ring's
-#      own line - never before a first delivery, never on an empty composer,
-#      never over a foreign draft or an ambiguous composer. The jolt
-#      re-verifies under its lock before pressing, then settles and requires
-#      the line to read back twice, so a restoration landing after the guard
-#      defers instead of submitting, whether it lands at once, a capture
-#      later, or racing the submit itself; an unconfirmed jolt defers while
-#      spending one ladder attempt. A prompt the jolt restores is neither
-#      submitted nor typed onto, and the steer recovers once the worker
-#      consumes it.
+#   6. A re-ring with a recorded delivery attempt resubmits the swallowed
+#      line without retyping and without extra keys; the ladder still
+#      paces every attempt and escalates an unhandled record on schedule.
 #   7. The ring-attempt count tells a first delivery from a re-ring.
 set -u
 
@@ -78,10 +71,8 @@ inbox_lib() {  # <state> <function> [args...]
 # composer text to FM_FAKE_SUBMITTED. With FM_FAKE_LITERAL_FAIL=1 a literal
 # send lands in the composer but still reports failure, standing in for a
 # transport error after commit; with =2 it fails without landing. With
-# FM_FAKE_ESCAPE_RESTORES set, an Escape arms a cancelled-prompt restoration
-# that lands after FM_FAKE_RESTORE_AFTER further captures (0 for the next),
-# once. With FM_FAKE_CAPTURE_GATE=N, each capture waits until N captures have
-# arrived, forcing concurrent rings through the same check.
+# FM_FAKE_CAPTURE_GATE=N, each capture waits until N captures have arrived,
+# forcing concurrent rings through the same check.
 make_muse_stubs() {  # <dir> -> echoes fakebin dir
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -123,15 +114,6 @@ case "${1:-}" in
       fi
       case "$key" in
         C-u) : > "$composer_file" ;;
-        Escape)
-          # Model the worker restoring its cancelled prompt into the
-          # composer, once: a second Escape finds the text already there.
-          # With FM_FAKE_RESTORE_AFTER=N the restoration lands after N
-          # further captures (0 for the next), once.
-          if [ -n "${FM_FAKE_ESCAPE_RESTORES:-}" ]; then
-            printf '%s' "${FM_FAKE_RESTORE_AFTER:-0}" > "${FM_FAKE_RESTORE_COUNT:-$composer_file.restore}" 2>/dev/null || true
-          fi
-          ;;
         Enter)
           if [ -n "${FM_FAKE_REQUIRE_SETTLE:-}" ]; then
             lit=$(cat "${FM_FAKE_LITERAL_CLOCK:-/dev/null}" 2>/dev/null || printf 0)
@@ -139,13 +121,6 @@ case "${1:-}" in
             if [ "$((now - lit))" -lt "${FM_FAKE_SETTLE_REQUIRED:-0}" ]; then
               printf 'IGNORED-Enter: too early (clock %s, literal %s)\n' "$now" "$lit" >> "$send_log"
               continue
-            fi
-          fi
-          # A restoration racing the submit itself: it lands before Enter
-          # consumes the composer, so the submitted line carries it.
-          if [ -n "${FM_FAKE_RESTORE_ON_ENTER:-}" ] && [ -n "${FM_FAKE_ESCAPE_RESTORES:-}" ]; then
-            if ! grep -qF -- "$FM_FAKE_ESCAPE_RESTORES" "$composer_file" 2>/dev/null; then
-              printf '%s' "$FM_FAKE_ESCAPE_RESTORES" >> "$composer_file"
             fi
           fi
           if [ -s "$composer_file" ] && [ -n "${FM_FAKE_SUBMITTED:-}" ]; then
@@ -167,21 +142,6 @@ case "${1:-}" in
     done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane)
-    restore_count=${FM_FAKE_RESTORE_COUNT:-$composer_file.restore}
-    if [ -n "${FM_FAKE_ESCAPE_RESTORES:-}" ] && [ -e "$restore_count" ]; then
-      pending=$(cat "$restore_count" 2>/dev/null || printf -1)
-      case "$pending" in ''|*[!0-9]*) pending=-1 ;; esac
-      if [ "$pending" -ge 0 ]; then
-        if [ "$pending" = 0 ]; then
-          if ! grep -qF -- "$FM_FAKE_ESCAPE_RESTORES" "$composer_file" 2>/dev/null; then
-            printf '%s' "$FM_FAKE_ESCAPE_RESTORES" >> "$composer_file"
-          fi
-          rm -f "$restore_count"
-        else
-          printf '%s' "$((pending - 1))" > "$restore_count"
-        fi
-      fi
-    fi
     if [ -n "${FM_FAKE_CAPTURE_GATE:-}" ]; then
       gate_count="${FM_FAKE_GATE_COUNT:-/dev/null}"
       gate_seen=$(cat "$gate_count" 2>/dev/null || printf 0)
@@ -408,9 +368,7 @@ test_other_harness_ring_sends_no_clear() {
   pass "non-muse ring: the shared path is unchanged with no clear"
 }
 
-# One watcher re-ring check through the real inbox_steer_check entry point: an
-# aged record with a recorded delivery attempt on a muse worker is jolted
-# first, while a record with no attempt yet rings without jolting.
+# One watcher re-ring check through the real inbox_steer_check entry point.
 muse_steer_check() {  # <case-dir>
   PATH="$1/fakebin:$PATH" FM_HOME="$1/home" FM_STATE_OVERRIDE="$1/state" \
     FM_SEND_LOG="$1/send.log" FM_FAKE_COMPOSER_TEXT="$1/composer.txt" \
@@ -433,28 +391,20 @@ setup_muse_watch_case() {  # <name> <ring-count> -> echoes case dir
   printf '%s\n' "$dir"
 }
 
-test_watcher_muse_rering_jolts_first() {
-  local dir rec log doorbell literals jolt_line enter_line submitted
+test_watcher_muse_rering_redelivers() {
+  local dir rec log submitted
   dir=$(setup_muse_watch_case rering 1)
   rec="$dir/state/t1.inbox/001.msg"
   doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
   printf '%s' "$doorbell" > "$dir/composer.txt"
   muse_steer_check "$dir"
   log=$(cat "$dir/send.log")
-  assert_contains "$log" "KEYS:send-keys -t sess:fm-t1 Escape" "a muse re-ring should jolt with one Escape first"
-  assert_contains "$log" "KEYS:send-keys -t sess:fm-t1 Enter" "a muse re-ring should still submit the swallowed line"
-  jolt_line=$(grep -n "Escape" "$dir/send.log" | head -1 | cut -d: -f1)
-  enter_line=$(grep -n "Enter" "$dir/send.log" | head -1 | cut -d: -f1)
-  [ "$jolt_line" -lt "$enter_line" ] \
-    || fail "the jolt must precede the submit:$'\n'$log"
-  literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log" || true)
-  [ "$literals" = 0 ] || fail "the swallowed line is submitted, never retyped, got $literals:$'\n'$log"
-  case "$log" in
-    *"C-u"*) fail "the jolt never clears:$'\n'$log" ;;
-  esac
+  assert_contains "$log" "KEYS:send-keys -t sess:fm-t1 Enter" "a muse re-ring should submit the swallowed line"
+  [ "$(grep -c "Firstmate instruction waiting" "$dir/send.log" || true)" = 0 ] \
+    || fail "the swallowed line is submitted, never retyped:$'\n'$log"
   submitted=$(cat "$dir/submitted.log")
-  assert_contains "$submitted" "Firstmate instruction waiting" "the jolted ring should submit the doorbell"
-  pass "watcher: a muse re-ring jolts before submitting"
+  assert_contains "$submitted" "Firstmate instruction waiting" "the re-ring should submit the doorbell"
+  pass "watcher: a muse re-ring submits without retyping and without keys"
 }
 
 test_muse_ring_recovers_when_visibility_lags() {
@@ -509,104 +459,15 @@ test_muse_ring_settles_before_enter() {
   pass "muse ring: Enter waits out the settle and submits the doorbell once"
 }
 
-test_watcher_muse_rering_empty_has_no_jolt() {
-  local dir log
-  dir=$(setup_muse_watch_case emptyrering 1)
-  muse_steer_check "$dir"
-  log=$(cat "$dir/send.log")
-  case "$log" in
-    *Escape*) fail "an advisory empty capture must not authorize a jolt:$'\n'$log" ;;
-  esac
-  assert_contains "$log" "Firstmate instruction waiting" "an empty re-ring should still ring the doorbell"
-  pass "watcher: a muse re-ring on an empty composer rings without jolting"
-}
-
-test_watcher_muse_first_ring_has_no_jolt() {
-  local dir log
+test_watcher_muse_first_ring_rings_plainly() {
+  local dir log submitted
   dir=$(setup_muse_watch_case firstring 0)
   muse_steer_check "$dir"
   log=$(cat "$dir/send.log")
-  case "$log" in
-    *Escape*) fail "a first delivery must not jolt:$'\n'$log" ;;
-  esac
   assert_contains "$log" "Firstmate instruction waiting" "a first delivery should ring the doorbell"
-  pass "watcher: a muse first delivery rings without jolting"
-}
-
-# A jolt that cancels a real turn makes the worker restore its cancelled
-# prompt. The following ring must neither submit that foreign text nor type
-# onto it, and the steer must stay recoverable once the worker consumes the
-# restoration.
-test_watcher_muse_restored_prompt_survives() {
-  local dir rec log doorbell submitted
-  dir=$(setup_muse_watch_case restored 1)
-  rec="$dir/state/t1.inbox/001.msg"
-  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
-  printf '%s' "$doorbell" > "$dir/composer.txt"
-  FM_FAKE_ESCAPE_RESTORES="cancelled: do the thing" muse_steer_check "$dir"
-  log=$(cat "$dir/send.log")
-  assert_contains "$log" "Escape" "the re-ring should jolt first"
-  case "$log" in
-    *Enter*) fail "a restored foreign prompt must never be submitted:$'\n'$log" ;;
-  esac
-  [ "$(grep -c "Firstmate instruction waiting" "$dir/send.log")" = 0 ] \
-    || fail "a restored foreign prompt must never be typed onto:$'\n'$log"
-  case "$(cat "$dir/composer.txt")" in
-    *"cancelled: do the thing"*) : ;;
-    *) fail "the restored prompt must survive the re-ring check" ;;
-  esac
-  [ -f "$rec" ] || fail "the unhandled record must survive for recovery"
-  printf '%s' "$doorbell" > "$dir/composer.txt"
-  muse_steer_check "$dir"
   submitted=$(cat "$dir/submitted.log")
-  assert_contains "$submitted" "Firstmate instruction waiting" "the steer should submit once the worker consumes the restoration"
-  pass "watcher: a restored prompt survives the re-ring and the steer recovers"
-}
-
-test_watcher_muse_rering_defers_when_jolt_fails() {
-  local dir rec log doorbell count
-  dir=$(setup_muse_watch_case failedjolt 1)
-  rec="$dir/state/t1.inbox/001.msg"
-  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
-  printf '%s' "$doorbell" > "$dir/composer.txt"
-  FM_FAKE_FAIL_KEY=Escape muse_steer_check "$dir"
-  log=$(cat "$dir/send.log")
-  assert_contains "$log" "KEY-FAIL:Escape" "the jolt press should have been attempted and failed"
-  case "$log" in
-    *Enter*) fail "an unconfirmed jolt must not submit:$'\n'$log" ;;
-  esac
-  [ "$(grep -c "Firstmate instruction waiting" "$dir/send.log")" = 0 ] \
-    || fail "an unconfirmed jolt must not type:$'\n'$log"
-  [ -f "$rec" ] || fail "the deferred record must stay unhandled"
-  count=$(inbox_lib "$dir/state" fm_task_inbox_ring_count "$dir/state" t1 "$rec")
-  [ "$count" = 2 ] || fail "the deferral should spend one ladder attempt, got $count"
-  pass "watcher: a muse re-ring defers when the jolt is unconfirmed"
-}
-
-test_watcher_muse_delayed_restore_defers() {
-  local dir rec log doorbell submitted
-  dir=$(setup_muse_watch_case delayedrestore 1)
-  rec="$dir/state/t1.inbox/001.msg"
-  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
-  printf '%s' "$doorbell" > "$dir/composer.txt"
-  : > "$dir/restores"
-  FM_FAKE_ESCAPE_RESTORES="cancelled: do the thing" FM_FAKE_RESTORE_AFTER=1 \
-    FM_FAKE_RESTORE_COUNT="$dir/restores" muse_steer_check "$dir"
-  log=$(cat "$dir/send.log")
-  assert_contains "$log" "Escape" "the re-ring should jolt first"
-  case "$log" in
-    *Enter*) fail "a restoration landing after the guard must never be submitted:$'\n'$log" ;;
-  esac
-  case "$(cat "$dir/composer.txt")" in
-    *"cancelled: do the thing"*) : ;;
-    *) fail "the delayed restoration must be present" ;;
-  esac
-  [ -f "$rec" ] || fail "the unhandled record must survive for recovery"
-  printf '%s' "$doorbell" > "$dir/composer.txt"
-  muse_steer_check "$dir"
-  submitted=$(cat "$dir/submitted.log")
-  assert_contains "$submitted" "Firstmate instruction waiting" "the steer should submit once the worker consumes the restoration"
-  pass "watcher: a delayed restoration defers the ring and the steer recovers"
+  assert_contains "$submitted" "Firstmate instruction waiting" "a first delivery should submit"
+  pass "watcher: a muse first delivery rings without extra keys"
 }
 
 test_muse_ring_never_retypes_across_rings() {
@@ -961,28 +822,6 @@ test_muse_ring_barrier_for_other_record() {
   pass "muse ring: another record's pending mark bars typing"
 }
 
-test_muse_ring_jolt_rechecks_under_lock() {
-  local dir rec log doorbell
-  dir=$(setup_case joltrecheck muse)
-  : > "$dir/send.log"
-  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
-  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
-  printf '%s' "a human draft" > "$dir/composer.txt"
-  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
-    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" \
-    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
-    inbox_lib "$dir/state" fm_task_inbox_muse_jolt muse tmux sess:fm-t1 "$rec" fm-t1 \
-    >"$dir/ring.log" 2>&1
-  expect_code 1 "$?" "a jolt must re-verify under its lock, not trust the guard"
-  log=$(cat "$dir/send.log")
-  case "$log" in
-    *Escape*) fail "no interrupt may go out over a foreign draft:$'\n'$log" ;;
-  esac
-  [ "$(cat "$dir/composer.txt")" = "a human draft" ] \
-    || fail "the draft must survive a refused jolt"
-  pass "muse jolt: a changed composer refuses the press under the lock"
-}
-
 test_muse_ring_defers_on_unreadable_composer_with_mark() {
   local dir rec rc log
   dir=$(setup_case unreadable muse)
@@ -1004,33 +843,6 @@ test_muse_ring_defers_on_unreadable_composer_with_mark() {
   [ -f "$dir/state/t1.inbox/.muse-pending" ] \
     || fail "a deferred ring must keep its pending mark"
   pass "muse ring: an unreadable composer defers with the mark intact"
-}
-
-test_muse_ring_enter_race_submits_once() {
-  local dir rec rc log submitted
-  dir=$(setup_case enterrace muse)
-  : > "$dir/send.log"
-  : > "$dir/submitted.log"
-  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
-  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
-  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
-    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
-    FM_FAKE_ESCAPE_RESTORES="cancelled: do the thing" FM_FAKE_RESTORE_ON_ENTER=1 \
-    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
-    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
-    >"$dir/ring.log" 2>&1
-  rc=$?
-  expect_code 0 "$rc" "the raced submit should still report delivery"
-  log=$(cat "$dir/send.log")
-  [ "$(grep -c "KEYS:send-keys -t sess:fm-t1 Enter" "$dir/send.log")" = 1 ] \
-    || fail "a restoration racing Enter must not trigger a retry:$'\n'$log"
-  submitted=$(cat "$dir/submitted.log")
-  [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 1 ] \
-    || fail "the raced submit must deliver exactly one doorbell:$'\n'$submitted"
-  assert_contains "$submitted" "cancelled: do the thing" "the raced submit carries the restoration with the line"
-  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
-    || fail "a submitted line must clear its pending mark"
-  pass "muse ring: a restoration racing Enter submits once without retrying"
 }
 
 test_muse_ring_dead_endpoint_beats_held_lock() {
@@ -1128,20 +940,6 @@ test_watcher_muse_escalation_names_stale_mark() {
   wakes=$(cat "$dir/state/.wake-queue" 2>/dev/null || true)
   assert_contains "$wakes" "went unverified" "an escalation past a stuck mark should name it:$'\n'$wakes"
   pass "watcher: a muse escalation names the stuck pending mark"
-}
-
-test_watcher_muse_jolt_bookkeeping_failure_wakes() {
-  local dir rec doorbell wakes
-  dir=$(setup_muse_watch_case joltbookkeeping 1)
-  rec="$dir/state/t1.inbox/001.msg"
-  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
-  printf '%s' "$doorbell" > "$dir/composer.txt"
-  chmod 444 "$dir/state/t1.inbox/.ring-state"
-  FM_FAKE_ESCAPE_RESTORES="cancelled: do the thing" muse_steer_check "$dir" >/dev/null 2>&1
-  chmod 644 "$dir/state/t1.inbox/.ring-state"
-  wakes=$(cat "$dir/state/.wake-queue" 2>/dev/null || true)
-  assert_contains "$wakes" "bookkeeping unwritable" "an unwritable ladder on a deferred jolt must wake:$'\n'$wakes"
-  pass "watcher: a jolt deferral with unwritable bookkeeping wakes"
 }
 
 # The dispatcher routes every backend with a native literal primitive to its
@@ -1253,15 +1051,13 @@ test_watcher_muse_rering_spares_foreign_draft() {
   printf '%s' "a human draft" > "$dir/composer.txt"
   muse_steer_check "$dir"
   log=$(cat "$dir/send.log")
-  case "$log" in
-    *Escape*) fail "no jolt may precede a ring over a foreign draft:$'\n'$log" ;;
-  esac
+  [ -z "$log" ] || fail "a skipped ring must send nothing:$'\n'$log"
   [ "$(cat "$dir/composer.txt")" = "a human draft" ] \
     || fail "the foreign draft must survive a muse re-ring check"
   case "$log" in
     *"Firstmate instruction waiting"*) fail "a foreign draft must skip the ring:$'\n'$log" ;;
   esac
-  pass "watcher: a muse re-ring spares a foreign draft without jolting"
+  pass "watcher: a muse re-ring spares a foreign draft"
 }
 
 test_muse_ring_types_then_enters_separately
@@ -1281,25 +1077,18 @@ test_watcher_muse_rering_spares_foreign_draft
 test_muse_ring_submits_own_pending_line
 test_muse_ring_unknown_composer_keeps_shared_path
 test_other_harness_ring_sends_no_clear
-test_watcher_muse_rering_jolts_first
-test_watcher_muse_restored_prompt_survives
-test_watcher_muse_delayed_restore_defers
-test_watcher_muse_rering_empty_has_no_jolt
-test_watcher_muse_first_ring_has_no_jolt
-test_watcher_muse_rering_defers_when_jolt_fails
+test_watcher_muse_rering_redelivers
+test_watcher_muse_first_ring_rings_plainly
 test_muse_ring_serializes_concurrent_rings
 test_muse_ring_bounds_repeated_post_commit_failures
 test_muse_ring_barrier_for_other_record
-test_muse_ring_jolt_rechecks_under_lock
 test_muse_ring_defers_on_unreadable_composer_with_mark
-test_muse_ring_enter_race_submits_once
 test_muse_ring_bounded_after_post_commit_stale
 test_muse_ring_defers_on_held_lock
 test_muse_ring_dead_endpoint_beats_held_lock
 test_muse_ring_refuses_unwritable_mark
 test_muse_stale_note_names_old_marks
 test_watcher_muse_escalation_names_stale_mark
-test_watcher_muse_jolt_bookkeeping_failure_wakes
 test_backend_send_literal_routes_paseo
 test_backend_send_literal_refuses_panes_without
 test_ring_count_tells_first_from_rering
