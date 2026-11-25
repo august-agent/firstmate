@@ -133,14 +133,16 @@ Herdr tracks agy natively (`antigravity-cli` integration, detected as `agent=agy
 The tmux adapter classifies the anchored process name `agy` as `agent` through the shared name vocabulary in `bin/fm-agent-process-lib.sh`, the muse/omp precedent for short bare-word names.
 agy is included in the session-lock name vocabulary in `bin/fm-session-lock-lib.sh` (`FM_HARNESS_RE` and `FM_HARNESS_NAMES`), recognizing an agy ancestor process as a verified session-lock holder.
 
-## Composer: unknown by design
+## Composer: the bare-`>` separated pair, proven by a live agy identity
 
 Byte-level capture of the idle pane shows a bare unstyled `>` between two full-width `─` rules, with an unstyled `? for shortcuts` cell and a dim (`SGR 2`) model cell in the status row below.
-The shared classifier reads that bare `>` as `unknown` under the dead-shell rule, never `empty`.
-Steering still confirms delivery: the Herdr submit core leads with the native `idle`-to-`working` transition, which agy performs, and the delivery footer regex covers the tmux path.
+The shared classifier reads that pair through an agy-owned branch of the separated shape: a live agy identity (Herdr's native `agent=agy`, or the anchored `agy` foreground process on tmux) plus an idle status proves the stripped pair empty, while any other content reads pending.
+A pane whose agent died to a shell has no live agy foreground process, so the dead-shell rule still reads it unknown and the relaunch gate still refuses it.
+The doorbell path this unblocks is the shared literal-then-separate-Enter ring: the typed-but-unsubmitted failure (doorbell lines stacking in the composer until one manual Enter submitted them) no longer recurs, because each ring types once, settles, and sends Enter as a separate keystroke, and re-rings submit the waiting line instead of typing another.
+`tests/fm-agy-doorbell.test.sh` pins the portable half (a separate Enter after the settle, no restacking on re-ring, the relaunch empty-composer read passing after the submit, a dead shell staying unknown).
+Steering without that proof still confirms delivery the old way: the Herdr submit core leads with the native `idle`-to-`working` transition, which agy performs, and the delivery footer regex covers the tmux path.
 agy renders the busy footer late for that confirm loop - about 1.5 s after Enter for a short steer and 4-5 s for a realistic longer brief, measured live on `agy 1.2.1` (2026-09-12) against the shared budget's 3 x 0.4 s - so `bin/fm-send.sh` gives agy typed targets a longer default submit-confirm budget (20 retries, about 8 s at the default cadence); an explicit `FM_SEND_RETRIES` still wins and every other harness keeps the shared 3-retry default.
 `tests/fm-send-agy-confirm.test.sh` pins the raised default and `tests/fm-agy-harness.test.sh` pins the Herdr transition path.
-This is the cursor precedent, not a gap to patch in shared code.
 
 ## Supervised task: spawn, steer, relaunch, and exit through the new path
 
@@ -150,6 +152,14 @@ Durable steering held: a `bin/fm-send.sh` message landed in the task inbox, the 
 Same-copy relaunch held: `bin/fm-control.sh relaunch --note` replaced the worker in place on the identical worktree, model, and effort, the replacement verified both prior lines intact and appended `relaunched: done`.
 Exit held: `bin/fm-control.sh exit` stopped the worker, the registry returned `agent_not_found`, and the pane remained a lone shell in the worktree with all work intact.
 No automatic quota failover was exercised or claimed; every handoff above was an explicit supervised relaunch.
+
+## Queued wedge: interrupt-alone recovery
+
+A pane that shows `Press up to edit queued messages` with the doorbell still sitting and no running turn is wedged: plain Enter never submits it, and a relaunch fails while the old agent still runs.
+The separate-Enter ring detects that exact state on agy only - the queued text rendered, our line reading back, the rendered busy read idle, while a healthy running turn reads busy and is never interrupted - and sends the control plane's verified single Escape alone, with no text and no Enter in that step; the next ring submits through the ordinary path.
+This is the fork owner's explicit exception to the no-automatic-interrupt rule for re-rings, scoped to this state.
+`tests/fm-agy-doorbell.test.sh` pins the interrupt-alone step, the submit on the next ring, the ladder going quiet after the acknowledgement, and every gate: non-agy, no queued text, busy, and a foreign line.
+Live proof of the recovery needs a genuinely wedged pane and is unproven; the portable fake renders the exact queued text.
 
 ## Primary and secondmate integration
 
@@ -165,14 +175,16 @@ Session lock verification recognizes `agy` process ancestry via `bin/fm-session-
 The unauthenticated failure mode was never observed; this host's agy runs signed in, so any auth prompt is a fail-loud credential blocker, not a handled dialog.
 No slash-skill invocation form was verified, so skill invocation stays natural language.
 `--continue` and `--conversation` resume were never exercised; recovery uses deterministic relaunch from the brief on disk.
+The composer's live half is unproven on the installed `agy 1.5.17`: the chrome above was established on `agy 1.2.x`, and no signed-in launch with the checkout trusted was available to run the matrix guard from, so the new `empty` read awaits its first live pass and any 1.5.x redraw would surface there first.
 
 ## Refreshing this record
 
-Run the portable suite and the live guard after any agy upgrade, because the process name, marker set, trust dialog text, the pinned status row's running/idle/`N task(s)` shapes, and the rendered interrupt text are all vendor-controlled surfaces that the spawn gate and the busy fallback match verbatim:
+Run the portable suite and the live guards after any agy upgrade, because the process name, marker set, trust dialog text, the composer chrome (the two `─` rules and the bare `>` prompt row), the pinned status row's running/idle/`N task(s)` shapes, and the rendered interrupt text are all vendor-controlled surfaces that the spawn gate, the composer read, and the busy fallback match verbatim:
 
 ```
-bin/fm-test-run.sh tests/fm-agy-harness.test.sh
+bin/fm-test-run.sh tests/fm-agy-harness.test.sh tests/fm-agy-doorbell.test.sh
 FM_AGY_SIGNALS_LIVE=1 bin/fm-test-run.sh tests/fm-agy-signals-live-e2e.test.sh
+FM_COMPOSER_MATRIX_LIVE=1 bin/fm-test-run.sh tests/fm-composer-matrix-live-e2e.test.sh
 ```
 
 The live guard was last run on `agy 1.2.7` (2026-09-21) and passed every assertion, including the two that were added with the status-row split: the settled pane classified `idle agy-regex`, and an agy worker waiting on a background `sleep` job it launched surfaced the `N task(s)` field and classified `busy agy-regex`.

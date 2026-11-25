@@ -111,11 +111,14 @@ fm_tmux_composer_caps() {
 # It answers Command Code the same way, from its anchored `command-code`
 # foreground process name and its own verified busy footer: its composer is a
 # bare `❯` row between the same two rules, and its placeholder needs the
-# identity-scoped ghost ceiling in bin/fm-composer-lib.sh. Hermes runs under
-# an interpreter, so it is matched by foreground argv through
+# identity-scoped ghost ceiling in bin/fm-composer-lib.sh. It answers agy
+# from its anchored `agy` foreground process name the same way: agy's
+# composer is a bare `>` row between the same two rules, and only this live
+# identity lets the shared classifier read that stripped pair empty. Hermes
+# runs under an interpreter, so it is matched by foreground argv through
 # bin/fm-hermes-process-lib.sh rather than by process name.
 # Prints "<owner><TAB>idle" or "<owner><TAB>working" for owner pi,
-# polytoken, commandcode, or hermes; exits 1 when the pane is not a live
+# polytoken, commandcode, agy, or hermes; exits 1 when the pane is not a live
 # shape owner.
 fm_tmux_composer_identity() {  # <target>
   local target=$1 tty pid pgid tpgid comm args owner='' status
@@ -129,6 +132,7 @@ fm_tmux_composer_identity() {  # <target>
           pi|pi-signed|pi-launcher|Pi) owner=pi ;;
           polytoken) owner=polytoken ;;
           command-code) owner=commandcode ;;
+          agy) owner=agy ;;
         esac
         if [ -z "$owner" ]; then
           args=$(LC_ALL=C ps -p "$pid" -o args= 2>/dev/null) || args=
@@ -145,6 +149,7 @@ EOF
     case "${comm##*/}" in
       pi|pi-signed|pi-launcher) owner=pi ;;
       polytoken) owner=polytoken ;;
+      agy) owner=agy ;;
     esac
   fi
   [ -n "$owner" ] || return 1
@@ -216,6 +221,17 @@ fm_tmux_composer_state() {  # <target> -> empty|pending|pending-unproven|unknown
   # process identity and read with that identity.
   if [ "$verdict" = unknown ] && identity=$(fm_tmux_composer_identity "$target") \
      && [ "${identity%%$'\t'*}" = commandcode ]; then
+    verdict=$(fm_composer_classify_screen "$(fm_tmux_composer_caps)" "$pane" '' "$identity")
+    [ "$verdict" != need-identity ] || verdict=unknown
+  fi
+  # agy leaves the terminal cursor wherever its TUI drew last - below the
+  # composer rather than on it - so a cursor-anchored read of a live agy pane
+  # answers `unknown` the same way. Reclassify that pane cursorless the same
+  # way, gated on its own anchored foreground identity and read with it: the
+  # live identity plus an idle status is what proves the bare `>` pair empty,
+  # so a pane whose agent died to a shell keeps reading unknown.
+  if [ "$verdict" = unknown ] && identity=$(fm_tmux_composer_identity "$target") \
+     && [ "${identity%%$'\t'*}" = agy ]; then
     verdict=$(fm_composer_classify_screen "$(fm_tmux_composer_caps)" "$pane" '' "$identity")
     [ "$verdict" != need-identity ] || verdict=unknown
   fi

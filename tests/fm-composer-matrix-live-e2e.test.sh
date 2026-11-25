@@ -168,7 +168,12 @@ check_harness_idle_cursorless() {  # <name> <version> <target>
 }
 
 # --- 1. Every installed verified harness must reach a proven-empty composer --
-for h in claude codex opencode pi grok kimi muse; do
+# agy rides the same loop: its bare `>` prompt row between two rules proves
+# empty only with a live agy identity plus an idle status, so this guard is
+# the tripwire if a vendor release redraws that chrome. An untrusted cwd or
+# a sign-in prompt is a real unreadable-composer state and correctly fails
+# that harness's check rather than passing silently.
+for h in claude codex opencode pi grok kimi muse agy; do
   if command -v "$h" >/dev/null 2>&1; then
     check_harness_idle_empty "$h" "$h"
   else
