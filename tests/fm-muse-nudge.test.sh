@@ -2,41 +2,47 @@
 # tests/fm-muse-nudge.test.sh - muse auto-nudge ladder: the strike selection,
 # guards, and actions in bin/fm-muse-nudge-lib.sh.
 #
-# A muse lane that proves another idle interval past the nudge threshold gets
-# at most one strike per escalation rung: strike 1 steers, strike 2
-# interrupts and steers once the lane reads idle with a clear composer (never
-# in the same step), strike 3 relaunches with a generated note and spends the
-# ladder. These tests drive the real library functions over a stub tmux and a
-# stub control plane and pin:
+# A muse lane that proves another wedge-escalation rung past the nudge
+# threshold of uninterrupted idleness earns at most one strike per rung:
+# strike 1 steers, strike 2 interrupts and steers once the lane reads idle
+# with a clear composer (never in the same step), strike 3 relaunches with a
+# generated note and spends the ladder. These tests drive the real library
+# functions over a stub tmux and a stub control plane and pin:
 #   1. The rung math and the pure strike selection, including the exact-rung
 #      first strike and the spent ladder.
 #   2. The guard matrix: paused, terminal, actively-working, captain-held,
-#      non-muse, and secondmate lanes are never struck.
-#   3. Strike 1 writes a steer record and rings it; strike 2 interrupts and
-#      defers its steer to idle plus a clear composer; strike 3 relaunches
-#      with a note built from durable state.
+#      non-muse, and secondmate lanes are never struck, and a strike
+#      requires a continuous quiet window, not just a rung count.
+#   3. Strike 1 writes a steer record and rings it; strike 2 reserves first,
+#      then interrupts in the background without delaying the caller, and its
+#      outcome is collected without replaying a lost verb; strike 3 relaunches
+#      the same way and spends the ladder.
 #   4. The poll upkeep: an acknowledged steer resets the ladder, a terminal
-#      task clears it, a spent ladder lapses when its episode ends, and the
-#      pending steer waits out busy and unclear composers.
+#      task clears it, a spent ladder lapses on fresh activity, the
+#      follow-up steer waits out busy and drafts under rechecked guards, and
+#      corrupt state fails safe instead of resetting.
 #
 # Seams, all documented so a green run means what it says: the tmux boundary
 # is stubbed (captures render a composer file, sends append to it, Enter
 # submits and clears - the same fake contract the doorbell suite uses); the
-# control plane is a stub script via FM_CONTROL_BIN (the ladder's selection
-# and sequencing are under test, while bin/fm-control.sh itself is covered by
-# tests/fm-control.test.sh); window identity helpers read the test meta files
-# the same way production reads recorded metadata; the pause classification
-# and captain-call predicates are canned per test (their own suites own their
-# truth, these tests own the ladder's response to each verdict).
+# control plane is a stub script via FM_CONTROL_BIN (the ladder's selection,
+# sequencing, reservation, and collection are under test, while
+# bin/fm-control.sh itself is covered by tests/fm-control.test.sh);
+# window identity helpers read the test meta files the same way production
+# reads recorded metadata; the pause classification and captain-call
+# predicates are canned per test (their own suites own their truth, these
+# tests own the ladder's response to each verdict).
 set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 STATE=""
-CASE_META=""
+TRIAGE_LOG=/dev/null
+CASE_META=/dev/null
 NUDGE_PAUSE_CLASS=none
 NUDGE_CAPTAIN_CALL=closed
+NUDGE_DIR=""
 
 # shellcheck source=bin/fm-classify-lib.sh
 . "$ROOT/bin/fm-classify-lib.sh"
@@ -59,9 +65,12 @@ task_captain_call_open() { [ "$NUDGE_CAPTAIN_CALL" = open ] && return 0 || retur
 
 # Minimal stub tmux: captures render the composer file in a box (empty box
 # for an empty file), literal sends append, Enter submits the composer text
-# and clears, C-u clears. Display queries report a plain pane.
+# and clears, C-u clears. Display queries report a plain pane with the
+# cursor on row 1, which is what the composer classifier locates.
 make_nudge_stubs() {  # <dir> -> echoes fakebin dir
-  local dir=$1 fb="$dir/fakebin"
+  local dir fb
+  dir=$1
+  fb="$dir/fakebin"
   mkdir -p "$fb"
   : > "$dir/composer.txt"
   cat > "$fb/tmux" <<'SH'
@@ -107,8 +116,6 @@ case "${1:-}" in
     for a in "$@"; do
       case "$a" in
         *cursor_y*) printf '1\n'; exit 0 ;;
-        *pane_current_command*)
-          [ -z "${FM_FAKE_TMUX_AGENT:-}" ] || { printf '%s\n' "$FM_FAKE_TMUX_AGENT"; exit 0; } ;;
       esac
     done
     printf 'fakepane\n'; exit 0 ;;
@@ -133,13 +140,15 @@ SH
   printf '%s' "$fb"
 }
 
-# One case: STATE with a task meta, a working status, and stub paths. Sets
-# NUDGE_DIR (call in the current shell: command substitution would lose the
-# exported paths).
+# One case: STATE with a task meta, a working status, a quiet worktree, and
+# stub paths. Sets NUDGE_DIR (call in the current shell: command
+# substitution would lose the exported paths). Worktree files are backdated
+# past the idle threshold so the lane reads as continuously quiet; tests that
+# need activity touch a fresh file into the worktree.
 setup_nudge_case() {  # <name>
   local dir=$TMP_ROOT/$1
   NUDGE_DIR=$dir
-  mkdir -p "$dir/state"
+  mkdir -p "$dir/state" "$dir/wt"
   STATE="$dir/state"
   export STATE
   CASE_META="$dir/meta"
@@ -150,19 +159,15 @@ setup_nudge_case() {  # <name>
   : > "$dir/submitted.log"
   : > "$dir/control.log"
   : > "$TRIAGE_LOG"
+  : > "$dir/wt/seed.txt"
+  touch -d "@$(( $(date +%s) - 3600 ))" "$dir/wt/seed.txt"
   cat > "$CASE_META" <<EOF
 window=sess:fm-t1
 backend=tmux
 harness=muse
 kind=ship
 label=fm-t1
-EOF
-  cat > "$CASE_META" <<EOF
-window=sess:fm-t1
-backend=tmux
-harness=muse
-kind=ship
-label=fm-t1
+worktree=$dir/wt
 EOF
   cp "$CASE_META" "$STATE/t1.meta"
   printf 'working [at=1]: doing step three\n' > "$STATE/t1.status"
@@ -179,6 +184,16 @@ EOF
   export FM_FAKE_SUBMITTED="$dir/submitted.log"
   export FM_COMPOSER_HARNESS=muse
   export FM_TASK_INBOX_MUSE_SETTLE_SECS=0
+}
+
+# Wait up to ~5s for a background control action to record its outcome.
+wait_for_action_rc() {  # <inbox-dir>
+  local i
+  for i in $(seq 1 50); do
+    [ -e "$1/.muse-nudge-action-rc" ] && return 0
+    sleep 0.1
+  done
+  return 1
 }
 
 test_muse_nudge_rungs_default() {
@@ -214,10 +229,11 @@ test_muse_nudge_next_strike_matrix() {
 
 test_muse_nudge_file_roundtrip() {
   local dir got
-  setup_nudge_case fileroundtrip; dir=$NUDGE_DIR
-  muse_nudge_write "$STATE" t1 2 004.msg 1 19 || fail "strike write should succeed"
+  setup_nudge_case fileroundtrip
+  dir=$NUDGE_DIR
+  muse_nudge_write "$STATE" t1 2 004.msg 1 19 hXYZ || fail "strike write should succeed"
   got=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")
-  [ "$got" = "2 004.msg 1 19" ] || fail "strike read should roundtrip, got $got"
+  [ "$got" = "2|004.msg|1|19|hXYZ" ] || fail "strike read should roundtrip, got $got"
   muse_nudge_clear "$STATE" t1
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "clear should drop the file"
   muse_nudge_read "$(muse_nudge_file "$STATE" t1)" 2>/dev/null \
@@ -226,8 +242,7 @@ test_muse_nudge_file_roundtrip() {
 }
 
 test_muse_nudge_guarded_matrix() {
-  local dir
-  setup_nudge_case guards; dir=$NUDGE_DIR
+  setup_nudge_case guards
   muse_nudge_guarded sess:fm-t1 t1 || fail "a working muse lane should be nudgeable"
   printf 'paused [at=1]: waiting on the captain\n' > "$STATE/t1.status"
   muse_nudge_guarded sess:fm-t1 t1 \
@@ -259,15 +274,15 @@ test_muse_nudge_guarded_matrix() {
 
 test_muse_nudge_steer_text() {
   local text
-  text=$(muse_nudge_steer_text 16)
+  text=$(muse_nudge_steer_text 15)
   assert_contains "$text" "continue in small steps from your todo" "the steer should carry the nudge"
-  assert_contains "$text" "16 minutes" "the steer should name the proven idle age"
+  assert_contains "$text" "15 minutes" "the steer should name the proven idle age"
   pass "muse nudge: steer text names the idle age"
 }
 
 test_muse_nudge_note_content() {
-  local dir note
-  setup_nudge_case notecontent; dir=$NUDGE_DIR
+  local note
+  setup_nudge_case notecontent
   printf 'working [at=42]: halfway through the migration\n' > "$STATE/t1.status"
   fm_task_inbox_write "$STATE" t1 "first steer" >/dev/null
   note=$(muse_nudge_note "$STATE" t1 24 3)
@@ -280,146 +295,269 @@ test_muse_nudge_note_content() {
 }
 
 test_muse_nudge_tick_strike_one() {
-  local dir rc rec
-  setup_nudge_case strikeone; dir=$NUDGE_DIR
-  muse_nudge_tick sess:fm-t1 t1 4 960
+  local rc rec
+  setup_nudge_case strikeone
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
   rc=$?
   [ "$rc" = 0 ] || fail "strike 1 should fire on rung 4, got rc $rc"
-  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d' ' -f2)
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
   [ -n "$rec" ] || fail "strike 1 should record its steer"
   [ -f "$STATE/t1.inbox/$rec" ] || fail "strike 1 should write a steer record"
-  assert_contains "$(cat "$dir/send.log")" "Firstmate instruction waiting" "strike 1 should ring the steer"
-  assert_contains "$(cat "$dir/submitted.log")" "Firstmate instruction waiting" "strike 1 should submit the doorbell"
+  assert_contains "$(cat "$NUDGE_DIR/send.log")" "Firstmate instruction waiting" "strike 1 should ring the steer"
+  assert_contains "$(cat "$NUDGE_DIR/submitted.log")" "Firstmate instruction waiting" "strike 1 should submit the doorbell"
   assert_contains "$(cat "$STATE/t1.inbox/$rec")" "continue in small steps from your todo" "the steer record should carry the nudge"
+  assert_contains "$(cat "$STATE/t1.inbox/$rec")" "15 minutes" "the steer should name the proven idle age"
   assert_contains "$(cat "$TRIAGE_LOG")" "strike 1/3" "strike 1 should be logged"
-  muse_nudge_tick sess:fm-t1 t1 5 1200 >/dev/null
-  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d' ' -f1)" = 2 ] \
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA >/dev/null
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1)" = 2 ] \
     || fail "rung 5 should escalate to strike 2, not re-fire strike 1"
-  [ "$(grep -c "Firstmate instruction waiting" "$dir/send.log")" = 1 ] \
+  [ "$(grep -c "Firstmate instruction waiting" "$NUDGE_DIR/send.log")" = 1 ] \
     || fail "rung 5 must not retype the steer"
+  wait_for_action_rc "$STATE/t1.inbox" || fail "strike 2 control should record its outcome"
   pass "muse nudge: strike 1 steers once on its rung"
 }
 
 test_muse_nudge_tick_below_threshold() {
-  local dir
-  setup_nudge_case belowthreshold; dir=$NUDGE_DIR
-  muse_nudge_tick sess:fm-t1 t1 3 720
+  setup_nudge_case belowthreshold
+  muse_nudge_tick sess:fm-t1 t1 3 hAAA
   [ "$?" = 1 ] || fail "no strike should fire below rung 4"
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "no strike file should exist below rung 4"
-  [ ! -s "$dir/send.log" ] || fail "no doorbell should ring below rung 4"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "no doorbell should ring below rung 4"
   pass "muse nudge: nothing fires below the first rung"
 }
 
 test_muse_nudge_tick_disabled() {
-  local dir
-  setup_nudge_case disablednudge; dir=$NUDGE_DIR
-  FM_MUSE_NUDGE_IDLE_SECS=0 muse_nudge_tick sess:fm-t1 t1 4 960
+  setup_nudge_case disablednudge
+  FM_MUSE_NUDGE_IDLE_SECS=0 muse_nudge_tick sess:fm-t1 t1 4 hAAA
   [ "$?" = 1 ] || fail "a disabled ladder should never fire"
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a disabled ladder should write nothing"
   pass "muse nudge: zero threshold disables the ladder"
 }
 
-test_muse_nudge_strike_two_interrupt_then_steer() {
-  local dir rc rec literals
-  setup_nudge_case striketwo; dir=$NUDGE_DIR
-  muse_nudge_tick sess:fm-t1 t1 4 960 >/dev/null
-  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d' ' -f2)
-  : > "$dir/send.log"
-  muse_nudge_tick sess:fm-t1 t1 5 1200
+test_muse_nudge_tick_needs_quiet_window() {
+  setup_nudge_case activewrite
+  : > "$NUDGE_DIR/wt/fresh.txt"
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
+  [ "$?" = 1 ] || fail "a recent worktree write should veto the strike"
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a vetoed strike should write nothing"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "a vetoed strike should ring nothing"
+  pass "muse nudge: a recent write vetoes the strike"
+}
+
+test_muse_nudge_tick_corrupt_state_fails_safe() {
+  setup_nudge_case corruptstate
+  mkdir -p "$STATE/t1.inbox"
+  printf 'STRIKE=bogus\n' > "$(muse_nudge_file "$STATE" t1)"
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
+  [ "$?" = 1 ] || fail "a corrupt strike file should fire nothing"
+  [ "$(cat "$(muse_nudge_file "$STATE" t1)")" = "STRIKE=bogus" ] \
+    || fail "a corrupt strike file must be left intact, not reset"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "a corrupt strike file should ring nothing"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "a corrupt strike file should spawn nothing"
+  pass "muse nudge: corrupt state fails safe"
+}
+
+test_muse_nudge_strike_two_async_then_steer() {
+  local rc rec got inbox
+  setup_nudge_case striketwo
+  inbox="$STATE/t1.inbox"
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA >/dev/null
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  : > "$NUDGE_DIR/send.log"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
   rc=$?
   [ "$rc" = 0 ] || fail "strike 2 should fire on rung 5, got rc $rc"
-  assert_contains "$(cat "$dir/control.log")" "interrupt" "strike 2 should interrupt first"
-  [ -z "$(grep "Firstmate instruction waiting" "$dir/send.log" || true)" ] \
-    || fail "the interrupt step must not steer in the same step"
   got=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")
-  [ "$got" = "2 $rec 1 20" ] || fail "strike 2 should wait on the first steer, got $got"
-  muse_nudge_poll sess:fm-t1 t1 1
-  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d' ' -f1,2)" = "2 002.msg" ] \
+  [ "$got" = "2|$rec|inflight|15" ] || fail "strike 2 should reserve before acting, got $got"
+  [ -z "$(grep "Firstmate instruction waiting" "$NUDGE_DIR/send.log" || true)" ] \
+    || fail "reserving strike 2 must not steer in the same step"
+  wait_for_action_rc "$inbox" || fail "the interrupt should record its outcome"
+  assert_contains "$(cat "$NUDGE_DIR/control.log")" "CONTROL:t1 interrupt" "strike 2 should interrupt in the background"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  got=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")
+  [ "$got" = "2|$rec|1|15" ] || fail "a confirmed interrupt should arm the follow-up steer, got $got"
+  [ -z "$(grep "Firstmate instruction waiting" "$NUDGE_DIR/send.log" || true)" ] \
+    || fail "collecting the interrupt must not steer by itself"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1,2)" = "2|002.msg" ] \
     || fail "the follow-up steer should go out once idle with a clear composer"
-  assert_contains "$(cat "$dir/submitted.log")" "Firstmate instruction waiting" "the follow-up steer should submit the doorbell"
-  literals=$(grep -c "Firstmate instruction waiting" "$dir/send.log")
-  [ "$literals" = 1 ] || fail "the follow-up should type exactly one doorbell, got $literals"
-  pass "muse nudge: strike 2 interrupts, then steers on idle plus clear"
+  [ "$(grep -c "Firstmate instruction waiting" "$NUDGE_DIR/send.log")" = 1 ] \
+    || fail "the follow-up should type exactly one doorbell"
+  pass "muse nudge: strike 2 interrupts in the background, then steers"
+}
+
+test_muse_nudge_strike_two_failure_reverts() {
+  local rc got
+  setup_nudge_case interruptfail
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA >/dev/null
+  FM_TEST_CONTROL_RC=1 muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  [ "$rc" = 0 ] || fail "strike 2 should issue on rung 5, got rc $rc"
+  wait_for_action_rc "$STATE/t1.inbox" || fail "the failed interrupt should record its outcome"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  got=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1,2,4)
+  [ "$got" = "1|001.msg|15" ] || fail "a failed interrupt should hold at strike 1, got $got"
+  [ "$(grep -c "CONTROL:" "$NUDGE_DIR/control.log")" = 1 ] \
+    || fail "a failed interrupt must not be replayed by collection"
+  pass "muse nudge: a failed interrupt holds the ladder"
+}
+
+test_muse_nudge_strike_two_unknown_proceeds() {
+  setup_nudge_case interruptunknown
+  muse_nudge_write "$STATE" t1 2 001.msg inflight 15 || fail "setup write should succeed"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a lost interrupt should advance without replay, got $(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "an unknown outcome must not re-fire the control plane"
+  pass "muse nudge: a lost interrupt outcome advances without replay"
 }
 
 test_muse_nudge_poll_waits_out_busy_and_drafts() {
-  local dir got
-  setup_nudge_case pollwaits; dir=$NUDGE_DIR
-  muse_nudge_write "$STATE" t1 2 001.msg 1 20 || fail "setup write should succeed"
-  muse_nudge_poll sess:fm-t1 t1 0
+  local got
+  setup_nudge_case pollwaits
+  muse_nudge_write "$STATE" t1 2 001.msg 1 15 || fail "setup write should succeed"
+  muse_nudge_poll sess:fm-t1 t1 0 hAAA
   got=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")
-  [ "$got" = "2 001.msg 1 20" ] || fail "a busy lane must keep waiting, got $got"
-  [ ! -s "$dir/send.log" ] || fail "a busy lane must send nothing"
-  printf 'someone is typing here' > "$dir/composer.txt"
-  muse_nudge_poll sess:fm-t1 t1 1
+  [ "$got" = "2|001.msg|1|15" ] || fail "a busy lane must keep waiting, got $got"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "a busy lane must send nothing"
+  printf 'someone is typing here' > "$NUDGE_DIR/composer.txt"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
   got=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")
-  [ "$got" = "2 001.msg 1 20" ] || fail "an unclear composer must keep waiting, got $got"
-  [ ! -s "$dir/send.log" ] || fail "an unclear composer must send nothing"
+  [ "$got" = "2|001.msg|1|15" ] || fail "an unclear composer must keep waiting, got $got"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "an unclear composer must send nothing"
   pass "muse nudge: the follow-up steer waits out busy and drafts"
 }
 
-test_muse_nudge_strike_three_relaunches() {
-  local dir rc
-  setup_nudge_case strikethree; dir=$NUDGE_DIR
-  muse_nudge_write "$STATE" t1 2 001.msg 1 20 || fail "setup write should succeed"
+test_muse_nudge_poll_followup_reguarded() {
+  setup_nudge_case followupguards
+  muse_nudge_write "$STATE" t1 2 001.msg 1 15 || fail "setup write should succeed"
+  printf 'paused [at=1]: waiting on the captain\n' > "$STATE/t1.status"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a newly paused lane must keep waiting"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "a newly paused lane must send nothing"
+  printf 'working [at=2]: back at it\n' > "$STATE/t1.status"
+  FM_MUSE_NUDGE_IDLE_SECS=0 muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ -s "$NUDGE_DIR/send.log" ] && fail "a disabled ladder must not steer"
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a disabled ladder must keep its state"
+  pass "muse nudge: the follow-up steer rechecks the guards"
+}
+
+test_muse_nudge_strike_three_relaunches_once() {
+  local rc
+  setup_nudge_case strikethree
+  muse_nudge_write "$STATE" t1 2 001.msg 1 15 || fail "setup write should succeed"
   touch "$STATE/t1.inbox/001.msg"
-  muse_nudge_tick sess:fm-t1 t1 6 1440
+  muse_nudge_tick sess:fm-t1 t1 6 hZZZ
   rc=$?
   [ "$rc" = 0 ] || fail "strike 3 should fire on rung 6, got rc $rc"
-  assert_contains "$(cat "$dir/control.log")" "relaunch" "strike 3 should relaunch"
-  assert_contains "$(cat "$dir/control.log")" "Continue in small steps from the todo" "the relaunch note should carry the nudge"
-  assert_contains "$(cat "$dir/control.log")" "doing step three" "the relaunch note should carry status"
-  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d' ' -f1)" = 3 ] \
-    || fail "strike 3 should spend the ladder"
-  : > "$dir/control.log"
-  muse_nudge_tick sess:fm-t1 t1 7 1680
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1)" = 3 ] \
+    || fail "strike 3 should spend the ladder immediately, without waiting for the relaunch"
+  wait_for_action_rc "$STATE/t1.inbox" || fail "the relaunch should record its outcome"
+  assert_contains "$(cat "$NUDGE_DIR/control.log")" "relaunch" "strike 3 should relaunch in the background"
+  assert_contains "$(cat "$NUDGE_DIR/control.log")" "Continue in small steps from the todo" "the relaunch note should carry the nudge"
+  assert_contains "$(cat "$NUDGE_DIR/control.log")" "doing step three" "the relaunch note should carry status"
+  : > "$NUDGE_DIR/control.log"
+  muse_nudge_tick sess:fm-t1 t1 7 hZZZ
   [ "$?" = 1 ] || fail "a spent ladder should not strike again"
-  [ ! -s "$dir/control.log" ] || fail "a spent ladder should not relaunch again"
+  muse_nudge_poll sess:fm-t1 t1 1 hZZZ
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "a spent ladder should not relaunch again"
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1)" = 3 ] \
+    || fail "a spent ladder should stay spent on its own hash"
   pass "muse nudge: strike 3 relaunches once, then spends the ladder"
 }
 
-test_muse_nudge_interrupt_failure_wakes() {
-  local dir rc
-  setup_nudge_case interruptfail; dir=$NUDGE_DIR
-  muse_nudge_tick sess:fm-t1 t1 4 960 >/dev/null
-  FM_TEST_CONTROL_RC=1 muse_nudge_tick sess:fm-t1 t1 5 1200
-  rc=$?
-  [ "$rc" = 1 ] || fail "a failed interrupt should report failure, got rc $rc"
-  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d' ' -f1)" = 1 ] \
-    || fail "a failed interrupt must not advance the ladder"
-  pass "muse nudge: a failed interrupt keeps its strike"
-}
-
 test_muse_nudge_poll_resets() {
-  local dir
-  setup_nudge_case pollresets; dir=$NUDGE_DIR
-  muse_nudge_write "$STATE" t1 1 001.msg "" 16 || fail "setup write should succeed"
+  setup_nudge_case pollresets
+  muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
   touch "$STATE/t1.inbox/001.msg"
-  mv "$STATE/t1.inbox/001.msg" "$STATE/t1.inbox/handled/" 2>/dev/null \
-    || { mkdir -p "$STATE/t1.inbox/handled"; mv "$STATE/t1.inbox/001.msg" "$STATE/t1.inbox/handled/"; }
-  muse_nudge_poll sess:fm-t1 t1 1
+  mkdir -p "$STATE/t1.inbox/handled"
+  mv "$STATE/t1.inbox/001.msg" "$STATE/t1.inbox/handled/"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "an acknowledged steer should reset the ladder"
-  muse_nudge_write "$STATE" t1 2 002.msg 1 20 || fail "setup write should succeed"
+  muse_nudge_write "$STATE" t1 2 002.msg 1 15 || fail "setup write should succeed"
   touch "$STATE/t1.inbox/002.msg"
   printf 'done [at=9]: shipped it\n' > "$STATE/t1.status"
-  muse_nudge_poll sess:fm-t1 t1 1
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a terminal task should clear the ladder"
-  muse_nudge_write "$STATE" t1 3 || fail "setup write should succeed"
+  muse_nudge_write "$STATE" t1 3 "" "" 15 hOLD || fail "setup write should succeed"
   printf 'working [at=10]: back at it\n' > "$STATE/t1.status"
-  rm -f "$STATE/.stale-since-"*
-  muse_nudge_poll sess:fm-t1 t1 1
-  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a spent ladder should lapse when its episode ends"
-  pass "muse nudge: ack, terminal, and lapsed episodes clear the ladder"
+  muse_nudge_poll sess:fm-t1 t1 0 hAAA
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a busy lane should lapse a spent ladder"
+  muse_nudge_write "$STATE" t1 3 "" "" 15 hOLD || fail "setup write should succeed"
+  muse_nudge_poll sess:fm-t1 t1 1 hNEW
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a new pane hash should lapse a spent ladder"
+  muse_nudge_write "$STATE" t1 3 "" "" 15 hOLD || fail "setup write should succeed"
+  muse_nudge_poll sess:fm-t1 t1 1 hOLD
+  [ -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a spent ladder should stay spent on its own hash"
+  pass "muse nudge: ack, terminal, busy, and new episodes clear the ladder"
+}
+
+test_muse_nudge_tick_skips_inflight() {
+  setup_nudge_case inflightskip
+  muse_nudge_write "$STATE" t1 2 001.msg inflight 15 || fail "setup write should succeed"
+  muse_nudge_tick sess:fm-t1 t1 6 hAAA
+  [ "$?" = 1 ] || fail "a rung that lands on an in-flight action must wait for collection"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "a waiting tick must not spawn a second action"
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|inflight|15" ] \
+    || fail "the in-flight reservation should stand while it waits"
+  pass "muse nudge: a rung never overlaps an in-flight action"
+}
+
+test_muse_nudge_action_timeout_unknown() {
+  local sleeper
+  setup_nudge_case actiontimeout
+  muse_nudge_write "$STATE" t1 2 001.msg inflight 15 || fail "setup write should succeed"
+  sleep 30 &
+  sleeper=$!
+  printf '%s\t%s\n' "$sleeper" "$(ps -o lstart= -p "$sleeper" 2>/dev/null | sed 's/^[[:space:]]*//')" \
+    > "$STATE/t1.inbox/.muse-nudge-action-pid"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|inflight|15" ] \
+    || fail "a live action should keep waiting"
+  touch -d "@$(( $(date +%s) - 600 ))" "$STATE/t1.inbox/.muse-nudge-action-pid"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a timed-out action should advance without replay"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "a timed-out action must not re-fire the control plane"
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  pass "muse nudge: a live action waits, a timed-out one advances"
+}
+
+test_muse_nudge_strike_two_persistence_first() {
+  setup_nudge_case persistfirst
+  muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
+  chmod 555 "$STATE/t1.inbox"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  [ "$?" = 1 ] || fail "an unrecordable strike 2 must not fire"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "an unrecordable strike must not touch the control plane"
+  chmod 755 "$STATE/t1.inbox"
+  muse_nudge_write "$STATE" t1 2 001.msg "" 15 || fail "setup write should succeed"
+  chmod 555 "$STATE/t1.inbox"
+  muse_nudge_tick sess:fm-t1 t1 6 hAAA
+  [ "$?" = 1 ] || fail "an unrecordable strike 3 must not fire"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "an unrecordable strike 3 must not touch the control plane"
+  chmod 755 "$STATE/t1.inbox"
+  pass "muse nudge: a strike that cannot be recorded never acts"
 }
 
 test_muse_nudge_tick_strike_one
 test_muse_nudge_tick_below_threshold
 test_muse_nudge_tick_disabled
-test_muse_nudge_strike_two_interrupt_then_steer
+test_muse_nudge_tick_needs_quiet_window
+test_muse_nudge_tick_corrupt_state_fails_safe
+test_muse_nudge_strike_two_async_then_steer
+test_muse_nudge_strike_two_failure_reverts
+test_muse_nudge_strike_two_unknown_proceeds
 test_muse_nudge_poll_waits_out_busy_and_drafts
-test_muse_nudge_strike_three_relaunches
-test_muse_nudge_interrupt_failure_wakes
+test_muse_nudge_poll_followup_reguarded
+test_muse_nudge_strike_three_relaunches_once
 test_muse_nudge_poll_resets
+test_muse_nudge_strike_two_persistence_first
+test_muse_nudge_tick_skips_inflight
+test_muse_nudge_action_timeout_unknown
 test_muse_nudge_rungs_default
 test_muse_nudge_next_strike_matrix
 test_muse_nudge_file_roundtrip

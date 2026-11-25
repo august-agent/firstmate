@@ -220,11 +220,13 @@ The `tui.foreign_context_notice_shown` flag in `settings.json` suppresses only t
 
 ### Auto-nudge on idle lanes (2026-11-25)
 
-A muse lane that proves another wedge-escalation rung past FM_MUSE_NUDGE_IDLE_SECS (default 900) of uninterrupted idleness earns at most one strike per rung: strike 1 steers, strike 2 interrupts and steers once the lane reads idle with a clear composer (never in the same step), strike 3 relaunches with a generated progress note and spends the ladder.
+A muse lane that reaches another wedge-escalation rung with at least FM_MUSE_NUDGE_IDLE_SECS (default 900) of continuous proven idleness behind it earns at most one strike per rung: strike 1 steers, strike 2 interrupts and steers once the lane reads idle with a clear composer (never in the same step as the interrupt), strike 3 relaunches with a generated progress note and spends the ladder.
+Eligibility is continuous proven idleness, not the rung count alone: a strike requires no worktree writes in the last threshold window, since a write restarts the rung timer while the count survives.
+Strikes 2 and 3 reserve first, then run the control plane in the background and return at once, so a blocked control executable never delays the wake or another lane's poll; the poll path collects each outcome, reconciling a lost one as unknown without replaying it.
 The ladder is additive: counting, waking, and timer resets proceed exactly as without it, and the strike state is a durable per-task file in the task inbox directory that survives watcher restarts.
-A strike never fires for a paused, terminal, actively-working, captain-held, or secondmate lane, or while a captain call is open.
-An acknowledged steer, a terminal task, or a spent ladder whose episode ended resets the ladder.
-Fourteen behavior checks pin the rung math, the pure strike selection, the guard matrix, the steer text and relaunch note, and every strike and poll transition.
+A strike never fires for a paused, terminal, actively-working, captain-held, or secondmate lane, or while a captain call is open, and the follow-up steer rechecks the guards.
+An acknowledged steer or a terminal task resets the ladder; a spent ladder lapses on busy work, an acknowledged steer, or a pane hash that no longer matches the spent one.
+Twenty-one behavior checks pin the rung math, the pure strike selection, the guard matrix, the continuous-idleness veto, the async reservation and collection without replay, the corrupt-state fail-safe, the steer text and relaunch note, and every strike and poll transition.
 
 ```
 $ bash bin/fm-test-run.sh tests/fm-muse-nudge.test.sh

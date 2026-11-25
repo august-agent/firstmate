@@ -20,7 +20,11 @@ _FM_MUSE_NUDGE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # without this library. Strike 1 steers, strike 2 interrupts (the steer
 # follows on a later poll once the lane reads idle with a clear composer -
 # never in the same step as the interrupt), strike 3 relaunches with a
-# generated progress note and spends the ladder for the episode.
+# generated progress note and spends the ladder for the episode. Strikes 2 and
+# 3 reserve first, then run the slow control plane in the background and
+# return at once, so a blocked control executable never delays the wake or
+# another lane's poll; the poll path collects each outcome, reconciling a lost
+# one as unknown without replaying it.
 #
 # State is one durable per-task file in the task's inbox directory, so the
 # ladder survives watcher restarts: STRIKE is the highest strike fired,
@@ -65,37 +69,92 @@ muse_nudge_file() {  # <state-dir> <task-id>
   printf '%s/.muse-nudge' "$(fm_task_inbox_dir "$1" "$2")"
 }
 
-# Read a strike file into "strike rec pending mins" (rec, pending, and mins
-# may be empty). Fails when the file is absent or holds no strike. Mins is
-# the proven idle age in minutes when the latest strike fired, reused for a
-# later follow-up steer whose own poll cannot measure it.
+# Read a strike file into "strike rec pending mins hash" (all but strike may
+# be empty). Fails when the file is absent or holds no strike. Mins is the
+# proven idle age in minutes when the latest strike fired, reused for a later
+# follow-up steer whose own poll cannot measure it; hash is the pane hash a
+# spent ladder was left on, so a new episode lapses it.
 muse_nudge_read() {  # <strike-file>
-  local strike rec pending mins
+  local strike rec pending mins hash
   [ -f "$1" ] || return 1
   strike=$(grep '^STRIKE=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true)
   rec=$(grep '^REC=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true)
   pending=$(grep '^PENDING=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true)
   mins=$(grep '^MINS=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  hash=$(grep '^HASH=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true)
   case "$strike" in 0|1|2|3) : ;; *) return 1 ;; esac
   case "$mins" in ''|*[!0-9]*) mins=0 ;; esac
-  printf '%s %s %s %s' "$strike" "$rec" "$pending" "$mins"
+  # Pipe-separated: pipe is not IFS whitespace, so empty middle fields
+  # survive the caller's read split (space and tab runs would collapse).
+  # Trailing empty fields are stripped; the caller's read still sees them
+  # as empty.
+  printf '%s|%s|%s|%s|%s' "$strike" "$rec" "$pending" "$mins" "$hash" | sed 's/|*$//'
 }
 
 # Atomically record strike state. Arguments: <state-dir> <task-id> <strike>
-# [rec] [pending] [mins]. A strike with no outstanding record passes empty
-# rec/pending; mins is the proven idle age in minutes at fire time.
-muse_nudge_write() {  # <state-dir> <task-id> <strike> [rec] [pending] [mins]
+# [rec] [pending] [mins] [hash]. A strike with no outstanding record passes
+# empty rec/pending; mins is the proven idle age in minutes at fire time and
+# hash pins a spent ladder to its episode.
+muse_nudge_write() {  # <state-dir> <task-id> <strike> [rec] [pending] [mins] [hash]
   local dir tmp
   dir=$(fm_task_inbox_dir "$1" "$2")
   mkdir -p "$dir" || return 1
-  tmp=$(mktemp "$dir/.muse-nudge.XXXXXX") || return 1
+  tmp=$(mktemp "$dir/.muse-nudge.XXXXXX" 2>/dev/null) || return 1
   {
     printf 'STRIKE=%s\n' "$3"
     [ -z "${4:-}" ] || printf 'REC=%s\n' "$4"
     [ -z "${5:-}" ] || printf 'PENDING=%s\n' "$5"
     [ -z "${6:-}" ] || printf 'MINS=%s\n' "$6"
+    [ -z "${7:-}" ] || printf 'HASH=%s\n' "$7"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$dir/.muse-nudge" || { rm -f "$tmp"; return 1; }
+}
+
+# How long an in-flight control action may run before its outcome is
+# reconciled as unknown without replaying it.
+muse_nudge_action_timeout() {
+  local timeout=${FM_MUSE_NUDGE_ACTION_TIMEOUT:-300}
+  case "$timeout" in ''|*[!0-9]*|0) timeout=300 ;; esac
+  printf '%s' "$timeout"
+}
+
+# Spawn a control-plane verb in the background, recording its pid for the
+# hygiene-style liveness check. The reservation (PENDING=inflight) is written
+# by the caller BEFORE this runs, so a crash between spawn and result never
+# looks like a strike that never happened. Result files land in the task
+# inbox dir: .muse-nudge-action-rc (exit code), .muse-nudge-action-out
+# (output), .muse-nudge-action-pid ("pid\tlstart"). Never blocks.
+muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
+  local state=$1 task=$2 dir pid started
+  dir=$(fm_task_inbox_dir "$state" "$task")
+  muse_nudge_action_clear "$dir" || true
+  shift 2
+  (
+    "$@" >"$dir/.muse-nudge-action-out" 2>&1
+    echo "$?" >"$dir/.muse-nudge-action-rc"
+  ) >/dev/null 2>&1 &
+  pid=$!
+  started=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+  printf '%s\t%s\n' "$pid" "$started" >"$dir/.muse-nudge-action-pid" 2>/dev/null || return 1
+}
+
+# 0 when the recorded action pid is still the process that was spawned (the
+# hygiene lstart comparison, which defeats pid reuse), 1 otherwise.
+muse_nudge_action_alive() {  # <inbox-dir>
+  local pid started live_start
+  [ -f "$1/.muse-nudge-action-pid" ] || return 1
+  pid=$(cut -f1 "$1/.muse-nudge-action-pid" 2>/dev/null || true)
+  started=$(cut -f2- "$1/.muse-nudge-action-pid" 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$started" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  live_start=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+  [ -n "$live_start" ] && [ "$live_start" = "$started" ]
+}
+
+# Drop every action outcome file for a task.
+muse_nudge_action_clear() {  # <inbox-dir>
+  rm -f "$1/.muse-nudge-action-rc" "$1/.muse-nudge-action-out" "$1/.muse-nudge-action-pid" 2>/dev/null
 }
 
 # Drop strike state. Absent state is already clean.
@@ -181,10 +240,41 @@ muse_nudge_do_steer() {  # <window> <task> <text>
   printf '%s' "${rec##*/}"
 }
 
-# Fire one strike. Returns 0 when the strike landed, 1 when it did not -
-# the caller always continues down the normal escalation path either way.
-muse_nudge_strike() {  # <window> <task> <strike> <idle-minutes> [rec]
-  local win=$1 task=$2 strike=$3 mins=$4 rec=${5:-} text newrec note_bin
+# 0 when the task worktree shows no writes in the last <idle-secs> seconds.
+# The wedge rung proves idleness only since the rung timer restarted, while
+# its count survives write deferrals, so a strike additionally requires a
+# continuous quiet window. Fails closed: an anchor that cannot be set or a
+# worktree that cannot be read skips the strike.
+muse_nudge_continuously_idle() {  # <task> <idle-secs>
+  local task=$1 idle=$2 anchor now
+  now=$(date +%s)
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  # The anchor lives in STATE rather than the inbox dir so an unreadable or
+  # unwritable inbox fails the strike at its own reservation write, where the
+  # poll path can tell the two failures apart.
+  anchor=$(mktemp "$STATE/.muse-nudge-anchor.XXXXXX" 2>/dev/null) || return 1
+  if ! touch -d "@$(( now - idle ))" "$anchor" 2>/dev/null; then
+    rm -f "$anchor"
+    return 1
+  fi
+  if crew_worktree_written_since "$task" "$STATE" "$anchor"; then
+    rm -f "$anchor"
+    return 1
+  fi
+  rm -f "$anchor"
+  return 0
+}
+
+# Fire one strike. Strike 1 steers synchronously, like the watcher's existing
+# doorbell rings. Strikes 2 and 3 reserve first, then run the slow control
+# plane in the background and return at once, so a blocked control
+# executable never delays the wake or another lane's poll; the poll path
+# collects the outcome. Returns 0 when the strike was issued, 1 when it was
+# not - the caller always continues down the normal escalation path either
+# way.
+muse_nudge_strike() {  # <window> <task> <strike> <idle-minutes> [rec] [pane-hash]
+  local win=$1 task=$2 strike=$3 mins=$4 rec=${5:-} hash=${6:-} text newrec note_bin dir
+  dir=$(fm_task_inbox_dir "$STATE" "$task")
   case "$strike" in
     1)
       text=$(muse_nudge_steer_text "$mins")
@@ -194,25 +284,19 @@ muse_nudge_strike() {  # <window> <task> <strike> <idle-minutes> [rec]
       ;;
     2)
       note_bin=$(muse_nudge_control_bin) || return 1
-      "$note_bin" "$task" interrupt >/dev/null 2>&1 || return 1
-      muse_nudge_write "$STATE" "$task" 2 "$rec" 1 "$mins" || return 1
-      triage_log "muse auto-nudge strike 2/3: interrupted $task, steer follows on idle plus a clear composer (idle ${mins}m)"
+      muse_nudge_write "$STATE" "$task" 2 "$rec" inflight "$mins" || return 1
+      muse_nudge_spawn "$STATE" "$task" "$note_bin" "$task" interrupt || return 1
+      triage_log "muse auto-nudge strike 2/3: interrupting $task in the background, steer follows on idle plus a clear composer (idle ${mins}m)"
       ;;
     3)
       text=$(muse_nudge_note "$STATE" "$task" "$mins" 3)
       newrec=$(mktemp "$STATE/.muse-nudge-note.XXXXXX") || return 1
       printf '%s\n' "$text" > "$newrec" || { rm -f "$newrec"; return 1; }
       note_bin=$(muse_nudge_control_bin) || { rm -f "$newrec"; return 1; }
-      if "$note_bin" "$task" relaunch --note-file "$newrec" >/dev/null 2>&1; then
-        rm -f "$newrec"
-        muse_nudge_write "$STATE" "$task" 3 || return 1
-        triage_log "muse auto-nudge strike 3/3: relaunched $task with a progress note (idle ${mins}m)"
-      else
-        rm -f "$newrec"
-        muse_nudge_write "$STATE" "$task" 3 || return 1
-        triage_log "muse auto-nudge strike 3/3: relaunch of $task failed; ladder spent, escalation continues unwedged"
-        return 1
-      fi
+      muse_nudge_write "$STATE" "$task" 3 "$rec" "" "$mins" "$hash" || { rm -f "$newrec"; return 1; }
+      muse_nudge_spawn "$STATE" "$task" "$note_bin" "$task" relaunch --note-file "$newrec" || return 1
+      rm -f "$newrec"
+      triage_log "muse auto-nudge strike 3/3: relaunching $task in the background with a progress note (idle ${mins}m)"
       ;;
     *) return 1 ;;
   esac
@@ -220,62 +304,132 @@ muse_nudge_strike() {  # <window> <task> <strike> <idle-minutes> [rec]
 }
 
 # The wedge-escalation hook. Fires at most one strike when this escalation
-# rung selects one for a guarded muse lane, then reports 0 for a fired
-# strike and 1 otherwise. The caller ALWAYS continues down the normal
-# escalation path either way: the ladder is additive, so counting, waking,
-# and timer resets stay exactly where they are.
-muse_nudge_tick() {  # <window> <task> <escalation-count> <idle-age-secs>
-  local win=$1 task=$2 n=$3 age=$4 idle s1 s2 s3 file strike rec pending mins next
+# rung selects one for a guarded, continuously-idle muse lane, then reports 0
+# for a fired strike and 1 otherwise. The caller ALWAYS continues down the
+# normal escalation path either way: the ladder is additive, so counting,
+# waking, and timer resets stay exactly where they are.
+muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
+  local win=$1 task=$2 n=$3 hash=$4 idle s1 s2 s3 file strike rec pending mins old next
   idle=$(muse_nudge_idle_secs)
   [ "$idle" -gt 0 ] || return 1
   muse_nudge_guarded "$win" "$task" || return 1
   read -r s1 s2 s3 <<< "$(muse_nudge_rungs)"
   file=$(muse_nudge_file "$STATE" "$task")
-  if next=$(muse_nudge_read "$file" 2>/dev/null); then
-    read -r strike rec pending mins <<< "$next"
+  if [ -e "$file" ]; then
+    # A present but unreadable strike file fails safe: it is neither struck
+    # on nor cleared, so a corrupt state can neither re-fire nor silently
+    # reset the ladder.
+    next=$(muse_nudge_read "$file" 2>/dev/null) || return 1
+    IFS='|' read -r strike rec pending mins old <<< "$next"
   else
-    strike=0; rec=''; pending=''; mins=0
+    strike=0; rec=''; pending=''; mins=0; old=''
   fi
   next=$(muse_nudge_next_strike "$n" "$s1" "$s2" "$s3" "$strike")
   [ "$next" != 0 ] || return 1
-  mins=$(( age / 60 ))
+  # Never overlap control actions: an in-flight interrupt is collected by
+  # the poll path first, which advances the ladder once its outcome lands.
+  [ "$pending" != inflight ] || return 1
+  # Eligibility is continuous proven idleness, not the rung count alone: a
+  # worktree write restarts the rung timer while the count survives, so only
+  # a quiet window covering the whole threshold authorizes a strike.
+  muse_nudge_continuously_idle "$task" "$idle" || return 1
+  mins=$(( idle / 60 ))
   case "$next" in
     1) muse_nudge_strike "$win" "$task" 1 "$mins" ;;
     2) muse_nudge_strike "$win" "$task" 2 "$mins" "$rec" ;;
-    3) muse_nudge_strike "$win" "$task" 3 "$mins" ;;
+    3) muse_nudge_strike "$win" "$task" 3 "$mins" "$rec" "$hash" ;;
   esac
+}
+
+# Collect one in-flight control action. Reports the outcome on stdout -
+# "done:0", "done:<rc>", or "unknown" - and clears the action files, leaving
+# the strike file for the caller to advance. A dead action with no result, or
+# one older than the action timeout, reconciles as unknown without replaying
+# the verb; a live one keeps waiting. Always reports 0.
+muse_nudge_collect() {  # <inbox-dir>
+  local dir=$1 rc timeout age now mtime
+  dir=${dir%/}
+  if [ -f "$dir/.muse-nudge-action-rc" ]; then
+    rc=$(cat "$dir/.muse-nudge-action-rc" 2>/dev/null || true)
+    case "$rc" in ''|*[!0-9]*) rc=unknown ;; esac
+    muse_nudge_action_clear "$dir"
+    printf 'done:%s' "$rc"
+    return 0
+  fi
+  # No result file: a live action keeps waiting, anything else reconciles as
+  # unknown without replaying the verb - including the crash window between
+  # the reservation write and the spawn, where no pid file exists at all.
+  if [ -f "$dir/.muse-nudge-action-pid" ] && muse_nudge_action_alive "$dir"; then
+    timeout=$(muse_nudge_action_timeout)
+    now=$(date +%s)
+    mtime=$(fm_path_mtime "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
+    case "$mtime$now" in ''|*[!0-9]*) ;; *) [ $(( now - mtime )) -le "$timeout" ] && return 0 ;; esac
+  fi
+  muse_nudge_action_clear "$dir"
+  printf 'unknown'
+  return 0
 }
 
 # Once-per-poll upkeep for muse lanes with strike state. Clears the file when
 # its steer was acknowledged or the task turned terminal, lapses a spent
-# ladder whose episode ended, and sends the strike-2 follow-up steer once the
-# lane reads idle with a clear composer. Always reports 0; a lane that cannot
-# be read keeps its state for the next poll.
-muse_nudge_poll() {  # <window> <task> <idle-now>
-  local win=$1 task=$2 idle_now=$3 file next strike rec pending mins handled key ssf cstate
+# ladder the pane hash no longer matches, collects in-flight control actions,
+# and sends the strike-2 follow-up steer once the lane reads idle with a
+# clear composer under freshly rechecked guards. Always reports 0; a lane
+# that cannot be read keeps its state for the next poll.
+muse_nudge_poll() {  # <window> <task> <idle-now> <pane-hash>
+  local win=$1 task=$2 idle_now=$3 hash=$4 file next strike rec pending mins old dir handled outcome
   [ -n "$task" ] || return 0
   file=$(muse_nudge_file "$STATE" "$task")
   [ -e "$file" ] || return 0
   [ "$(window_harness "$win")" = muse ] || return 0
   if stale_is_terminal "$win" "$STATE"; then muse_nudge_clear "$STATE" "$task"; return 0; fi
   if next=$(muse_nudge_read "$file" 2>/dev/null); then
-    read -r strike rec pending mins <<< "$next"
+    IFS='|' read -r strike rec pending mins old <<< "$next"
   else
-    muse_nudge_clear "$STATE" "$task"; return 0
+    return 0
   fi
   if [ -n "$rec" ]; then
     handled=$(fm_task_inbox_handled_dir "$STATE" "$task")
     if [ -e "$handled/$rec" ]; then muse_nudge_clear "$STATE" "$task"; return 0; fi
   fi
   if [ "$strike" = 3 ]; then
-    key=$(window_key "$win")
-    ssf="$STATE/.stale-since-$key"
-    [ -e "$ssf" ] || muse_nudge_clear "$STATE" "$task"
+    # A spent ladder lapses on fresh activity, not on the rung timer the
+    # escalation path resets after every rung: busy work, an acknowledged
+    # steer (above), or a pane hash that no longer matches the spent one.
+    # An empty recorded hash pins nothing, so it never lapses the ladder.
+    if [ "$idle_now" -eq 0 ]; then muse_nudge_clear "$STATE" "$task"; return 0; fi
+    if [ -n "$old" ] && [ -n "$hash" ] && [ "$hash" != "$old" ]; then
+      muse_nudge_clear "$STATE" "$task"; return 0
+    fi
+    return 0
+  fi
+  if [ "$pending" = inflight ]; then
+    dir=$(fm_task_inbox_dir "$STATE" "$task")
+    outcome=$(muse_nudge_collect "$dir")
+    case "$outcome" in
+      done:0)
+        muse_nudge_write "$STATE" "$task" 2 "$rec" 1 "$mins" || return 0
+        triage_log "muse auto-nudge strike 2/3: interrupt confirmed for $task"
+        ;;
+      done:*)
+        muse_nudge_write "$STATE" "$task" 1 "$rec" "" "$mins" || return 0
+        triage_log "muse auto-nudge strike 2/3: interrupt failed for $task ($outcome); ladder holds at strike 1"
+        ;;
+      unknown)
+        muse_nudge_write "$STATE" "$task" 2 "$rec" 1 "$mins" || return 0
+        triage_log "muse auto-nudge strike 2/3: interrupt outcome unknown for $task; proceeding without replay"
+        ;;
+    esac
     return 0
   fi
   [ "$pending" = 1 ] || return 0
   [ "$strike" = 2 ] || return 0
   [ "$idle_now" -ne 0 ] || return 0
+  # The follow-up steer rechecks the full guard set: the lane may have become
+  # legitimately busy-waiting while the interrupt was in flight, and a
+  # disabled ladder never steers.
+  [ "$(muse_nudge_idle_secs)" -gt 0 ] || return 0
+  muse_nudge_guarded "$win" "$task" || return 0
   cstate=$(FM_COMPOSER_HARNESS=muse fm_backend_composer_state \
     "$(window_backend "$win")" "$win" "$(window_label "$win")" 2>/dev/null) || return 0
   [ "$cstate" = empty ] || return 0

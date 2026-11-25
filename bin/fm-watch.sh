@@ -2267,7 +2267,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         # counts, wakes, and resets exactly as it would without it. Lanes
         # with a live model-stream snapshot keep the unmodified path.
         if [ -z "$stream_snapshot" ]; then
-          muse_nudge_tick "$win" "$task" "$n" "$age" || true
+          muse_nudge_tick "$win" "$task" "$n" "$hash" || true
         fi
         # A stream observation writes its count only after the guarded append,
         # so a close, progress, or replacement during the publication lock wait
@@ -4624,10 +4624,10 @@ EOF
     # content cannot suppress stale detection. Read once per window per poll and
     # reused below so a busy verdict is consistent within one cycle.
     if window_is_busy "$w" "$tail40"; then busy_now=0; else busy_now=1; fi
-    # Muse auto-nudge upkeep: ack resets, spent-ladder lapse, and the
-    # strike-2 follow-up steer. Rare-state only: returns at once when the
-    # task holds no strike file.
-    muse_nudge_poll "$w" "$task" "$busy_now"
+    # Muse auto-nudge upkeep: ack resets, spent-ladder lapse, in-flight
+    # control collection, and the strike-2 follow-up steer. Rare-state only:
+    # returns at once when the task holds no strike file.
+    muse_nudge_poll "$w" "$task" "$busy_now" "$h"
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"
