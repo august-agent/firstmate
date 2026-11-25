@@ -141,24 +141,30 @@ case "${1:-}" in
               continue
             fi
           fi
-          if [ -s "$composer_file" ] && [ -n "${FM_FAKE_SUBMITTED:-}" ]; then
-            cat "$composer_file" >> "$FM_FAKE_SUBMITTED"
-            printf '\n' >> "$FM_FAKE_SUBMITTED"
-          fi
-          : > "$composer_file"
-          # A restoration racing the submit itself: the line was already
-          # accepted, and the restored text lands after it.
+          # A restoration racing the submit itself: it lands before Enter
+          # consumes the composer, so the submitted line carries it.
           if [ -n "${FM_FAKE_RESTORE_ON_ENTER:-}" ] && [ -n "${FM_FAKE_ESCAPE_RESTORES:-}" ]; then
             if ! grep -qF -- "$FM_FAKE_ESCAPE_RESTORES" "$composer_file" 2>/dev/null; then
               printf '%s' "$FM_FAKE_ESCAPE_RESTORES" >> "$composer_file"
             fi
           fi
+          if [ -s "$composer_file" ] && [ -n "${FM_FAKE_SUBMITTED:-}" ]; then
+            cat "$composer_file" >> "$FM_FAKE_SUBMITTED"
+            printf '\n' >> "$FM_FAKE_SUBMITTED"
+          fi
+          : > "$composer_file"
           ;;
       esac
     done
     exit 0 ;;
   display-message)
-    for a in "$@"; do case "$a" in *cursor_y*) printf '1\n'; exit 0 ;; esac; done
+    for a in "$@"; do
+      case "$a" in
+        *cursor_y*) printf '1\n'; exit 0 ;;
+        *pane_current_command*)
+          [ -z "${FM_FAKE_TMUX_AGENT:-}" ] || { printf '%s\n' "$FM_FAKE_TMUX_AGENT"; exit 0; } ;;
+      esac
+    done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane)
     restore_count=${FM_FAKE_RESTORE_COUNT:-$composer_file.restore}
@@ -1014,16 +1020,62 @@ test_muse_ring_enter_race_submits_once() {
     inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
     >"$dir/ring.log" 2>&1
   rc=$?
+  expect_code 0 "$rc" "the raced submit should still report delivery"
   log=$(cat "$dir/send.log")
   [ "$(grep -c "KEYS:send-keys -t sess:fm-t1 Enter" "$dir/send.log")" = 1 ] \
     || fail "a restoration racing Enter must not trigger a retry:$'\n'$log"
   submitted=$(cat "$dir/submitted.log")
   [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 1 ] \
     || fail "the raced submit must deliver exactly one doorbell:$'\n'$submitted"
-  assert_contains "$(cat "$dir/composer.txt")" "cancelled: do the thing" "the raced restoration must survive"
-  [ -f "$dir/state/t1.inbox/.muse-pending" ] \
-    || fail "the raced ring must keep watching for the acknowledgement"
+  assert_contains "$submitted" "cancelled: do the thing" "the raced submit carries the restoration with the line"
+  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "a submitted line must clear its pending mark"
   pass "muse ring: a restoration racing Enter submits once without retrying"
+}
+
+test_muse_ring_dead_endpoint_beats_held_lock() {
+  local dir rec rc log lock holder
+  dir=$(setup_case deadlocked muse)
+  : > "$dir/send.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  lock="$dir/state/t1.inbox/.muse-ring.lock"
+  FM_STATE_OVERRIDE="$dir/state" PATH="$dir/fakebin:$PATH" \
+    bash -c '. "$1"; fm_lock_try_acquire "$2" && /bin/sleep 30' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$lock" &
+  holder=$!
+  /bin/sleep 1
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_TMUX_AGENT=zsh \
+    FM_TASK_INBOX_LOCK_WAIT_SECS=0 \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null || true
+  expect_code 3 "$rc" "a dead endpoint should report unavailable even with the lock held"
+  log=$(cat "$dir/send.log")
+  [ -z "$log" ] || fail "a dead endpoint must never be typed:$'\n'$log"
+  pass "muse ring: a dead endpoint reports unavailable despite a held lock"
+}
+
+test_muse_ring_refuses_unwritable_mark() {
+  local dir rec rc log
+  dir=$(setup_case unwritable muse)
+  : > "$dir/send.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  mkdir -p "$dir/state/t1.inbox/.muse-pending"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  rmdir "$dir/state/t1.inbox/.muse-pending" 2>/dev/null || true
+  expect_code 2 "$rc" "a ring that cannot record its literal should report failure"
+  log=$(cat "$dir/send.log")
+  case "$log" in
+    *"Firstmate instruction waiting"*) fail "no literal may go out unprotected:$'\n'$log" ;;
+  esac
+  pass "muse ring: an unwritable pending mark refuses the send"
 }
 
 test_muse_ring_defers_on_held_lock() {
@@ -1243,6 +1295,8 @@ test_muse_ring_defers_on_unreadable_composer_with_mark
 test_muse_ring_enter_race_submits_once
 test_muse_ring_bounded_after_post_commit_stale
 test_muse_ring_defers_on_held_lock
+test_muse_ring_dead_endpoint_beats_held_lock
+test_muse_ring_refuses_unwritable_mark
 test_muse_stale_note_names_old_marks
 test_watcher_muse_escalation_names_stale_mark
 test_watcher_muse_jolt_bookkeeping_failure_wakes

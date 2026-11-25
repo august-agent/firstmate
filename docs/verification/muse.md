@@ -312,7 +312,7 @@ A failed Enter keeps the mark and reports the failure, so the next ring resubmit
 A per-record lock serializes concurrent rings and jolts across the whole delivery; a stale lock fails safe into deferral.
 A record still unhandled after a recorded delivery attempt is re-rung behind one press of the verified interrupt key, with no clear.
 The jolt settles and requires the line to read back twice before the ring, so a restoration landing after the guard capture only defers; an unconfirmed jolt defers while spending one ladder attempt through the shared bookkeeping-failure path, which also reports an unwritable ladder as a stale wake.
-The jolt runs only where the composer provably holds the ring's own line, re-verified under its lock before pressing; even a raced guard cannot destroy a draft, and a restoration racing the submit itself is contained by the no-retry-on-change rule, which reports a deferral instead of a send failure.
+The jolt runs only where the composer provably holds the ring's own line, re-verified under its lock before pressing; even a raced guard cannot destroy a draft. A restoration landing between the final verify and Enter is still submitted once: nothing can interlock a terminal keypress, so the guarantee there is single submission with no retry and no clear, and the post-Enter check refuses to retry into the changed composer.
 A mark for another record bars typing until that record's line submits or the mark proves stale.
 A stuck mark annotates the escalation with how long the literal went unverified.
 The foreign-draft and ambiguous-composer guards keep their meaning on both paths: a proven foreign draft still skips without typing or jolting, and an ambiguous composer keeps the shared type-through path with no jolt.

@@ -677,7 +677,13 @@ fm_task_inbox_ring_muse() {  # <backend> <target> <record-path> [expected-label]
     fm_task_inbox_muse_reconcile "$dir" "$backend" "$target" "$line" "$label"
     return
   fi
-  fm_task_inbox_muse_mark_pending "$dir" "$rec"
+  # Persistence before input: when the mark cannot be written, sending
+  # proceeds without the state that prevents retyping, so refuse instead.
+  # A stuck writer escalates through the ordinary ladder rather than
+  # duplicating silently on every re-ring.
+  if ! fm_task_inbox_muse_mark_pending "$dir" "$rec"; then
+    return 2
+  fi
   fm_backend_send_literal "$backend" "$target" "$line" "$label" >/dev/null 2>&1
   case "$?" in
     0) : ;;
@@ -813,14 +819,22 @@ fm_task_inbox_ring() {  # <backend> <target> <record-path> [expected-label]
     return
   fi
   dir=${3%/*}
-  if [ -d "$dir" ] && fm_task_inbox_muse_take_ring_lock "$dir"; then
+  if [ ! -d "$dir" ]; then
     fm_task_inbox_ring_muse "$@"
-    rc=$?
-    fm_lock_release "$dir/.muse-ring.lock"
-    return "$rc"
+    return
   fi
-  [ -d "$dir" ] || { fm_task_inbox_ring_muse "$@"; return; }
-  return 1
+  # Liveness before locking: a positively dead or missing endpoint reports
+  # unavailable even when another ring holds the lock, so the caller never
+  # mistakes contention for delivery and never spends a retry meant for a
+  # skipped or failed send.
+  case "$(fm_backend_agent_state "$1" "$2" 2>/dev/null || true)" in
+    dead|missing) return 3 ;;
+  esac
+  fm_task_inbox_muse_take_ring_lock "$dir" || return 1
+  fm_task_inbox_ring_muse "$@"
+  rc=$?
+  fm_lock_release "$dir/.muse-ring.lock"
+  return "$rc"
 }
 
 # Whether the composer's content, ignoring line wrapping, is exactly <line>.
