@@ -1000,6 +1000,11 @@ SH
   cpidfile="$STATE/t1.inbox/.muse-nudge-action-cpid"
   tries=0
   while [ ! -f "$NUDGE_DIR/orphan-child.pid" ] && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$(( tries + 1 )); done
+  [ -f "$NUDGE_DIR/orphan-child.pid" ] || fail "the control must start its child"
+  # The wrapper records the control pid asynchronously after spawning it;
+  # wait for that record itself, not just for the control's own startup.
+  tries=0
+  while [ ! -f "$cpidfile" ] && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$(( tries + 1 )); done
   [ -f "$cpidfile" ] || fail "dispatch must record the control pid"
   cpid=$(sed -n '1p' "$cpidfile")
   child=$(cat "$NUDGE_DIR/orphan-child.pid")
