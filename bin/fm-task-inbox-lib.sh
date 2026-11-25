@@ -583,9 +583,30 @@ fm_task_inbox_ring_muse() {  # <backend> <target> <record-path> [expected-label]
   elif seq=$(fm_task_inbox_muse_pending_seq "$dir"); then
     if [ -f "$dir/$seq.msg" ]; then
       fm_task_inbox_muse_reconcile_other "$dir" "$backend" "$target" "$seq" "$label"
-      return
+      rc=$?
+      case "$rc" in
+        0) return 0 ;;
+        2) return 2 ;;
+      esac
+      # Deferred on an unreadable or foreign composer: an older send that
+      # failed before landing still owes one retry, so reconcile it the way
+      # the current record would be - by switching the subject to the older
+      # record and falling through to the ordinary dispatch below. An
+      # accepted-but-unverified older send keeps deferring instead.
+      cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
+      if [ "$cstate" = empty ] && fm_task_inbox_muse_mark_failed "$dir" "$dir/$seq.msg"; then
+        fm_task_inbox_muse_clear_pending "$dir"
+        RETRY=1
+        rec="$dir/$seq.msg"
+        if ! line=$(fm_task_inbox_doorbell_line "$rec"); then
+          return 2
+        fi
+      else
+        return 1
+      fi
+    else
+      fm_task_inbox_muse_clear_pending "$dir"
     fi
-    fm_task_inbox_muse_clear_pending "$dir"
   fi
   cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
   case "$cstate" in

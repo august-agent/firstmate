@@ -11,8 +11,9 @@
 #      delivery: a pending mark carries the send outcome, so a later ring
 #      reconciles before typing - an accepted but unverified send defers,
 #      while a failed send retypes only onto a proven empty composer and
-#      only once. A mark for another record bars typing entirely. A
-#      per-record lock serializes concurrent rings across the whole
+#      only once. A mark for another record bars typing, except a failed
+#      mark on an empty composer, whose retry is performed for that record
+#      first. A per-record lock serializes concurrent rings across the whole
 #      delivery, proved by stalling one ring mid-send. The ring never
 #      clears: even a proven empty composer
 #      is typed onto, and a stale empty capture keeps a hidden draft. A
@@ -796,6 +797,48 @@ test_muse_ring_bounded_after_post_commit_stale() {
   pass "muse ring: a post-commit failure with stale captures duplicates at most once"
 }
 
+test_muse_ring_retries_failed_older_record_first() {
+  local dir rec_a rec_b rc log literals submitted
+  dir=$(setup_case barrierretry muse)
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec_a=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "first steer" fire-and-forget)
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_FAKE_LITERAL_FAIL=2 \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec_a" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 2 "$rc" "a pre-commit failure should report the failure without typing"
+  [ "$(cat "$dir/state/t1.inbox/.muse-pending" 2>/dev/null)" = "$(basename "$rec_a")"$'\t'"failed" ] \
+    || fail "a failed send must leave a failed mark"
+  rec_b=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "second steer")
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec_b" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 0 "$rc" "the barrier should retry the failed older send first"
+  submitted=$(cat "$dir/submitted.log")
+  [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 1 ] \
+    || fail "the retry should submit the older line exactly once:$'\n'$submitted"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec_b" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  expect_code 0 "$rc" "the newer record should ring once its predecessor clears"
+  submitted=$(cat "$dir/submitted.log")
+  [ "$(grep -c "Firstmate instruction waiting" "$dir/submitted.log")" = 2 ] \
+    || fail "both records should submit in order:$'\n'$submitted"
+  [ ! -e "$dir/state/t1.inbox/.muse-pending" ] \
+    || fail "a submitted line must clear its pending mark"
+  pass "muse ring: a failed older send is retried before a newer record types"
+}
+
 test_muse_ring_barrier_for_other_record() {
   local dir rec rec_b rc log literals submitted
   dir=$(setup_case barrier muse)
@@ -1170,6 +1213,7 @@ test_other_harness_ring_sends_no_clear
 test_watcher_muse_rering_redelivers
 test_watcher_muse_first_ring_rings_plainly
 test_muse_ring_serializes_concurrent_rings
+test_muse_ring_retries_failed_older_record_first
 test_muse_ring_stale_capture_submit_does_not_retry
 test_muse_ring_defers_on_unreadable_composer_with_mark
 test_muse_ring_bounds_repeated_post_commit_failures
