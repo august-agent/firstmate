@@ -42,6 +42,7 @@ TRIAGE_LOG=/dev/null
 CASE_META=/dev/null
 NUDGE_PAUSE_CLASS=none
 NUDGE_CAPTAIN_CALL=closed
+NUDGE_WAIT_EVIDENCE=absent
 NUDGE_DIR=""
 
 # shellcheck source=bin/fm-classify-lib.sh
@@ -62,6 +63,7 @@ window_backend() { grep '^backend=' "$CASE_META" 2>/dev/null | cut -d= -f2- || t
 window_label() { grep '^label=' "$CASE_META" 2>/dev/null | cut -d= -f2- || true; }
 pause_state_class() { printf '%s' "$NUDGE_PAUSE_CLASS"; }
 task_captain_call_open() { [ "$NUDGE_CAPTAIN_CALL" = open ] && return 0 || return 1; }
+wedge_wait_evidence() { [ "$NUDGE_WAIT_EVIDENCE" = present ] && printf 'parked ask-user gate'; [ "$NUDGE_WAIT_EVIDENCE" = present ]; }
 
 # Minimal stub tmux: captures render the composer file in a box (empty box
 # for an empty file), literal sends append, Enter submits the composer text
@@ -186,6 +188,7 @@ EOF
   export FM_TEST_CONTROL_RC=0
   NUDGE_PAUSE_CLASS=none
   NUDGE_CAPTAIN_CALL=closed
+  NUDGE_WAIT_EVIDENCE=absent
   make_nudge_stubs "$dir" >/dev/null
   export FM_STATE_OVERRIDE="$STATE"
   export PATH="$dir/fakebin:$PATH"
@@ -330,7 +333,8 @@ test_muse_nudge_tick_strike_one() {
 test_muse_nudge_tick_below_threshold() {
   setup_nudge_case belowthreshold
   muse_nudge_tick sess:fm-t1 t1 3 hAAA
-  expect_code 1 $? "no strike should fire below rung 4"
+  rc=$?
+  expect_code 1 "$rc" "no strike should fire below rung 4"
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "no strike file should exist below rung 4"
   [ ! -s "$NUDGE_DIR/send.log" ] || fail "no doorbell should ring below rung 4"
   pass "muse nudge: nothing fires below the first rung"
@@ -348,7 +352,8 @@ test_muse_nudge_tick_needs_quiet_window() {
   setup_nudge_case activewrite
   : > "$NUDGE_DIR/wt/fresh.txt"
   muse_nudge_tick sess:fm-t1 t1 4 hAAA
-  expect_code 1 $? "a recent worktree write should veto the strike"
+  rc=$?
+  expect_code 1 "$rc" "a recent worktree write should veto the strike"
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a vetoed strike should write nothing"
   [ ! -s "$NUDGE_DIR/send.log" ] || fail "a vetoed strike should ring nothing"
   pass "muse nudge: a recent write vetoes the strike"
@@ -359,7 +364,8 @@ test_muse_nudge_tick_corrupt_state_fails_safe() {
   mkdir -p "$STATE/t1.inbox"
   printf 'STRIKE=bogus\n' > "$(muse_nudge_file "$STATE" t1)"
   muse_nudge_tick sess:fm-t1 t1 4 hAAA
-  expect_code 1 $? "a corrupt strike file should fire nothing"
+  rc=$?
+  expect_code 1 "$rc" "a corrupt strike file should fire nothing"
   [ "$(cat "$(muse_nudge_file "$STATE" t1)")" = "STRIKE=bogus" ] \
     || fail "a corrupt strike file must be left intact, not reset"
   [ ! -s "$NUDGE_DIR/send.log" ] || fail "a corrupt strike file should ring nothing"
@@ -470,7 +476,8 @@ test_muse_nudge_strike_three_relaunches_once() {
   assert_contains "$(cat "$NUDGE_DIR/control.log")" "doing step three" "the relaunch note should carry status"
   : > "$NUDGE_DIR/control.log"
   muse_nudge_tick sess:fm-t1 t1 7 hZZZ
-  expect_code 1 $? "a spent ladder should not strike again"
+  rc=$?
+  expect_code 1 "$rc" "a spent ladder should not strike again"
   muse_nudge_poll sess:fm-t1 t1 1 hZZZ
   [ ! -s "$NUDGE_DIR/control.log" ] || fail "a spent ladder should not relaunch again"
   [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1)" = 3 ] \
@@ -508,7 +515,8 @@ test_muse_nudge_tick_skips_inflight() {
   setup_nudge_case inflightskip
   muse_nudge_write "$STATE" t1 2 001.msg inflight 15 || fail "setup write should succeed"
   muse_nudge_tick sess:fm-t1 t1 6 hAAA
-  expect_code 1 $? "a rung that lands on an in-flight action must wait for collection"
+  rc=$?
+  expect_code 1 "$rc" "a rung that lands on an in-flight action must wait for collection"
   [ ! -s "$NUDGE_DIR/control.log" ] || fail "a waiting tick must not spawn a second action"
   [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|inflight|15" ] \
     || fail "the in-flight reservation should stand while it waits"
@@ -546,7 +554,8 @@ test_muse_nudge_gated_control_never_blocks() {
   export FM_CONTROL_GATE="$NUDGE_DIR/gate"
   rm -f "$NUDGE_DIR/gate"
   muse_nudge_tick sess:fm-t1 t1 5 hAAA
-  expect_code 0 $? "strike 2 should issue while control is gated"
+  rc=$?
+  expect_code 0 "$rc" "strike 2 should issue while control is gated"
   [ -f "$STATE/t1.inbox/.muse-nudge-action-pid" ] || fail "the gated action should be in flight"
   muse_nudge_poll sess:fm-t1 t1 1 hAAA
   [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|inflight|15" ] \
@@ -564,13 +573,15 @@ test_muse_nudge_worktree_uninspectable_vetoes() {
   setup_nudge_case nouninspect
   sed -i '/^worktree=/d' "$STATE/t1.meta"
   muse_nudge_tick sess:fm-t1 t1 4 hAAA
-  expect_code 1 $? "a task with no worktree record must not be struck"
+  rc=$?
+  expect_code 1 "$rc" "a task with no worktree record must not be struck"
   assert_contains "$(cat "$TRIAGE_LOG")" "not inspectable" "an uninspectable tree should be logged"
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "an uninspectable tree should write nothing"
   setup_nudge_case unreadablewt
   chmod 000 "$NUDGE_DIR/wt"
   muse_nudge_tick sess:fm-t1 t1 4 hAAA
-  expect_code 1 $? "an unreadable worktree must not be struck"
+  rc=$?
+  expect_code 1 "$rc" "an unreadable worktree must not be struck"
   [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "an unreadable tree should write nothing"
   chmod 755 "$NUDGE_DIR/wt"
   pass "muse nudge: an uninspectable worktree vetoes the strike"
@@ -612,18 +623,95 @@ test_muse_nudge_strike_three_collected() {
   pass "muse nudge: strike 3 outcomes are collected and logged"
 }
 
+test_muse_nudge_followup_wait_evidence() {
+  setup_nudge_case waitemerges
+  muse_nudge_write "$STATE" t1 2 001.msg 1 15 || fail "setup write should succeed"
+  NUDGE_WAIT_EVIDENCE=present
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a newly evidenced wait must defer the follow-up steer"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "a newly evidenced wait must send nothing"
+  assert_contains "$(cat "$TRIAGE_LOG")" "wait evidenced" "the deferral should be logged"
+  NUDGE_WAIT_EVIDENCE=absent
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1,2)" = "2|001.msg" ] \
+    || fail "the steer should go out once the wait lifts"
+  pass "muse nudge: the follow-up steer honors wedge wait evidence"
+}
+
+test_muse_nudge_strike_three_waits_for_live_action() {
+  local sleeper
+  setup_nudge_case strikethreewaits
+  muse_nudge_write "$STATE" t1 2 001.msg 1 15 || fail "setup write should succeed"
+  sleep 30 &
+  sleeper=$!
+  {
+    printf '%s\n' "$sleeper"
+    ps -o lstart= -p "$sleeper" 2>/dev/null | sed 's/^[[:space:]]*//'
+    printf 'Glive\n'
+  } > "$STATE/t1.inbox/.muse-nudge-action-pid"
+  muse_nudge_tick sess:fm-t1 t1 6 hZZZ
+  rc=$?
+  expect_code 1 "$rc" "a live action must hold off strike 3"
+  [ ! -s "$NUDGE_DIR/control.log" ] || fail "a held strike 3 should spawn nothing"
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  muse_nudge_tick sess:fm-t1 t1 6 hZZZ
+  rc=$?
+  expect_code 0 "$rc" "strike 3 should proceed once the action ends"
+  wait_for_action_rc "$STATE/t1.inbox" || fail "strike 3 should record its outcome"
+  pass "muse nudge: strike 3 waits for a live action"
+}
+
+test_muse_nudge_timeout_kills_action() {
+  local sleeper tries
+  setup_nudge_case timeoutkill
+  muse_nudge_write "$STATE" t1 2 001.msg inflight 15 || fail "setup write should succeed"
+  sleep 30 &
+  sleeper=$!
+  {
+    printf '%s\n' "$sleeper"
+    ps -o lstart= -p "$sleeper" 2>/dev/null | sed 's/^[[:space:]]*//'
+    printf 'Gkill\n'
+  } > "$STATE/t1.inbox/.muse-nudge-action-pid"
+  touch -d "@$(( $(date +%s) - 600 ))" "$STATE/t1.inbox/.muse-nudge-action-pid"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ "$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)")" = "2|001.msg|1|15" ] \
+    || fail "a timed-out action should advance without replay"
+  tries=0
+  while kill -0 "$sleeper" 2>/dev/null && [ "$tries" -lt 50 ]; do
+    sleep 0.1
+    tries=$(( tries + 1 ))
+  done
+  kill -0 "$sleeper" 2>/dev/null && fail "a timed-out action should be signalled to stop"
+  wait "$sleeper" 2>/dev/null || true
+  pass "muse nudge: a timed-out action is signalled to stop"
+}
+
+test_muse_nudge_collect_empty_rc() {
+  local out
+  setup_nudge_case emptyrc
+  mkdir -p "$STATE/t1.inbox"
+  : > "$STATE/t1.inbox/.muse-nudge-action-rc"
+  out=$(muse_nudge_collect "$STATE/t1.inbox")
+  [ "$out" = "unknown" ] || fail "an empty result should reconcile as unknown, got $out"
+  pass "muse nudge: an empty result file is not a result"
+}
+
 test_muse_nudge_strike_two_persistence_first() {
   setup_nudge_case persistfirst
   muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
   chmod 555 "$STATE/t1.inbox"
   muse_nudge_tick sess:fm-t1 t1 5 hAAA
-  expect_code 1 $? "an unrecordable strike 2 must not fire"
+  rc=$?
+  expect_code 1 "$rc" "an unrecordable strike 2 must not fire"
   [ ! -s "$NUDGE_DIR/control.log" ] || fail "an unrecordable strike must not touch the control plane"
   chmod 755 "$STATE/t1.inbox"
   muse_nudge_write "$STATE" t1 2 001.msg "" 15 || fail "setup write should succeed"
   chmod 555 "$STATE/t1.inbox"
   muse_nudge_tick sess:fm-t1 t1 6 hAAA
-  expect_code 1 $? "an unrecordable strike 3 must not fire"
+  rc=$?
+  expect_code 1 "$rc" "an unrecordable strike 3 must not fire"
   [ ! -s "$NUDGE_DIR/control.log" ] || fail "an unrecordable strike 3 must not touch the control plane"
   chmod 755 "$STATE/t1.inbox"
   pass "muse nudge: a strike that cannot be recorded never acts"
@@ -647,6 +735,10 @@ test_muse_nudge_action_timeout_unknown
 test_muse_nudge_gated_control_never_blocks
 test_muse_nudge_worktree_uninspectable_vetoes
 test_muse_nudge_collect_generation
+test_muse_nudge_followup_wait_evidence
+test_muse_nudge_strike_three_waits_for_live_action
+test_muse_nudge_timeout_kills_action
+test_muse_nudge_collect_empty_rc
 test_muse_nudge_strike_three_collected
 test_muse_nudge_rungs_default
 test_muse_nudge_next_strike_matrix

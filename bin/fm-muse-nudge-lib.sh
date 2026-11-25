@@ -24,8 +24,12 @@ _FM_MUSE_NUDGE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # generated progress note and spends the ladder for the episode. Strikes 2 and
 # 3 reserve first, then run the slow control plane in the background and
 # return at once, so a blocked control executable never delays the wake or
-# another lane's poll; the poll path collects each outcome, reconciling a lost
-# one as unknown without replaying it.
+# another lane's poll; the poll path collects each outcome by generation,
+# reconciling a lost one as unknown without replaying it. A still-running
+# action blocks a later strike until it is collected or times out; a timed-out
+# action is signalled to stop before the ladder advances, and an unkillable
+# survivor is accepted as a documented residual (an interrupt landing late on
+# an idle worker cancels nothing, and a spent relaunch never re-fires).
 #
 # State is one durable per-task file in the task's inbox directory, so the
 # ladder survives watcher restarts: STRIKE is the highest strike fired,
@@ -138,8 +142,8 @@ muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
   (
     "$@" >"$dir/.muse-nudge-action-out" 2>&1
     status=$?
-    printf '%s %s\n' "$gen" "$status" >"$dir/.muse-nudge-action-tmp" 2>/dev/null \
-      && mv "$dir/.muse-nudge-action-tmp" "$dir/.muse-nudge-action-rc"
+    printf '%s %s\n' "$gen" "$status" >"$dir/.muse-nudge-action-tmp.$gen" 2>/dev/null \
+      && mv "$dir/.muse-nudge-action-tmp.$gen" "$dir/.muse-nudge-action-rc"
   ) >/dev/null 2>&1 &
   pid=$!
   started=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)
@@ -164,9 +168,10 @@ muse_nudge_action_alive() {  # <inbox-dir>
   [ -n "$live_start" ] && [ "$live_start" = "$started" ]
 }
 
-# Drop every action outcome file for a task.
+# Drop every action outcome file for a task, including orphaned per-generation
+# temp files a killed action may have left behind.
 muse_nudge_action_clear() {  # <inbox-dir>
-  rm -f "$1/.muse-nudge-action-rc" "$1/.muse-nudge-action-out" "$1/.muse-nudge-action-pid" 2>/dev/null
+  rm -f "$1"/.muse-nudge-action-tmp.* "$1/.muse-nudge-action-rc" "$1/.muse-nudge-action-out" "$1/.muse-nudge-action-pid" 2>/dev/null
 }
 
 # Drop strike state. Absent state is already clean.
@@ -363,6 +368,12 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
   # Never overlap control actions: an in-flight interrupt is collected by
   # the poll path first, which advances the ladder once its outcome lands.
   [ "$pending" != inflight ] || return 1
+  # A strike-3 relaunch must not overlap a still-running action either: it
+  # waits for collection or timeout like everything else.
+  if [ "$next" = 3 ] && muse_nudge_action_alive "$(fm_task_inbox_dir "$STATE" "$task")"; then
+    triage_log "muse auto-nudge holding strike 3 for $task: a control action is still running"
+    return 1
+  fi
   # Eligibility is continuous proven idleness, not the rung count alone: a
   # worktree write restarts the rung timer while the count survives, so only
   # a quiet window covering the whole threshold authorizes a strike. An
@@ -412,6 +423,18 @@ muse_nudge_collect() {  # <inbox-dir>
     now=$(date +%s)
     mtime=$(fm_path_mtime "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$mtime$now" in ''|*[!0-9]*) ;; *) [ $(( now - mtime )) -le "$timeout" ] && return 0 ;; esac
+    # Timed out while verifiably alive: signal it to stop before releasing
+    # the ladder, so a late delivery is unlikely to land on a worker this
+    # ladder no longer tracks. Best effort only; an unkillable survivor is
+    # accepted as a documented residual (an interrupt landing late on an
+    # idle worker cancels nothing, and a spent relaunch never re-fires).
+    # The ladder still advances as unknown rather than stalling on a stuck
+    # control plane.
+    pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
+    case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+    muse_nudge_action_clear "$dir"
+    printf 'unknown'
+    return 0
   fi
   muse_nudge_action_clear "$dir"
   printf 'unknown'
@@ -485,9 +508,14 @@ muse_nudge_poll() {  # <window> <task> <idle-now> <pane-hash>
   [ "$idle_now" -ne 0 ] || return 0
   # The follow-up steer rechecks the full guard set: the lane may have become
   # legitimately busy-waiting while the interrupt was in flight, and a
-  # disabled ladder never steers.
+  # disabled ladder never steers. The wedge wait evidence covers the parked
+  # gates and worker blockers the strike-time guards do not name.
   [ "$(muse_nudge_idle_secs)" -gt 0 ] || return 0
   muse_nudge_guarded "$win" "$task" || return 0
+  if wedge_wait_evidence "$task" >/dev/null 2>&1; then
+    triage_log "muse auto-nudge holding steer for $task: worker wait evidenced after interrupt"
+    return 0
+  fi
   cstate=$(FM_COMPOSER_HARNESS=muse fm_backend_composer_state \
     "$(window_backend "$win")" "$win" "$(window_label "$win")" 2>/dev/null) || return 0
   [ "$cstate" = empty ] || return 0
