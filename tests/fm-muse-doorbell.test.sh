@@ -933,6 +933,34 @@ test_muse_ring_busy_mid_submit_keeps_mark() {
   pass "muse ring: a busy worker mid-submit keeps the mark"
 }
 
+# The submit path must refuse the same way the fresh-send guard does: an
+# already-visible line reaches submit without passing the persistence check,
+# so an unwritable mark must stop the Enter instead of sending it untracked.
+test_muse_ring_submit_refuses_unwritable_mark() {
+  local dir rec rc log doorbell
+  dir=$(setup_case unwritablesubmit muse)
+  : > "$dir/send.log"
+  : > "$dir/submitted.log"
+  rec=$(inbox_lib "$dir/state" fm_task_inbox_write "$dir/state" t1 "please continue")
+  doorbell=$(inbox_lib "$dir/state" fm_task_inbox_doorbell_line "$rec")
+  printf '%s' "$doorbell" > "$dir/composer.txt"
+  mkdir -p "$dir/state/t1.inbox/.muse-pending"
+  PATH="$dir/fakebin:$PATH" FM_SEND_LOG="$dir/send.log" \
+    FM_FAKE_COMPOSER_TEXT="$dir/composer.txt" FM_FAKE_SUBMITTED="$dir/submitted.log" \
+    FM_COMPOSER_HARNESS=muse FM_TASK_INBOX_MUSE_SETTLE_SECS=0 \
+    inbox_lib "$dir/state" fm_task_inbox_ring tmux sess:fm-t1 "$rec" fm-t1 \
+    >"$dir/ring.log" 2>&1
+  rc=$?
+  rmdir "$dir/state/t1.inbox/.muse-pending" 2>/dev/null || true
+  expect_code 2 "$rc" "a submit that cannot record its attempt should report failure"
+  log=$(cat "$dir/send.log")
+  case "$log" in
+    *Enter*) fail "no Enter may go out unrecorded:$'\n'$log" ;;
+  esac
+  [ ! -s "$dir/submitted.log" ] || fail "an unrecorded submit must not submit"
+  pass "muse ring: an unwritable submit mark refuses the Enter"
+}
+
 test_muse_ring_bounded_after_post_commit_stale() {
   local dir rec rc log literals
   dir=$(setup_case stalestale muse)
@@ -1447,6 +1475,7 @@ test_muse_ring_retries_submitted_mark_once
 test_muse_ring_submitted_mark_spares_foreign_draft
 test_muse_ring_spent_retry_never_retypes
 test_muse_ring_busy_mid_submit_keeps_mark
+test_muse_ring_submit_refuses_unwritable_mark
 test_muse_ring_skips_busy_own_line
 test_muse_ring_skips_foreign_pending
 test_watcher_muse_rering_spares_foreign_draft

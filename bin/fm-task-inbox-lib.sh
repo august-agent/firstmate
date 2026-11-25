@@ -492,7 +492,9 @@ fm_task_inbox_muse_submit() {  # <inbox-dir> <record-path> <backend> <target> <l
   sleep "$settle"
   fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
   [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ] || return 1
-  fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" submitted
+  # Persistence before submission, matching the fresh-send guard: when the
+  # attempt cannot be recorded, no Enter may go out untracked.
+  fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" submitted || return 2
   fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || {
     fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" failed
     return 2
