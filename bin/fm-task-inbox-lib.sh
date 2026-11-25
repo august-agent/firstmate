@@ -373,6 +373,369 @@ fm_task_inbox_doorbell_line() {  # <record-path>
     "$quoted"
 }
 
+# Muse doorbell settle: seconds between the literal doorbell send and the
+# separate Enter on the muse path below. Muse evaluates an Enter sent in the
+# same tick as the typed text against a still-empty composer and ignores it,
+# so the text must be visible plus settled before Enter goes out.
+FM_TASK_INBOX_MUSE_SETTLE_DEFAULT=1
+
+fm_task_inbox_muse_settle_secs() {
+  local s=${FM_TASK_INBOX_MUSE_SETTLE_SECS:-$FM_TASK_INBOX_MUSE_SETTLE_DEFAULT}
+  case "$s" in ''|*[!0-9]*) s=$FM_TASK_INBOX_MUSE_SETTLE_DEFAULT ;; esac
+  printf '%s' "$s"
+}
+
+# A muse literal that may already have landed: the sequence basename of the
+# record whose literal send was accepted but never verified visible, kept in
+# <inbox-dir>/.muse-pending with the send outcome after a TAB: nothing for an
+# accepted send, `failed` for one that reported failure. A lagging capture is
+# not proof the send was lost, so a later ring for the same record reconciles
+# this mark without retyping: when the text reads back it submits, while it
+# stays unreadable the ring defers again. A failed mark retypes only onto a
+# proven empty composer - likely nothing landed - and at most once: the retry
+# is marked accepted, so a still-unverifiable line defers from there. That
+# bounds a post-commit failure under a frozen capture to two literals before
+# the ladder escalates. A ring for any other record ignores a stale mark,
+# and the empty-inbox ladder reset drops
+# it, so an acknowledged record never blocks a later one. The resulting
+# guarantee is at-most-once per unverified delivery: a ring retypes only for
+# a record with no mark on a proven empty composer, where the text is
+# provably gone. The mark is best-effort bookkeeping: losing it only risks
+# the duplication it exists to prevent, never delivery itself - a stuck mark
+# still escalates through the ordinary ladder, which names its age.
+fm_task_inbox_muse_mark_pending() {  # <inbox-dir> <record-path> [failed|submitted|retried]
+  case "${3:-}" in
+    failed) printf '%s\tfailed\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
+    submitted) printf '%s\tsubmitted\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
+    retried) printf '%s\tretried\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
+    *) printf '%s\n' "${2##*/}" > "$1/.muse-pending" 2>/dev/null ;;
+  esac
+}
+
+fm_task_inbox_muse_has_pending() {  # <inbox-dir> <record-path>
+  [ -d "$1" ] || return 1
+  [ "$(cut -f1 "$1/.muse-pending" 2>/dev/null || true)" = "${2##*/}" ]
+}
+
+# A pending mark that still owes one retry: a failed send, or a submitted one
+# whose Enter went out but was never verified. An accepted-but-unverified
+# send (plain mark) does not qualify: retyping it risks duplicating a line
+# that only the capture has not caught up with yet. A spent retry (retried
+# mark) never qualifies again, so one retry cannot re-arm itself.
+fm_task_inbox_muse_mark_retryable() {  # <inbox-dir> <record-path>
+  local kind
+  fm_task_inbox_muse_has_pending "$1" "$2" || return 1
+  kind=$(cut -f2 -s "$1/.muse-pending" 2>/dev/null || true)
+  [ "$kind" = failed ] || [ "$kind" = submitted ]
+}
+
+# Mark a send outcome unless the record's retry is already spent: a spent
+# retry stays spent through submit, reconcile, and Enter failures, so one
+# retry never re-arms itself into a literal per ring.
+fm_task_inbox_muse_mark_unless_spent() {  # <inbox-dir> <record-path> <kind>
+  [ "$(cut -f2 -s "$1/.muse-pending" 2>/dev/null || true)" = retried ] && return 0
+  fm_task_inbox_muse_mark_pending "$1" "$2" "$3"
+}
+
+# The sequence number a pending mark names, or nothing when no mark is set.
+fm_task_inbox_muse_pending_seq() {  # <inbox-dir>
+  local seq
+  [ -f "$1/.muse-pending" ] || return 1
+  seq=$(cut -f1 "$1/.muse-pending" 2>/dev/null || true)
+  seq=${seq%.msg}
+  case "$seq" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$seq"
+}
+
+# Reconcile another record's unresolved literal instead of typing over it.
+# Enqueue-time rings target the newest record while an older one may still be
+# unverified, so a pending mark for a different sequence bars this ring from
+# typing: the older record reconciles through the same submit path, and the
+# ring defers when its line no longer reads back. Call only when the marked
+# record is still unhandled; a stale mark is cleared by the caller so it
+# cannot block later records. Returns 0 submitted, 1 deferred, 2 when an
+# Enter keystroke itself failed.
+fm_task_inbox_muse_reconcile_other() {  # <inbox-dir> <record-seq> <backend> <target> [expected-label]
+  local dir=$1 seq=$2 backend=$3 target=$4 label=${5:-} other line
+  other="$dir/$seq.msg"
+  line=$(fm_task_inbox_doorbell_line "$other") || return 1
+  fm_task_inbox_muse_reconcile "$dir" "$other" "$backend" "$target" "$line" "$label"
+}
+
+fm_task_inbox_muse_clear_pending() {  # <inbox-dir>
+  rm -f "$1/.muse-pending" 2>/dev/null
+}
+
+# Submit a muse doorbell line: settle first, then one Enter only when the
+# line reads back visible, then a second only when it is still sitting there
+# unchanged and the worker is not busy. The pre-Enter settle owns the
+# visibility contract for every caller - reconcile paths, failed sends,
+# and fresh deliveries alike submit through here, so no Enter goes out in
+# the same tick as the typed text. The submission attempt is tracked in the
+# pending mark: it becomes "submitted" before the first Enter goes out, is
+# cleared on a verified-empty composer or a completed second Enter, and
+# becomes "failed" when an Enter keystroke itself fails. A composer that changed under the first
+# Enter - a restored prompt landing late, a draft appearing, an unreadable
+# capture - is never retried into: it reports a deferral with the mark left
+# in "submitted" form, so the next ring retries the attempt instead of
+# typing a duplicate line. A completed submission - a verified-empty composer
+# or both Enters sent - clears the mark: from there the acknowledgement move
+# is the delivery proof and the ladder owns the rest. A spent retry stays
+# spent: the submit path never writes over a "retried" mark except to clear
+# it on success. A worker that turns busy before the second Enter goes out
+# keeps the mark and defers: a half-submitted line is not a submission.
+# Returns 0 submitted, 1 deferred on an unverified or changed composer or a
+# worker that turned busy mid-submit, 2 when an Enter keystroke itself failed.
+fm_task_inbox_muse_submit() {  # <inbox-dir> <record-path> <backend> <target> <line> [expected-label]
+  local dir=$1 rec=$2 backend=$3 target=$4 line=$5 label=${6:-} cstate settle
+  settle=$(fm_task_inbox_muse_settle_secs)
+  sleep "$settle"
+  fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
+  [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ] || return 1
+  # Persistence before submission, matching the fresh-send guard: when the
+  # attempt cannot be recorded, no Enter may go out untracked.
+  fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" submitted || return 2
+  fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || {
+    fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" failed
+    return 2
+  }
+  sleep 0.3
+  cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
+  case "$cstate" in
+    empty)
+      fm_task_inbox_muse_clear_pending "$dir"
+      return 0
+      ;;
+    pending)
+      fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
+      if [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" = busy ]; then
+        # The second Enter never went out and the line is still sitting
+        # there, so this is not a submission: keep the mark and defer
+        # rather than reporting success on a half-submitted line.
+        return 1
+      fi
+      fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || {
+        fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" failed
+        return 2
+      }
+      fm_task_inbox_muse_clear_pending "$dir"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Reconcile a marked muse literal without typing: when the line reads back
+# and the worker is idle it submits through the shared submit path - which
+# owns the pending mark from there - and otherwise it defers with the mark
+# intact. The submit status propagates verbatim - 0 submitted, 1 deferred on
+# a changed composer, 2 when an Enter keystroke itself failed - so callers
+# never mistake a deferral for a send failure.
+fm_task_inbox_muse_reconcile() {  # <inbox-dir> <record-path> <backend> <target> <line> [expected-label]
+  local dir=$1 rec=$2 backend=$3 target=$4 line=$5 label=${6:-}
+  if fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" \
+    && [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ]; then
+    fm_task_inbox_muse_submit "$dir" "$rec" "$backend" "$target" "$line" "$label"
+    return
+  fi
+  return 1
+}
+
+# The per-record ring lock: <inbox-dir>/.muse-ring.lock, held across one
+# whole ring delivery by the dispatcher so two racing rings cannot interleave
+# a check and a type. A waiter blocks for the bounded lock wait; when it
+# gets the lock it re-reads state under mutual exclusion and usually finds
+# the winner's mark and reconciles, or a clean composer and types exactly
+# once. When the wait expires it defers to the next grace. A lock orphaned
+# by a killed ring fails safe the same way: the holder check reclaims locks
+# whose owner is dead, and anything still held only delays the next attempt.
+# Returns 0 with the lock held, 1 when it is held elsewhere or cannot be
+# taken; the caller releases with fm_lock_release.
+fm_task_inbox_muse_take_ring_lock() {  # <inbox-dir>
+  fm_task_inbox_lock_acquire "$1/.muse-ring.lock" || return 1
+}
+
+# A stuck muse literal named for the supervisor: when a record with a pending
+# mark escalates, the mark's age says how long the line went unverified. Empty
+# when there is no mark or it is younger than the ladder's own budget horizon
+# (ring attempts times grace), so only a mark that outlived every delivery
+# attempt it could have reconciled annotates the escalation.
+fm_task_inbox_muse_stale_note() {  # <state-dir> <task-id>
+  local dir mark age horizon
+  dir=$(fm_task_inbox_dir "$1" "$2")
+  mark="$dir/.muse-pending"
+  [ -f "$mark" ] || return 1
+  age=$(fm_path_age "$mark") || return 1
+  horizon=$(( $(fm_task_inbox_ring_max) * $(fm_task_inbox_grace_secs) ))
+  [ "$age" -ge "$horizon" ] || return 1
+  printf ' (its doorbell literal went unverified for %ss; the composer may never have shown it)' "$age"
+}
+
+# The muse doorbell path: the muse worker drops a doorbell whose Enter lands
+# before its text is visible, so this path types the doorbell as one literal
+# send and only then sends Enter as a separate keystroke, retrying Enter
+# without retyping. The dispatcher holds a per-record lock across the whole
+# delivery, so concurrent rings serialize instead of typing twice. The
+# pending mark carries the send outcome, so every later ring reconciles
+# before typing: an accepted but unverified send defers, while a failed send
+# retypes only onto a proven empty composer and only once - the retry is
+# marked accepted either way, bounding a post-commit failure under a frozen
+# capture to two literals. A mark for another record bars typing: its line
+# is submitted first, its failed send is retried onto an empty composer, or
+# the ring defers. A lagging capture is not proof the send was lost
+# and a second literal would concatenate onto the first. Only a backend with
+# no literal primitive falls back to the shared path, because no input was
+# attempted there. This path never clears:
+# an advisory capture must not authorize a destructive operation. A composer
+# proven to hold other text is skipped exactly like the generic path, and an
+# unreadable composer defers without typing at all. Returns 0 rang, 1
+# skipped or deferred on a protected or unverified composer, 2 the send
+# failed, 3 the endpoint is positively dead or missing. Like the generic path,
+# no return value proves delivery; the acknowledgement move into handled/ is
+# the only delivery proof.
+fm_task_inbox_ring_muse() {  # <backend> <target> <record-path> [expected-label]
+  local backend=$1 target=$2 rec=$3 label=${4:-} line cstate dir rc RETRY seq
+  case "$(fm_backend_agent_state "$backend" "$target" 2>/dev/null || true)" in
+    dead|missing) return 3 ;;
+  esac
+  if ! line=$(fm_task_inbox_doorbell_line "$rec"); then
+    return 2
+  fi
+  dir=${rec%/*}
+  RETRY=0
+  if fm_task_inbox_muse_has_pending "$dir" "$rec"; then
+    fm_task_inbox_muse_reconcile "$dir" "$rec" "$backend" "$target" "$line" "$label"
+    rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      2) return 2 ;;
+    esac
+    cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
+    if [ "$cstate" = empty ] && fm_task_inbox_muse_mark_retryable "$dir" "$rec"; then
+      fm_task_inbox_muse_clear_pending "$dir"
+      RETRY=1
+    else
+      return 1
+    fi
+  elif seq=$(fm_task_inbox_muse_pending_seq "$dir"); then
+    if [ -f "$dir/$seq.msg" ]; then
+      fm_task_inbox_muse_reconcile_other "$dir" "$seq" "$backend" "$target" "$label"
+      rc=$?
+      case "$rc" in
+        0) return 0 ;;
+        2) return 2 ;;
+      esac
+      # Deferred on an unreadable or foreign composer: an older send that
+      # failed before landing - or was submitted but never verified - still
+      # owes one retry, so reconcile it the way the current record would be -
+      # by switching the subject to the older record and falling through to
+      # the ordinary dispatch below. An accepted-but-unverified older send
+      # keeps deferring instead.
+      cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
+      if [ "$cstate" = empty ] && fm_task_inbox_muse_mark_retryable "$dir" "$dir/$seq.msg"; then
+        fm_task_inbox_muse_clear_pending "$dir"
+        RETRY=1
+        rec="$dir/$seq.msg"
+        if ! line=$(fm_task_inbox_doorbell_line "$rec"); then
+          return 2
+        fi
+      else
+        return 1
+      fi
+    else
+      fm_task_inbox_muse_clear_pending "$dir"
+    fi
+  fi
+  cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
+  case "$cstate" in
+    pending)
+      if fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" \
+        && [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ]; then
+        fm_task_inbox_muse_submit "$dir" "$rec" "$backend" "$target" "$line" "$label"
+        return
+      fi
+      return 1
+      ;;
+    # An ambiguous composer falls through with an empty one, but the recheck
+    # below only authorizes typing onto a proven empty composer: anything
+    # else reconciles without typing, so an unreadable composer defers
+    # instead of risking input onto a draft nobody can see.
+    empty|*) : ;;
+  esac
+  # The dispatcher serializes rings across this window, so no second ring can
+  # interleave its own check and type: re-check under the held lock anyway,
+  # because the composer may have changed since the first read.
+  if fm_task_inbox_muse_has_pending "$dir" "$rec"; then
+    fm_task_inbox_muse_reconcile "$dir" "$rec" "$backend" "$target" "$line" "$label"
+    return
+  fi
+  cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
+  if [ "$cstate" != empty ]; then
+    fm_task_inbox_muse_reconcile "$dir" "$rec" "$backend" "$target" "$line" "$label"
+    return
+  fi
+  # Persistence before input: when the mark cannot be written, sending
+  # proceeds without the state that prevents retyping, so refuse instead.
+  # A stuck writer escalates through the ordinary ladder rather than
+  # duplicating silently on every re-ring. A retry records its spent
+  # allowance the same way, so a later deferral never re-arms it.
+  if [ "$RETRY" = 1 ]; then
+    fm_task_inbox_muse_mark_pending "$dir" "$rec" retried || return 2
+  elif ! fm_task_inbox_muse_mark_pending "$dir" "$rec"; then
+    return 2
+  fi
+  fm_backend_send_literal "$backend" "$target" "$line" "$label" >/dev/null 2>&1
+  case "$?" in
+    0) : ;;
+    # Unsupported, with no input attempted: the shared submit path is safe.
+    2)
+      fm_task_inbox_muse_clear_pending "$dir"
+      fm_task_inbox_ring_submit "$backend" "$target" "$rec" "$label"
+      return
+      ;;
+    # Failed: the attempt is uncertain, so record the outcome and look before
+    # deciding: a first failure marks the record failed, while a retry that
+    # fails leaves the plain mark the retry's own type wrote. When the line
+    # reads back it landed despite the failure, it joins the ordinary
+    # settle-and-verify path below - which owns the mark from there - so the
+    # text earns no exemption from the settle. This deliberately retypes after
+    # a failed send on a proven empty composer: a clean failure - by far the
+    # common case, where nothing landed - then recovers on the next ring,
+    # while a post-commit failure under a frozen capture duplicates at most
+    # once and escalates with the line intact for the supervisor. Never
+    # retyping would trade that recovery for a quieter lockout; the ladder
+    # bounds either outcome to an escalation.
+    *)
+      [ "$RETRY" = 1 ] || fm_task_inbox_muse_mark_pending "$dir" "$rec" failed
+      if ! fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" \
+        || [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" = busy ]; then
+        return 2
+      fi
+      ;;
+  esac
+  # The submit path owns the settle-and-verify sequence - and the pending
+  # mark from here - so every Enter, fresh, reconciled, or retried, waits
+  # out the same settle first.
+  fm_task_inbox_muse_submit "$dir" "$rec" "$backend" "$target" "$line" "$label"
+  return
+}
+
+# Recorded delivery attempts for one record: the count in .ring-state, or 0
+# when this record has no recorded attempt yet. Lets the watcher tell a first
+# delivery from a re-ring without reparsing the ladder.
+fm_task_inbox_ring_count() {  # <state-dir> <task-id> <record-path>
+  local dir base ladder rec_base count last
+  dir=$(fm_task_inbox_dir "$1" "$2")
+  base=${3##*/}
+  ladder=$(cat "$dir/.ring-state" 2>/dev/null || true)
+  IFS=$(printf '\t') read -r rec_base count last <<EOF
+$ladder
+EOF
+  [ "$rec_base" = "$base" ] || count=0
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  printf '%s' "$count"
+}
+
 # Ring the doorbell, best-effort: one endpoint-liveness pre-check, one advisory
 # composer pre-check, then the backend's submit machinery with a minimal retry
 # budget, verdict discarded.
@@ -391,7 +754,7 @@ fm_task_inbox_doorbell_line() {  # <record-path>
 # whose Enter never landed, so on an agent not reported busy it is submitted
 # rather than skipped; skipping it would block every later ring. On both paths
 # a lost first Enter gets one confirmed retry.
-fm_task_inbox_ring() {  # <backend> <target> <record-path> [expected-label]
+fm_task_inbox_ring_submit() {  # <backend> <target> <record-path> [expected-label]
   local backend=$1 target=$2 rec=$3 label=${4:-} line cstate verdict
   case "$(fm_backend_agent_state "$backend" "$target" 2>/dev/null || true)" in
     dead|missing) return 3 ;;
@@ -423,6 +786,40 @@ fm_task_inbox_ring() {  # <backend> <target> <record-path> [expected-label]
   # (empty, pending, unknown, ...) is deliberately ignored, never proof.
   [ "$verdict" != send-failed ] || return 2
   return 0
+}
+
+# Ring the doorbell, best-effort, through the harness-scoped delivery path.
+# The muse worker drops a doorbell whose Enter lands before its text is
+# visible, so its rings go through fm_task_inbox_ring_muse (one literal plus
+# a separate Enter, never a clear); every other harness keeps the shared
+# submit path unchanged. A muse ring holds the per-record ring lock across
+# the whole delivery so two rings racing the same empty composer cannot both
+# type: the loser waits out the winner's window and reconciles instead.
+# A lock the winner orphaned by dying fails safe: the waiter times out,
+# defers, and the ladder escalates on schedule.
+fm_task_inbox_ring() {  # <backend> <target> <record-path> [expected-label]
+  local dir rc
+  if [ "${FM_COMPOSER_HARNESS:-}" != muse ]; then
+    fm_task_inbox_ring_submit "$@"
+    return
+  fi
+  dir=${3%/*}
+  if [ ! -d "$dir" ]; then
+    fm_task_inbox_ring_muse "$@"
+    return
+  fi
+  # Liveness before locking: a positively dead or missing endpoint reports
+  # unavailable even when another ring holds the lock, so the caller never
+  # mistakes contention for delivery and never spends a retry meant for a
+  # skipped or failed send.
+  case "$(fm_backend_agent_state "$1" "$2" 2>/dev/null || true)" in
+    dead|missing) return 3 ;;
+  esac
+  fm_task_inbox_muse_take_ring_lock "$dir" || return 1
+  fm_task_inbox_ring_muse "$@"
+  rc=$?
+  fm_lock_release "$dir/.muse-ring.lock"
+  return "$rc"
 }
 
 # Whether the composer's content, ignoring line wrapping, is exactly <line>.
@@ -491,10 +888,24 @@ fm_task_inbox_clear_retry() {  # <state-dir> <task-id> <record-path>
 # An empty inbox also resets the ladder bookkeeping so the next message starts
 # a fresh ladder.
 fm_task_inbox_due_action() {  # <state-dir> <task-id>
-  local dir oldest base now grace max ladder rec_base count last
+  local dir oldest base now grace max ladder rec_base count last mark_seq
   dir=$(fm_task_inbox_dir "$1" "$2")
   if ! oldest=$(fm_task_inbox_oldest_unhandled "$1" "$2"); then
     rm -f "$dir/.ring-state" "$dir/.escalated" "$dir/.busy-state" 2>/dev/null || true
+    # A pending mark outlives this reset while its record is still unhandled:
+    # oldest_unhandled skips fire-and-forget records, so an empty ladder here
+    # does not mean the inbox is empty, and dropping the mark would let the
+    # fire-and-forget retry below retype onto an unverified literal. The
+    # check and removal run under the ring lock so a concurrent ring cannot
+    # publish a new mark in between; on contention the cleanup waits for the
+    # next poll.
+    if FM_TASK_INBOX_LOCK_WAIT_SECS=0 fm_task_inbox_muse_take_ring_lock "$dir" 2>/dev/null; then
+      if ! mark_seq=$(fm_task_inbox_muse_pending_seq "$dir" 2>/dev/null) \
+        || [ ! -f "$dir/$mark_seq.msg" ]; then
+        rm -f "$dir/.muse-pending" 2>/dev/null || true
+      fi
+      fm_lock_release "$dir/.muse-ring.lock"
+    fi
     # The one retry ring exists only while config/wait-no-turns is present.
     # Absent, a mark is left untouched and the inbox stays quiet, as before.
     if [ -e "${FM_CONFIG_OVERRIDE:-${FM_HOME:-}/config}/wait-no-turns" ]; then

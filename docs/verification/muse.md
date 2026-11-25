@@ -299,3 +299,29 @@ The 1.3 key reorder was such a change for the old prefix matcher, and the turn-t
 A build that ever split one turn across several runs would make a settled log ambiguous, which is a classifier change rather than a note in this file.
 
 The portable counterparts that run in ordinary CI are `tests/fm-muse-harness.test.sh`, `tests/fm-tmux-agent-liveness.test.sh`, `tests/fm-composer-lib.test.sh`, and `tests/fm-composer-ghost.test.sh`.
+
+### Doorbell reliability (2026-11-24)
+
+The worker dropped a doorbell whose Enter landed before its text was visible, and a steer typed onto a restored prompt submitted garbled.
+The inbox ring for this worker now types the doorbell as one literal send, and only then sends Enter as a separate keystroke, retrying Enter without retyping.
+The literal dispatcher covers every backend with a native literal primitive; a backend with no pane to type into stays unsupported and keeps the shared submit path.
+The ring never clears: an advisory capture must not authorize a destructive operation.
+The pending mark carries the send outcome, so a later ring reconciles before typing: an accepted but unverified send defers, while a failed send - or a submitted one whose Enter went out but stayed unverified - retypes only onto a proven empty composer and only once: the mark becomes "submitted" before the first Enter, is cleared by a completed submission, and becomes "failed" when an Enter keystroke itself fails. The retry records its spent allowance when it types, and the submit path never writes over a spent retry except to clear it on success, so repeated failures stay bounded by the ladder instead of costing a literal per ring.
+A mark for another record bars typing: its line is submitted first, or the ring defers, except a failed or submitted mark on an empty composer, whose retry runs for that record first.
+A failed Enter leaves a failed mark and reports the failure, so the next ring resubmits the protected line.
+A worker that turns busy before the second Enter keeps the mark and defers: a half-submitted line is not a submission.
+A submit that finds a changed composer defers instead of retrying into it.
+A per-record lock serializes concurrent rings across the whole delivery; a stale lock fails safe into deferral.
+A record still unhandled after a recorded delivery attempt is re-rung as-is, with no interrupt key.
+An automatic re-ring interrupt was removed because a restoration racing the final verify can submit a foreign prompt, which no capture spacing can rule out.
+A restoration landing between the final verify and Enter is still submitted: nothing can interlock a terminal keypress.
+The guarantee is one submission per verified read with no retry into observed change.
+A frozen capture can still misread the post-Enter check, which is why the ladder escalation remains the backstop.
+A stuck mark annotates the escalation with how long the literal went unverified.
+The foreign-draft guard keeps its meaning: a proven foreign draft still skips without typing.
+An ambiguous composer defers without typing or submitting: only a readable empty composer authorizes a fresh send.
+
+```
+$ bash bin/fm-test-run.sh tests/fm-muse-doorbell.test.sh tests/fm-task-inbox.test.sh tests/fm-send-inbox.test.sh
+FM_TEST_SUMMARY total=3 failed=0 skipped_gate=0
+```

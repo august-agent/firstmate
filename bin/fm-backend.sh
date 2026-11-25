@@ -1276,6 +1276,33 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
   esac
 }
 
+# fm_backend_send_literal: type TEXT as literal, unsubmitted input; the caller
+# sends Enter separately. Every backend with a native literal primitive is
+# covered; the t3code backend has no pane to type into, so it stays
+# unsupported like any unknown backend. Returns 0 sent, 2 unsupported (the
+# caller keeps its existing path - no input was attempted, so falling back
+# cannot duplicate), and any other nonzero when the send itself failed (input
+# may have landed, so the caller must not retype).
+fm_backend_send_literal() {  # <backend> <target> <text> [expected-label]
+  local backend=$1 rc
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_send_literal "$1" "$2" ;;
+    herdr) fm_backend_herdr_send_literal "$1" "$2" ;;
+    cmux) fm_backend_cmux_send_literal "$1" "$2" "${3:-}" ;;
+    zellij) fm_backend_zellij_send_literal "$1" "$2" "${3:-}" ;;
+    orca) fm_backend_orca_send_literal "$1" "$2" ;;
+    paseo) fm_backend_paseo_send_literal "$1" "$2" "${3:-}" ;;
+    rex) fm_backend_rex_send_literal "$1" "$2" "${3:-}" ;;
+    tern) fm_backend_tern_send_literal "$1" "$2" "${3:-}" ;;
+    *) echo "error: no send-literal implementation for backend '$backend'" >&2; return 2 ;;
+  esac
+  rc=$?
+  [ "$rc" -eq 2 ] && return 1
+  return "$rc"
+}
+
 # fm_backend_send_text_submit: submit and verify through the selected adapter.
 # Pane backends type once and retry only submission; T3 uses a native send.
 # Echoes the backend's verdict; callers require exact empty for confirmed delivery.

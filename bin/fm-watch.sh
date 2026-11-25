@@ -614,6 +614,28 @@ inbox_steer_busy() {  # <window> <backend> <task> <tail40>
   fi
 }
 
+# Record one ladder attempt after a ring delivery: a concurrently removed
+# record refreshes the ladder and reports done, while an unwritable
+# ladder with the record still unhandled wakes the bookkeeping failure so a
+# stuck ladder can never retry silently forever. Returns 0 to continue the
+# delivery, 1 when the check is already done.
+inbox_steer_note_ring_attempt() {  # <window> <task> <record>
+  local w=$1 task=$2 rec=$3 reason
+  if fm_task_inbox_record_ring "$STATE" "$task" "$rec"; then
+    return 0
+  fi
+  if [ ! -f "$rec" ]; then
+    fm_task_inbox_due_action "$STATE" "$task" >/dev/null || true
+    return 1
+  fi
+  if [ -d "${rec%/*}" ]; then
+    reason="stale: $w (steering-inbox ladder bookkeeping unwritable: ${rec%/*}/.ring-state cannot be written while $rec stays unhandled; the doorbell cannot advance toward escalation - inspect the inbox directory)"
+    fm_wake_append stale "$w" "$reason" || exit 1
+    wake "$reason"
+  fi
+  return 0
+}
+
 # Steering-inbox loss detection, one cheap check per recorded window per poll.
 # bin/fm-task-inbox-lib.sh owns delivery, busy-deferral, retry, and escalation policy.
 # Endpoint and busy checks precede delivery so recovery never types into a busy,
@@ -675,17 +697,7 @@ inbox_steer_check() {  # <window> <task>
         inbox_steer_escalate_unavailable "$w" "$task" "$rec"
         return 0
       fi
-      if ! fm_task_inbox_record_ring "$STATE" "$task" "$rec"; then
-        if [ ! -f "$rec" ]; then
-          fm_task_inbox_due_action "$STATE" "$task" >/dev/null || true
-          return 0
-        fi
-        if [ -d "${rec%/*}" ]; then
-          reason="stale: $w (steering-inbox ladder bookkeeping unwritable: ${rec%/*}/.ring-state cannot be written while $rec stays unhandled; the doorbell cannot advance toward escalation - inspect the inbox directory)"
-          fm_wake_append stale "$w" "$reason" || exit 1
-          wake "$reason"
-        fi
-      fi
+      inbox_steer_note_ring_attempt "$w" "$task" "$rec" || return 0
       triage_log "steer-inbox delivery attempt: $task ${rec##*/} result=$ring_rc"
       ;;
     retry)
@@ -700,7 +712,7 @@ inbox_steer_check() {  # <window> <task>
       triage_log "steer-inbox retry ring: $task ${rec##*/} result=$ring_rc"
       ;;
     escalate)
-      reason=${reason:-"stale: $w (unread firstmate instruction: $rec still unhandled after $count doorbell delivery attempts with an idle pane; inspect the worker)"}
+      reason=${reason:-"stale: $w (unread firstmate instruction: $rec still unhandled after $count doorbell delivery attempts with an idle pane$(fm_task_inbox_muse_stale_note "$STATE" "$task" 2>/dev/null || true); inspect the worker)"}
       if [ ! -d "${rec%/*}" ] || [ ! -f "$rec" ]; then
         fm_task_inbox_due_action "$STATE" "$task" >/dev/null || true
         return 0
