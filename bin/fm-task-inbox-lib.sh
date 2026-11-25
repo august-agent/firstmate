@@ -102,6 +102,12 @@ _FM_TASK_INBOX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_FM_TASK_INBOX_LIB_DIR/fm-wake-lib.sh"
 # shellcheck source=/dev/null
 . "$_FM_TASK_INBOX_LIB_DIR/fm-backend.sh"
+# The control plane's verified interrupt tables (key, repeat, backend key
+# capability) for the agy queued-wedge recovery below. That library is pure
+# tables and predicates with no side effects on source, so this direction
+# cannot cycle: nothing in the control plane sources the inbox.
+# shellcheck source=/dev/null
+. "$_FM_TASK_INBOX_LIB_DIR/fm-control-lib.sh"
 
 FM_TASK_INBOX_SCHEMA='fm-task-inbox.v1'
 FM_TASK_INBOX_GRACE_DEFAULT=90
@@ -373,10 +379,11 @@ fm_task_inbox_doorbell_line() {  # <record-path>
     "$quoted"
 }
 
-# Muse doorbell settle: seconds between the literal doorbell send and the
-# separate Enter on the muse path below. Muse evaluates an Enter sent in the
-# same tick as the typed text against a still-empty composer and ignores it,
-# so the text must be visible plus settled before Enter goes out.
+# Separate-Enter doorbell settle: seconds between the literal doorbell send
+# and the separate Enter on the shared path below. Every harness on that path
+# evaluates an Enter sent in the same tick as the typed text against a
+# still-empty composer and ignores it, so the text must be visible plus
+# settled before Enter goes out. One settle covers every harness on the path.
 FM_TASK_INBOX_MUSE_SETTLE_DEFAULT=1
 
 fm_task_inbox_muse_settle_secs() {
@@ -466,9 +473,53 @@ fm_task_inbox_muse_clear_pending() {  # <inbox-dir>
   rm -f "$1/.muse-pending" 2>/dev/null
 }
 
-# Submit a muse doorbell line: settle first, then one Enter only when the
-# line reads back visible, then a second only when it is still sitting there
-# unchanged and the worker is not busy. The pre-Enter settle owns the
+# The agy queued-wedge check: 0 when this ring must interrupt instead of
+# submitting, 1 when there is no wedge and the caller proceeds, 2 when a
+# wedge was found but its interrupt key could not be delivered. Only the agy
+# harness in this exact queued state ever returns 0: a positively live agent
+# whose pane positively shows our doorbell queued behind no running turn -
+# the exact queued text is rendered, our line reads back in the composer,
+# the pinned idle row is proven with no background task count, and the
+# rendered busy read is idle.
+# A healthy running turn reads busy and is never interrupted, and a worker
+# legitimately waiting on its own background job keeps its task-count row
+# and is never interrupted either. This is the one deliberate exception to
+# the no-automatic-interrupt rule for re-rings, ordered for this state by
+# the fork owner. The interrupt is the control plane's own verified single
+# Escape for agy (no clear key), resolved through its tables so a vendor
+# change there moves this recovery with it - and it goes out alone: never
+# the doorbell text and never Enter in the same step. The pending mark is
+# left untouched, so the next ring reconciles and submits through the
+# ordinary path.
+fm_task_inbox_agy_queued_wedge() {  # <backend> <target> <line> [expected-label]
+  local backend=$1 target=$2 line=$3 label=${4:-} capture rendered key repeat i=0
+  [ "${FM_COMPOSER_HARNESS:-}" = agy ] || return 1
+  # Source in the main shell (not in a substitution) so the composer helpers
+  # below resolve, matching fm_task_inbox_composer_holds.
+  fm_backend_source "$backend" || return 1
+  # Only a positively live agent is ever interrupted: a dead shell keeps no
+  # composer, so nothing here could be a wedge, and an unreadable endpoint
+  # proves nothing either way.
+  [ "$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null)" = alive ] || return 1
+  capture=$(fm_backend_capture "$backend" "$target" "${FM_COMPOSER_CAPTURE_LINES:-20}" "$label" 2>/dev/null) || return 1
+  printf '%s\n' "$capture" | fm_composer_strip_ansi | grep -qF -- "$FM_COMPOSER_AGY_QUEUED_TEXT" || return 1
+  fm_composer_agy_idle_proven "$capture" || return 1
+  fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
+  rendered=$(fm_backend_rendered_busy_state "$backend" "$target" agy 2>/dev/null) || rendered=unknown
+  [ "$rendered" = idle ] || return 1
+  key=$(fm_control_interrupt_key agy) || return 1
+  repeat=$(fm_control_interrupt_repeat agy) || return 1
+  fm_control_backend_supports_key "$backend" "$key" || return 1
+  while [ "$i" -lt "$repeat" ]; do
+    fm_backend_send_key "$backend" "$target" "$key" "$label" >/dev/null 2>&1 || return 2
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# Submit a separate-Enter doorbell line: settle first, then one Enter only
+# when the line reads back visible, then a second only when it is still
+# sitting there unchanged and the worker is not busy. The pre-Enter settle owns the
 # visibility contract for every caller - reconcile paths, failed sends,
 # and fresh deliveries alike submit through here, so no Enter goes out in
 # the same tick as the typed text. The submission attempt is tracked in the
@@ -487,11 +538,23 @@ fm_task_inbox_muse_clear_pending() {  # <inbox-dir>
 # Returns 0 submitted, 1 deferred on an unverified or changed composer or a
 # worker that turned busy mid-submit, 2 when an Enter keystroke itself failed.
 fm_task_inbox_muse_submit() {  # <inbox-dir> <record-path> <backend> <target> <line> [expected-label]
-  local dir=$1 rec=$2 backend=$3 target=$4 line=$5 label=${6:-} cstate settle
+  local dir=$1 rec=$2 backend=$3 target=$4 line=$5 label=${6:-} cstate settle wedge_rc
   settle=$(fm_task_inbox_muse_settle_secs)
   sleep "$settle"
   fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 1
   [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ] || return 1
+  # An agy pane holding our line queued behind no running turn is wedged,
+  # not busy: interrupt alone through the verified control key and defer, so
+  # the next ring submits through the ordinary path. The wedge helper owns
+  # the agy-only gate and the interrupt-or-nothing discipline, and the mark
+  # below is untouched on this path, so every other harness - and every
+  # non-wedged agy ring - reaches the mark unchanged.
+  fm_task_inbox_agy_queued_wedge "$backend" "$target" "$line" "$label"
+  wedge_rc=$?
+  case "$wedge_rc" in
+    0) return 1 ;;
+    2) return 2 ;;
+  esac
   # Persistence before submission, matching the fresh-send guard: when the
   # attempt cannot be recorded, no Enter may go out untracked.
   fm_task_inbox_muse_mark_unless_spent "$dir" "$rec" submitted || return 2
@@ -571,10 +634,14 @@ fm_task_inbox_muse_stale_note() {  # <state-dir> <task-id>
   printf ' (its doorbell literal went unverified for %ss; the composer may never have shown it)' "$age"
 }
 
-# The muse doorbell path: the muse worker drops a doorbell whose Enter lands
-# before its text is visible, so this path types the doorbell as one literal
-# send and only then sends Enter as a separate keystroke, retrying Enter
-# without retyping. The dispatcher holds a per-record lock across the whole
+# The separate-Enter doorbell path, shared by every harness in
+# fm_task_inbox_separate_enter_harness: the worker drops a doorbell whose
+# Enter lands before its text is visible, so this path types the doorbell as
+# one literal send and only then sends Enter as a separate keystroke, retrying
+# Enter without retyping. The one interrupt this path ever sends is the agy
+# queued-wedge recovery in the submit path, which goes out alone and only in
+# that positively detected state. The dispatcher holds a
+# per-record lock across the whole
 # delivery, so concurrent rings serialize instead of typing twice. The
 # pending mark carries the send outcome, so every later ring reconciles
 # before typing: an accepted but unverified send defers, while a failed send
@@ -788,18 +855,30 @@ fm_task_inbox_ring_submit() {  # <backend> <target> <record-path> [expected-labe
   return 0
 }
 
+# Harnesses whose workers drop a doorbell Enter sent in the same tick as its
+# text share the literal-then-separate-Enter ring path below: muse (verified
+# in the reliability fix) and agy, whose typed-but-unsubmitted doorbells
+# stacked in the composer until one manual Enter submitted them all. Every
+# other harness keeps the shared submit path unchanged.
+fm_task_inbox_separate_enter_harness() {  # [harness]
+  case "${1:-${FM_COMPOSER_HARNESS:-}}" in muse|agy) return 0 ;; esac
+  return 1
+}
+
 # Ring the doorbell, best-effort, through the harness-scoped delivery path.
-# The muse worker drops a doorbell whose Enter lands before its text is
-# visible, so its rings go through fm_task_inbox_ring_muse (one literal plus
-# a separate Enter, never a clear); every other harness keeps the shared
-# submit path unchanged. A muse ring holds the per-record ring lock across
-# the whole delivery so two rings racing the same empty composer cannot both
-# type: the loser waits out the winner's window and reconciles instead.
+# A separate-Enter harness (see above) rings through fm_task_inbox_ring_muse
+# (one literal plus a separate Enter, never a clear); every other harness
+# keeps the shared submit path unchanged. The only interrupt any ring sends
+# is the agy queued-wedge recovery inside the submit path below, which owns
+# its agy-only gate and its interrupt-or-nothing discipline. A separate-Enter
+# ring holds the per-record ring lock across the whole delivery so two rings
+# racing the same empty composer cannot both type: the loser waits out the
+# winner's window and reconciles instead.
 # A lock the winner orphaned by dying fails safe: the waiter times out,
 # defers, and the ladder escalates on schedule.
 fm_task_inbox_ring() {  # <backend> <target> <record-path> [expected-label]
   local dir rc
-  if [ "${FM_COMPOSER_HARNESS:-}" != muse ]; then
+  if ! fm_task_inbox_separate_enter_harness; then
     fm_task_inbox_ring_submit "$@"
     return
   fi

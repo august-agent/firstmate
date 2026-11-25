@@ -89,6 +89,12 @@
 #                different, self-proving thing: real claude 2.x draws exactly
 #                that (`─` rule, `❯`+NBSP, `─` rule), so the glyph inside the
 #                pair carries the shape and no identity is needed.
+#                agy draws the same pair around a bare SHELL `>` prompt row,
+#                which never self-proves: only a live agy identity (herdr
+#                native, tmux foreground process) plus the pinned idle row
+#                with no background task count as the last non-blank row
+#                reads the stripped pair empty, and any other content reads
+#                pending.
 #
 # THE COMPOSER FOOTER ZONE (task firstmate-doorbell-vals-pending-p1): a
 # harness draws its own furniture BELOW the composer - a user statusLine, a
@@ -254,6 +260,82 @@ fm_composer_normalize_trim_var() {  # <varname>
 # read exactly as it was before kiro existed.
 fm_composer_kiro_scope() {
   [ "${FM_COMPOSER_HARNESS:-}" = kiro ]
+}
+
+# fm_composer_agy_scope: 0 when the caller has named the pane's harness as agy
+# through FM_COMPOSER_HARNESS. It turns on only the agy-only extractor strip
+# (one leading `>` off the prompt row of a separated pair); the `empty`
+# verdict itself stays identity-gated in _fm_composer_pi_verdict, so a dead
+# shell in an agy task can never read empty. Callers that know their target's
+# recorded harness set it for their reads (bin/fm-send.sh, bin/fm-control.sh,
+# the watcher's and process-event re-rings); an unset or other value leaves
+# every read exactly as it was before agy existed.
+fm_composer_agy_scope() {
+  [ "${FM_COMPOSER_HARNESS:-}" = agy ]
+}
+
+# The exact vendor text of an agy input row queued behind a turn. It is the
+# one transcript-shaped row the footer walk below tolerates, because the
+# live TUI renders it between the composer and the status row while a
+# queued message waits. Matched as a fixed string, never as a pattern.
+FM_COMPOSER_AGY_QUEUED_TEXT='Press up to edit queued messages'
+
+# fm_composer_agy_idle_proven: 0 when <screen> shows agy's composer pair
+# selected with the pinned idle status row as the last non-blank row - the
+# `? for shortcuts` cell opening that row, its model cell after it, no
+# nonzero background task count on it - and with nothing between the pair's
+# closing separator and that row but blank rows or the queued row above.
+# This is the positive idle proof the agy `empty` verdict and the
+# queued-wedge recovery both require. No busy footer can ever prove a worker
+# is NOT running (a missing or changed token reads exactly like an idle
+# one), a transcript echo of the token anywhere but the pinned last row
+# proves nothing either, a bare echo with no model cell is transcript, a
+# row carrying `N task(s)` proves the opposite - the worker is legitimately
+# waiting on its own background job - and any intervening transcript row
+# between the pair and the footer proves the pair is stale scrollback. The
+# TUI pins its status row at the viewport bottom, so anything below it is
+# transcript, and nothing legitimate renders after it. Reads the
+# ANSI-preserving screen and strips styling itself, so callers pass whatever
+# capture they hold. Runs its own scan and cursorless selection, so it
+# decides the same way from the verdict path (which scanned already) and
+# from callers that never scanned.
+fm_composer_agy_idle_proven() {  # <screen>
+  local screen=$1 plain last last_idx r row
+  plain=$(printf '%s\n' "$screen" | fm_composer_strip_ansi)
+  _fm_composer_scan_screen "$plain" ''
+  _fm_composer_select_cursorless "$plain" "$screen" 0 || return 1
+  [ "$FM_COMPOSER_SELECTED_KIND" = pi ] || return 1
+  last_idx=0
+  r=0
+  while IFS= read -r row; do
+    fm_composer_normalize_trim_var row
+    [ -n "$row" ] && last_idx=$r
+    r=$((r + 1))
+  done <<EOF
+$plain
+EOF
+  [ "$last_idx" -gt "$FM_COMPOSER_SCAN_PI_CLOSE" ] || return 1
+  last=$(_fm_composer_screen_row "$last_idx" "$plain")
+  fm_composer_normalize_trim_var last
+  # The pinned row opens with the cell and always carries its model cell
+  # after it; a bare echoed token with nothing after it is transcript, not
+  # the footer.
+  case "$last" in
+    '? for shortcuts'*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$last" | grep -qE '^\? for shortcuts[[:space:]]+[^[:space:]]' || return 1
+  printf '%s\n' "$last" | grep -qE '[1-9][0-9]* task\(s\)' && return 1
+  r=$((FM_COMPOSER_SCAN_PI_CLOSE + 1))
+  while [ "$r" -lt "$last_idx" ]; do
+    row=$(_fm_composer_screen_row "$r" "$plain")
+    fm_composer_normalize_trim_var row
+    if [ -n "$row" ] && [ "$row" != "$FM_COMPOSER_AGY_QUEUED_TEXT" ]; then
+      return 1
+    fi
+    r=$((r + 1))
+  done
+  return 0
 }
 
 # fm_composer_strip_ghost: the ONE fleet-wide ANSI-aware extractor of "real typed
@@ -2203,6 +2285,20 @@ EOF
           leading_blank=0
         fi
         ;;
+      pi)
+        # The agy prompt row opens with the shell `>` glyph, which is not
+        # content: strip one off the first pair row so the holds-check reads
+        # the typed line back, mirroring _fm_composer_classify_agy_rows. The
+        # agy scope (not identity) gates this because the extractor never
+        # receives the identity probe result, and the strip can only ever
+        # move a holds-check toward refusing - a wrongly stripped row simply
+        # matches nothing - never toward a false empty.
+        if fm_composer_agy_scope && [ "$row" -eq "$FM_COMPOSER_SELECTED_FIRST" ] \
+           && fm_composer_leading_shell_glyph_var glyph "$content" \
+           && [ "$glyph" = '>' ]; then
+          content=${content#"$glyph"}
+        fi
+        ;;
       box)
         if [ "$prompt_row" -lt 0 ] \
            && fm_composer_leading_prompt_glyph_var glyph "$content"; then
@@ -2577,6 +2673,34 @@ _fm_composer_classify_bare_pi_overlap() {  # <screen> <styled> <has-identity> <i
 # is drawn above the separator pair, so the composer region looks free while the
 # keys would answer the prompt instead of composing (issue #2797). Structure
 # cannot disprove that, so a blocked pi defers rather than claiming empty.
+# The agy separated-shape rows: like the pi pair, but the live prompt row
+# opens with agy's bare shell `>` glyph, which is not content. Strip one
+# leading `>` off the FIRST pair row only, so the bare prompt reads blank
+# while any typed text - on that row or a wrapped row below it - still reads
+# pending. A first row that leads with anything else is real content, and a
+# `>` stranded anywhere but first is typed text too, so neither is stripped.
+_fm_composer_classify_agy_rows() {  # <screen> <styled>
+  local screen=$1 styled=$2 row raw content glyph
+  row=$((FM_COMPOSER_SCAN_PI_OPEN + 1))
+  while [ "$row" -lt "$FM_COMPOSER_SCAN_PI_CLOSE" ]; do
+    raw=$(_fm_composer_screen_row "$row" "$screen")
+    content=$(_fm_composer_row_content "$raw" "$styled")
+    fm_composer_normalize_trim_var content
+    if [ "$row" -eq "$((FM_COMPOSER_SCAN_PI_OPEN + 1))" ] \
+      && fm_composer_leading_shell_glyph_var glyph "$content" \
+      && [ "$glyph" = '>' ]; then
+      content=${content#"$glyph"}
+      fm_composer_normalize_trim_var content
+    fi
+    if [ -n "$content" ]; then
+      printf 'pending'
+      return 0
+    fi
+    row=$((row + 1))
+  done
+  printf 'empty'
+}
+
 _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
   local screen=$1 styled=$2 has_identity=$3 identity=$4 agent agent_status state
   if [ "$has_identity" != 1 ]; then
@@ -2593,6 +2717,29 @@ _fm_composer_pi_verdict() {  # <screen> <styled> <has_identity> <identity>
   fi
   agent=${identity%%$'\t'*}
   agent_status=${identity#*$'\t'}
+  # agy is the third verified owner of the separated shape: a borderless bare
+  # `>` prompt row between two full-width rules (verified live, agy 1.2.0),
+  # which the dead-shell rule would otherwise always read unknown. The live
+  # identity above is what keeps that rule honest: a pane whose agent died to
+  # a shell has no agy foreground process and stays unknown. Proven input
+  # stays pending for every live agy state, while only a positively idle agy -
+  # live identity, an idle status, AND the pinned idle row with no background
+  # task count as the last non-blank row - proves an empty composer. Absence
+  # of a busy footer alone never does, and neither does a transcript echo of
+  # the footer token anywhere but that pinned last row.
+  if [ "$agent" = agy ]; then
+    [ "$FM_COMPOSER_SCAN_PI_PAIR_VALID" = 1 ] || { printf 'unknown'; return 0; }
+    state=$(_fm_composer_classify_agy_rows "$screen" "$styled")
+    if [ "$state" = pending ]; then
+      printf 'pending'
+      return 0
+    fi
+    case "$agent_status" in
+      idle) fm_composer_agy_idle_proven "$screen" && printf 'empty' || printf 'unknown' ;;
+      *) printf 'unknown' ;;
+    esac
+    return 0
+  fi
   # polytoken is the second verified owner of the separated shape (verified
   # live, 0.8.19: a full-width separator pair over one blank or pending
   # content row with a footer below), so its identity passes the same

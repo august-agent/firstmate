@@ -1457,6 +1457,23 @@ fm_backend_composer_state() {  # <backend> <target> [expected-label] -> empty|pe
   esac
 }
 
+# fm_backend_rendered_busy_state: busy|idle|unknown from the pane's rendered
+# busy footer - the same delivery-only signal the submit cores consume. This
+# is NOT a worker-state source: each backend's native agent-state stays the
+# semantic owner. Backends with no rendered-footer read answer unknown, which
+# every caller treats as unproven rather than idle.
+fm_backend_rendered_busy_state() {  # <backend> <target> [harness] -> busy|idle|unknown
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || { printf 'unknown'; return 0; }
+  case "$backend" in
+    tmux) fm_pane_busy_state "$@" ;;
+    herdr) fm_backend_herdr_rendered_busy_state "$@" ;;
+    rex) fm_backend_rex_rendered_busy_state "$@" ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # fm_backend_target_exists: cheap, READ-ONLY existence check - does the
 # recorded TARGET endpoint still exist on BACKEND? Never starts a server or
 # session: for herdr this deliberately queries the pane directly instead of
