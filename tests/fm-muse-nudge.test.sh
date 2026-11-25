@@ -224,7 +224,7 @@ test_muse_nudge_next_strike_matrix() {
   got=$(muse_nudge_next_strike 3 4 5 6 0)
   [ "$got" = 0 ] || fail "no strike below rung 4 should fire nothing, got $got"
   got=$(muse_nudge_next_strike 5 4 5 6 0)
-  [ "$got" = 0 ] || fail "no strike past rung 4 must not re-fire strike 1, got $got"
+  [ "$got" = 1 ] || fail "a late first rung must still start the ladder, got $got"
   got=$(muse_nudge_next_strike 5 4 5 6 1)
   [ "$got" = 2 ] || fail "strike 1 on rung 5 should fire strike 2, got $got"
   got=$(muse_nudge_next_strike 4 4 5 6 1)
@@ -359,6 +359,48 @@ test_muse_nudge_tick_needs_quiet_window() {
   pass "muse nudge: a recent write vetoes the strike"
 }
 
+test_muse_nudge_veto_then_late_start() {
+  local rc rec
+  setup_nudge_case latestart
+  : > "$NUDGE_DIR/wt/fresh.txt"
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
+  rc=$?
+  expect_code 1 "$rc" "a vetoed first rung should not strike"
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "a vetoed first rung should write nothing"
+  rm -f "$NUDGE_DIR/wt/fresh.txt"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 0 "$rc" "the first eligible rung should start the ladder late, got rc $rc"
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  [ "$rec" = "001.msg" ] || fail "the late start should write the first steer, got $rec"
+  pass "muse nudge: a vetoed rung yields to a later first strike"
+}
+
+test_muse_nudge_ack_no_resteer() {
+  local rc rec
+  setup_nudge_case noreresteer
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA
+  rc=$?
+  expect_code 0 "$rc" "strike 1 should fire on rung 4, got rc $rc"
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  [ -n "$rec" ] || fail "strike 1 should record its steer"
+  mkdir -p "$STATE/t1.inbox/handled"
+  mv "$STATE/t1.inbox/$rec" "$STATE/t1.inbox/handled/"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "an acknowledged steer should reset the ladder"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  rc=$?
+  expect_code 1 "$rc" "an acknowledged steer must not earn an immediate re-steer, got rc $rc"
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "no re-steer should be recorded"
+  touch -d "@$(( $(date +%s) - 3600 ))" "$STATE/t1.inbox/handled/$rec"
+  muse_nudge_tick sess:fm-t1 t1 6 hAAA
+  rc=$?
+  expect_code 0 "$rc" "an old acknowledgement should allow a fresh steer, got rc $rc"
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  [ "$rec" = "002.msg" ] || fail "the fresh steer should take the next sequence, got $rec"
+  pass "muse nudge: an acknowledged steer never earns an immediate re-steer"
+}
+
 test_muse_nudge_tick_corrupt_state_fails_safe() {
   setup_nudge_case corruptstate
   mkdir -p "$STATE/t1.inbox"
@@ -402,7 +444,7 @@ test_muse_nudge_strike_two_async_then_steer() {
   pass "muse nudge: strike 2 interrupts in the background, then steers"
 }
 
-test_muse_nudge_strike_two_failure_reverts() {
+test_muse_nudge_strike_two_failure_advances() {
   local rc got
   setup_nudge_case interruptfail
   muse_nudge_tick sess:fm-t1 t1 4 hAAA >/dev/null
@@ -412,10 +454,12 @@ test_muse_nudge_strike_two_failure_reverts() {
   wait_for_action_rc "$STATE/t1.inbox" || fail "the failed interrupt should record its outcome"
   muse_nudge_poll sess:fm-t1 t1 1 hAAA
   got=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f1,2,4)
-  [ "$got" = "1|001.msg|15" ] || fail "a failed interrupt should hold at strike 1, got $got"
-  [ "$(grep -c "CONTROL:" "$NUDGE_DIR/control.log")" = 1 ] \
-    || fail "a failed interrupt must not be replayed by collection"
-  pass "muse nudge: a failed interrupt holds the ladder"
+  [ "$got" = "2|001.msg|15" ] || fail "a failed interrupt should advance, not rewind, got $got"
+  muse_nudge_tick sess:fm-t1 t1 6 hAAA >/dev/null
+  muse_nudge_tick sess:fm-t1 t1 7 hAAA >/dev/null
+  [ "$(grep -c "CONTROL:.*interrupt" "$NUDGE_DIR/control.log")" = 1 ] \
+    || fail "a failed interrupt must never be re-issued on later rungs"
+  pass "muse nudge: a failed interrupt advances without replay"
 }
 
 test_muse_nudge_strike_two_unknown_proceeds() {
@@ -663,6 +707,37 @@ test_muse_nudge_strike_three_waits_for_live_action() {
   pass "muse nudge: strike 3 waits for a live action"
 }
 
+test_muse_nudge_anchor_fallback_chain() {
+  local old_path anchor mtime now
+  setup_nudge_case anchorfallback
+  anchor=$(muse_nudge_anchor_since 900)
+  [ -n "$anchor" ] || fail "the anchor helper should produce a file"
+  now=$(date +%s)
+  mtime=$(fm_path_mtime "$anchor" 2>/dev/null || echo 0)
+  [ "$mtime" -le $(( now - 890 )) ] && [ "$mtime" -ge $(( now - 910 )) ] \
+    || fail "the anchor should be about 900s old, got $mtime vs $now"
+  rm -f "$anchor"
+  old_path=$PATH
+  mkdir -p "$NUDGE_DIR/nosuchtools"
+  printf '#!/bin/sh\nexit 1\n' > "$NUDGE_DIR/nosuchtools/touch"
+  chmod +x "$NUDGE_DIR/nosuchtools/touch"
+  export PATH="$NUDGE_DIR/nosuchtools:$PATH"
+  anchor=$(muse_nudge_anchor_since 900) \
+    || fail "the perl fallback should cover a touch without -d support"
+  now=$(date +%s)
+  mtime=$(fm_path_mtime "$anchor" 2>/dev/null || echo 0)
+  [ "$mtime" -le $(( now - 890 )) ] && [ "$mtime" -ge $(( now - 910 )) ] \
+    || fail "the perl-set anchor should be about 900s old, got $mtime vs $now"
+  rm -f "$anchor"
+  printf '#!/bin/sh\nexit 1\n' > "$NUDGE_DIR/nosuchtools/perl"
+  chmod +x "$NUDGE_DIR/nosuchtools/perl"
+  if muse_nudge_anchor_since 900 2>/dev/null; then
+    fail "with no working setter the anchor should fail closed"
+  fi
+  export PATH="$old_path"
+  pass "muse nudge: the anchor helper falls back from touch to perl to failure"
+}
+
 test_muse_nudge_timeout_kills_action() {
   local sleeper tries
   setup_nudge_case timeoutkill
@@ -698,6 +773,31 @@ test_muse_nudge_collect_empty_rc() {
   pass "muse nudge: an empty result file is not a result"
 }
 
+test_muse_nudge_ack_during_inflight() {
+  local rec
+  setup_nudge_case ackinflight
+  muse_nudge_tick sess:fm-t1 t1 4 hAAA >/dev/null
+  rec=$(muse_nudge_read "$(muse_nudge_file "$STATE" t1)" | cut -d'|' -f2)
+  export FM_CONTROL_BIN="$NUDGE_DIR/control-gate"
+  export FM_CONTROL_GATE="$NUDGE_DIR/gate"
+  rm -f "$NUDGE_DIR/gate"
+  muse_nudge_tick sess:fm-t1 t1 5 hAAA
+  : > "$NUDGE_DIR/send.log"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  mkdir -p "$STATE/t1.inbox/handled"
+  mv "$STATE/t1.inbox/$rec" "$STATE/t1.inbox/handled/"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  [ ! -e "$(muse_nudge_file "$STATE" t1)" ] || fail "an ack must reset the ladder even mid-flight"
+  [ -e "$STATE/t1.inbox/.muse-nudge-action-pid" ] || fail "the in-flight action must keep its tracking"
+  [ ! -s "$NUDGE_DIR/send.log" ] || fail "no follow-up steer may go out without a strike on file"
+  : > "$NUDGE_DIR/gate"
+  wait_for_action_rc "$STATE/t1.inbox" || fail "the orphaned action should still report"
+  muse_nudge_poll sess:fm-t1 t1 1 hAAA
+  assert_contains "$(cat "$TRIAGE_LOG")" "late action outcome" "a late outcome should be logged, not acted on"
+  [ ! -e "$STATE/t1.inbox/.muse-nudge-action-rc" ] || fail "a collected late outcome should be cleared"
+  pass "muse nudge: an ack during flight resets the strike but tracks the action"
+}
+
 test_muse_nudge_strike_two_persistence_first() {
   setup_nudge_case persistfirst
   muse_nudge_write "$STATE" t1 1 001.msg "" 15 || fail "setup write should succeed"
@@ -721,15 +821,18 @@ test_muse_nudge_tick_strike_one
 test_muse_nudge_tick_below_threshold
 test_muse_nudge_tick_disabled
 test_muse_nudge_tick_needs_quiet_window
+test_muse_nudge_veto_then_late_start
+test_muse_nudge_ack_no_resteer
 test_muse_nudge_tick_corrupt_state_fails_safe
 test_muse_nudge_strike_two_async_then_steer
-test_muse_nudge_strike_two_failure_reverts
+test_muse_nudge_strike_two_failure_advances
 test_muse_nudge_strike_two_unknown_proceeds
 test_muse_nudge_poll_waits_out_busy_and_drafts
 test_muse_nudge_poll_followup_reguarded
 test_muse_nudge_strike_three_relaunches_once
 test_muse_nudge_poll_resets
 test_muse_nudge_strike_two_persistence_first
+test_muse_nudge_ack_during_inflight
 test_muse_nudge_tick_skips_inflight
 test_muse_nudge_action_timeout_unknown
 test_muse_nudge_gated_control_never_blocks
@@ -737,6 +840,7 @@ test_muse_nudge_worktree_uninspectable_vetoes
 test_muse_nudge_collect_generation
 test_muse_nudge_followup_wait_evidence
 test_muse_nudge_strike_three_waits_for_live_action
+test_muse_nudge_anchor_fallback_chain
 test_muse_nudge_timeout_kills_action
 test_muse_nudge_collect_empty_rc
 test_muse_nudge_strike_three_collected

@@ -136,11 +136,27 @@ muse_nudge_action_timeout() {
 muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
   local state=$1 task=$2 dir pid started gen
   dir=$(fm_task_inbox_dir "$state" "$task")
+  # Never overlap control actions: a still-running recorded action blocks a
+  # new spawn, whatever the strike file says, so an in-flight verb is never
+  # orphaned by a fresh reservation.
+  if muse_nudge_action_alive "$dir"; then
+    triage_log "muse auto-nudge: a control action is already running for $task; not starting another"
+    return 1
+  fi
   muse_nudge_action_clear "$dir" || true
   shift 2
   gen="$(date +%s)-$$-$RANDOM$RANDOM"
   (
-    "$@" >"$dir/.muse-nudge-action-out" 2>&1
+    # Own process group when the platform allows it, so a timeout can stop
+    # the whole tree and not just the waiting shell.
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$@" >"$dir/.muse-nudge-action-out" 2>&1 &
+    else
+      "$@" >"$dir/.muse-nudge-action-out" 2>&1 &
+    fi
+    cpid=$!
+    printf '%s\n' "$cpid" >"$dir/.muse-nudge-action-cpid" 2>/dev/null
+    wait "$cpid"
     status=$?
     printf '%s %s\n' "$gen" "$status" >"$dir/.muse-nudge-action-tmp.$gen" 2>/dev/null \
       && mv "$dir/.muse-nudge-action-tmp.$gen" "$dir/.muse-nudge-action-rc"
@@ -151,7 +167,7 @@ muse_nudge_spawn() {  # <state-dir> <task-id> <verb> [verb-args...]
     printf '%s\n' "$pid"
     printf '%s\n' "$started"
     printf '%s\n' "$gen"
-  } >"$dir/.muse-nudge-action-pid" 2>/dev/null || return 1
+  } >"$dir/.muse-nudge-action-pid" 2>/dev/null || { kill "$pid" 2>/dev/null; return 1; }
 }
 
 # 0 when the recorded action pid is still the process that was spawned (the
@@ -171,7 +187,7 @@ muse_nudge_action_alive() {  # <inbox-dir>
 # Drop every action outcome file for a task, including orphaned per-generation
 # temp files a killed action may have left behind.
 muse_nudge_action_clear() {  # <inbox-dir>
-  rm -f "$1"/.muse-nudge-action-tmp.* "$1/.muse-nudge-action-rc" "$1/.muse-nudge-action-out" "$1/.muse-nudge-action-pid" 2>/dev/null
+  rm -f "$1"/.muse-nudge-action-tmp.* "$1"/.muse-nudge-action-rc "$1"/.muse-nudge-action-out "$1"/.muse-nudge-action-pid "$1"/.muse-nudge-action-cpid 2>/dev/null
 }
 
 # Drop strike state. Absent state is already clean.
@@ -227,7 +243,7 @@ muse_nudge_next_strike() {  # <n> <s1> <s2> <s3> <file-strike>
   local n=$1 s1=$2 s2=$3 s3=$4 strike=${5:-0}
   case "$strike" in
     3) printf 0 ;;
-    0) [ "$n" = "$s1" ] && printf 1 || printf 0 ;;
+    0) [ "$n" -ge "$s1" ] && printf 1 || printf 0 ;;
     1) [ "$n" -ge "$s2" ] && printf 2 || printf 0 ;;
     2) [ "$n" -ge "$s3" ] && printf 3 || printf 0 ;;
     *) printf 0 ;;
@@ -257,13 +273,51 @@ muse_nudge_do_steer() {  # <window> <task> <text>
   printf '%s' "${rec##*/}"
 }
 
+# Print a state-dir anchor file with the given age in seconds, for -newer
+# comparisons. Prefers touch -d "@epoch"; falls back to perl utime where
+# touch lacks that syntax, and fails closed when neither works.
+muse_nudge_anchor_since() {  # <idle-secs> -> prints path
+  local idle=$1 now anchor
+  now=$(date +%s)
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  anchor=$(mktemp "$STATE/.muse-nudge-anchor.XXXXXX" 2>/dev/null) || return 1
+  if touch -d "@$(( now - idle ))" "$anchor" 2>/dev/null; then
+    printf '%s' "$anchor"
+    return 0
+  fi
+  if command -v perl >/dev/null 2>&1 \
+    && perl -e 'utime $ARGV[0], $ARGV[0], $ARGV[1]' "$(( now - idle ))" "$anchor" 2>/dev/null \
+    && perl -e 'my @s = stat($ARGV[0]); exit(@s and $s[9] == $ARGV[1] ? 0 : 1);' "$anchor" "$(( now - idle ))" 2>/dev/null; then
+    printf '%s' "$anchor"
+    return 0
+  fi
+  rm -f "$anchor"
+  return 1
+}
+
+# 0 when the task acknowledged a steer within the last <idle-secs> seconds.
+# After a vetoed rung the ladder starts on the first eligible rung; without
+# this check an acknowledged steer would earn an immediate re-steer on the
+# next rung. A handled/ record is the acknowledgement: only the worker's own
+# ack moves a record there.
+muse_nudge_recently_acked() {  # <task> <idle-secs>
+  local task=$1 idle=$2 dir anchor hit
+  [ -n "$task" ] || return 1
+  dir=$(fm_task_inbox_dir "$STATE" "$task")
+  [ -d "$dir/handled" ] || return 1
+  anchor=$(muse_nudge_anchor_since "$idle") || return 1
+  hit=$(find "$dir/handled" -maxdepth 1 -type f -name '*.msg' -newer "$anchor" -print -quit 2>/dev/null || true)
+  rm -f "$anchor"
+  [ -n "$hit" ]
+}
+
 # 0 when the task worktree shows no writes in the last <idle-secs> seconds.
 # The wedge rung proves idleness only since the rung timer restarted, while
 # its count survives write deferrals, so a strike additionally requires a
 # continuous quiet window. Fails closed: an anchor that cannot be set or a
 # worktree that cannot be read skips the strike.
 muse_nudge_worktree_quiet() {  # <task> <idle-secs> -> 0 quiet, 1 writes, 2 uninspectable
-  local task=$1 idle=$2 wt kind now anchor hit bound maxdepth names name rc
+  local task=$1 idle=$2 wt kind anchor hit bound maxdepth names name rc
   local -a prune=()
   [ -n "$task" ] || return 2
   wt=$(grep '^worktree=' "$STATE/$task.meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
@@ -273,13 +327,7 @@ muse_nudge_worktree_quiet() {  # <task> <idle-secs> -> 0 quiet, 1 writes, 2 unin
   if [ -e "$wt/.fm-secondmate-home" ] || [ -L "$wt/.fm-secondmate-home" ]; then
     return 2
   fi
-  now=$(date +%s)
-  case "$now" in ''|*[!0-9]*) return 2 ;; esac
-  anchor=$(mktemp "$STATE/.muse-nudge-anchor.XXXXXX" 2>/dev/null) || return 2
-  if ! touch -d "@$(( now - idle ))" "$anchor" 2>/dev/null; then
-    rm -f "$anchor"
-    return 2
-  fi
+  anchor=$(muse_nudge_anchor_since "$idle") || return 2
   read -r -a names <<< "$FM_WORKTREE_WRITE_PRUNE"
   for name in ${names[@]+"${names[@]}"}; do
     [ "${#prune[@]}" -eq 0 ] || prune+=( -o )
@@ -365,6 +413,13 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
   fi
   next=$(muse_nudge_next_strike "$n" "$s1" "$s2" "$s3" "$strike")
   [ "$next" != 0 ] || return 1
+  # A first strike on a later rung is a late start after a veto, not a
+  # re-steer: skip it when the worker acknowledged a steer within the
+  # window, so an ack never earns an immediate duplicate.
+  if [ "$next" = 1 ] && muse_nudge_recently_acked "$task" "$idle"; then
+    triage_log "muse auto-nudge holding strike 1 for $task: steer acknowledged within the window"
+    return 1
+  fi
   # Never overlap control actions: an in-flight interrupt is collected by
   # the poll path first, which advances the ladder once its outcome lands.
   [ "$pending" != inflight ] || return 1
@@ -400,7 +455,7 @@ muse_nudge_tick() {  # <window> <task> <escalation-count> <pane-hash>
 # with no result, or one older than the action timeout, reconciles as unknown
 # without replaying the verb; a live one keeps waiting. Always reports 0.
 muse_nudge_collect() {  # <inbox-dir>
-  local dir=$1 rc rcgen pidgen timeout now mtime
+  local dir=$1 rc rcgen pidgen timeout now mtime pid cpid
   dir=${dir%/}
   if [ -f "$dir/.muse-nudge-action-rc" ]; then
     rc=$(cat "$dir/.muse-nudge-action-rc" 2>/dev/null || true)
@@ -423,13 +478,17 @@ muse_nudge_collect() {  # <inbox-dir>
     now=$(date +%s)
     mtime=$(fm_path_mtime "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$mtime$now" in ''|*[!0-9]*) ;; *) [ $(( now - mtime )) -le "$timeout" ] && return 0 ;; esac
-    # Timed out while verifiably alive: signal it to stop before releasing
-    # the ladder, so a late delivery is unlikely to land on a worker this
-    # ladder no longer tracks. Best effort only; an unkillable survivor is
-    # accepted as a documented residual (an interrupt landing late on an
-    # idle worker cancels nothing, and a spent relaunch never re-fires).
-    # The ladder still advances as unknown rather than stalling on a stuck
-    # control plane.
+    # Timed out while verifiably alive: stop the whole process group before
+    # releasing the ladder, so a late delivery cannot land on a worker this
+    # ladder no longer tracks. The group id is the control child's pid, which
+    # setsid made a group leader; without setsid it is just the child and
+    # the group kill fails closed into the plain wrapper kill below it.
+    # Best effort only: an unkillable survivor is accepted as a documented
+    # residual (an interrupt landing late on an idle worker cancels nothing,
+    # and a spent relaunch never re-fires). The ladder still advances as
+    # unknown rather than stalling on a stuck control plane.
+    cpid=$(sed -n '1p' "$dir/.muse-nudge-action-cpid" 2>/dev/null || true)
+    case "$cpid" in ''|*[!0-9]*) : ;; *) kill -TERM -- "-$cpid" 2>/dev/null || true ;; esac
     pid=$(sed -n '1p' "$dir/.muse-nudge-action-pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*) : ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
     muse_nudge_action_clear "$dir"
@@ -451,7 +510,19 @@ muse_nudge_poll() {  # <window> <task> <idle-now> <pane-hash>
   local win=$1 task=$2 idle_now=$3 hash=$4 file next strike rec pending mins old dir handled outcome
   [ -n "$task" ] || return 0
   file=$(muse_nudge_file "$STATE" "$task")
-  [ -e "$file" ] || return 0
+  if [ ! -e "$file" ]; then
+    # No strike on file, but a control action may still be in flight after an
+    # acknowledgement or terminal reset cleared it: keep collecting until the
+    # outstanding generation lands, without authorizing anything new.
+    dir=$(fm_task_inbox_dir "$STATE" "$task")
+    if [ -f "$dir/.muse-nudge-action-pid" ] || [ -f "$dir/.muse-nudge-action-rc" ]; then
+      outcome=$(muse_nudge_collect "$dir")
+      case "$outcome" in
+        done:*|unknown) triage_log "muse auto-nudge: late action outcome $outcome for $task with no strike pending" ;;
+      esac
+    fi
+    return 0
+  fi
   [ "$(window_harness "$win")" = muse ] || return 0
   if stale_is_terminal "$win" "$STATE"; then muse_nudge_clear "$STATE" "$task"; return 0; fi
   if next=$(muse_nudge_read "$file" 2>/dev/null); then
@@ -493,8 +564,12 @@ muse_nudge_poll() {  # <window> <task> <idle-now> <pane-hash>
         triage_log "muse auto-nudge strike 2/3: interrupt confirmed for $task"
         ;;
       done:*)
-        muse_nudge_write "$STATE" "$task" 1 "$rec" "" "$mins" || return 0
-        triage_log "muse auto-nudge strike 2/3: interrupt failed for $task ($outcome); ladder holds at strike 1"
+        # A failed interrupt still consumed strike 2: the verb may have been
+        # delivered before verification failed, so re-issuing it on every
+        # rung would loop forever. Advance exactly like an unknown outcome
+        # instead of dropping back to strike 1.
+        muse_nudge_write "$STATE" "$task" 2 "$rec" 1 "$mins" || return 0
+        triage_log "muse auto-nudge strike 2/3: interrupt failed for $task ($outcome); proceeding without replay"
         ;;
       unknown)
         muse_nudge_write "$STATE" "$task" 2 "$rec" 1 "$mins" || return 0
