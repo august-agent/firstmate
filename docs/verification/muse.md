@@ -218,6 +218,19 @@ a4kill   blocks=rules_file,workspace_identity,security_mode,skills_catalog,sessi
 
 The `tui.foreign_context_notice_shown` flag in `settings.json` suppresses only the notice, never the loading, so a quiet later launch is not evidence of a clean context.
 
+### Auto-nudge on idle lanes (2026-11-25)
+
+A muse lane that proves another wedge-escalation rung past FM_MUSE_NUDGE_IDLE_SECS (default 900) of uninterrupted idleness earns at most one strike per rung: strike 1 steers, strike 2 interrupts and steers once the lane reads idle with a clear composer (never in the same step), strike 3 relaunches with a generated progress note and spends the ladder.
+The ladder is additive: counting, waking, and timer resets proceed exactly as without it, and the strike state is a durable per-task file in the task inbox directory that survives watcher restarts.
+A strike never fires for a paused, terminal, actively-working, captain-held, or secondmate lane, or while a captain call is open.
+An acknowledged steer, a terminal task, or a spent ladder whose episode ended resets the ladder.
+Fourteen behavior checks pin the rung math, the pure strike selection, the guard matrix, the steer text and relaunch note, and every strike and poll transition.
+
+```
+$ bash bin/fm-test-run.sh tests/fm-muse-nudge.test.sh
+FM_TEST_SUMMARY total=1 failed=0 skipped_gate=0
+```
+
 ### Composer rendering
 
 Captured with `tmux capture-pane -p -e`:

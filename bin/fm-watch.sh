@@ -293,6 +293,11 @@ WATCH_HOME_EXISTED=0
 # (inbox_steer_check below).
 # shellcheck source=bin/fm-task-inbox-lib.sh
 . "$SCRIPT_DIR/fm-task-inbox-lib.sh"
+# Muse auto-nudge ladder: bin/fm-muse-nudge-lib.sh owns strike selection,
+# guards, and actions; the wedge-escalation and per-poll call sites below
+# own when each runs.
+# shellcheck source=bin/fm-muse-nudge-lib.sh
+. "$SCRIPT_DIR/fm-muse-nudge-lib.sh"
 # The away-posture record (state/.afk-contract) is the posture in both the
 # attended and the afk session; bin/fm-afk-contract.sh owns its schema and its
 # away-or-quiet reading, which is all this watcher reads (away_record_present
@@ -2257,6 +2262,13 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         prev=$(cat "$escalation_file" 2>/dev/null || true)
         _wedge_cap_int prev "$prev" 0 0
         n=$(( prev + 1 ))
+        # Muse auto-nudge ladder: at most one strike for a guarded muse lane
+        # on this rung. Additive: whatever it reports, the normal path below
+        # counts, wakes, and resets exactly as it would without it. Lanes
+        # with a live model-stream snapshot keep the unmodified path.
+        if [ -z "$stream_snapshot" ]; then
+          muse_nudge_tick "$win" "$task" "$n" "$age" || true
+        fi
         # A stream observation writes its count only after the guarded append,
         # so a close, progress, or replacement during the publication lock wait
         # cannot leave an escalation counted for a wake that never went out.
@@ -4612,6 +4624,10 @@ EOF
     # content cannot suppress stale detection. Read once per window per poll and
     # reused below so a busy verdict is consistent within one cycle.
     if window_is_busy "$w" "$tail40"; then busy_now=0; else busy_now=1; fi
+    # Muse auto-nudge upkeep: ack resets, spent-ladder lapse, and the
+    # strike-2 follow-up steer. Rare-state only: returns at once when the
+    # task holds no strike file.
+    muse_nudge_poll "$w" "$task" "$busy_now"
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"
