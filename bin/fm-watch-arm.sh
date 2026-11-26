@@ -43,7 +43,10 @@
 # stale-beacon or dead-pid holder either self-heals (the fresh child steals the
 # dead lock per the singleton self-eviction/steal path and is confirmed) or this
 # returns the FAILED line. On started it waits the child and propagates the wake
-# reason; on attached it stays live across identity-matched successors.
+# reason; on attached it stays live across identity-matched successors. A
+# verified success - a started or attached watcher with a fresh beacon, or a
+# delivered wake - also retires any recorded auto-arm failure episode, so a
+# manual re-arm that recovers the watcher leaves no stale failure behind.
 #
 # Confirmation is a liveness backstop, not a fork budget: the arm keeps waiting
 # while its child is alive and unconfirmed up to CONFIRM_TIMEOUT (default the
@@ -384,10 +387,25 @@ healthy_watcher() {
   HEALTHY_IDENTITY=$FM_WATCHER_HEALTHY_IDENTITY
 }
 
+# A verified success retires any recorded failure episode, so a manual re-arm
+# that recovers the watcher leaves no stale failure behind for the next Stop
+# to re-report. Best-effort and contention-safe: fm_failure_episode_reset
+# holds only the budget lock, which excludes it across a concurrent
+# attended-alarm commit instead - the alarm then keeps the episode and this
+# arm still succeeds. The presence check keeps homes with no episode from
+# minting lock state.
+note_arm_success() {
+  [ -e "$STATE/.claude-autoarm-failure-notified" ] \
+    || [ -e "$STATE/.claude-autoarm-failure-alarmed" ] \
+    || [ -e "$STATE/.turnend-claude-blocks" ] || return 0
+  fm_failure_episode_reset "$STATE" 2>/dev/null || true
+}
+
 report_attached() {
   local age
   age=$(fm_path_age "$BEAT")
   echo "watcher: attached pid=$HEALTHY_PID (beacon ${age}s)"
+  note_arm_success
 }
 
 # Header, "arm ground removed". Sets ARM_GROUND_MISSING to the first missing
@@ -713,7 +731,7 @@ if [ "$mode" = take-over ]; then
     take_over_cycle "$HEALTHY_PID" "$HEALTHY_IDENTITY"
     case $? in
       0) TAKEN_OVER=1 ;;
-      3) exit 0 ;;
+      3) note_arm_success; exit 0 ;;
     esac
   fi
 fi
@@ -814,6 +832,7 @@ owned_child_finished() {
   if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
     reason_type=$(watch_output_reason_type "$child_out")
     cycle_log_append "$rc" "$signal" "$reason_type" none
+    note_arm_success
     print_watch_output "$child_out"
     rm -f "$child_out" 2>/dev/null || true
     child=
@@ -844,6 +863,7 @@ owned_child_finished() {
     fi
     if close_unobserved_cycle; then
       cycle_log_append "$rc" "$signal" clean-exit-delivered-wake none
+      note_arm_success
       return 0
     fi
     cycle_log_append "$rc" "$signal" unexpected-clean-exit none
@@ -894,6 +914,7 @@ while :; do
       else
         echo "watcher: started pid=$child (beacon fresh)"
       fi
+      note_arm_success
       wait "$child"
       rc=$?
       owned_child_finished "$rc"

@@ -102,7 +102,11 @@
 #     an existing identity-matched watcher and follows its eventual wake.
 #   - Failure handling: an unexpected EXIT while still arming reuses the
 #     remaining attempt budget instead of stranding the claim. Retries wait
-#     one second after the first attempt and two after the second. An
+#     one second after the first attempt and two after the second, growing with
+#     each attempt. A host cycle that exits 0 with output but no wake and no
+#     stand-down reads as slow I/O rather than a broken mechanism, so it earns
+#     its own bounded retries (FM_CLAUDE_AUTOARM_QUIET_ATTEMPTS, default 3) on
+#     top of the hard-failure budget instead of failing the Stop. An
 #     untrappable termination (SIGKILL) is handled by the transport supervisor
 #     or the independent recovery hook, without waiting for another Stop.
 #     A typed failure is rechecked against the same live,
@@ -204,6 +208,16 @@ AUTOARM_ATTEMPTS=${FM_CLAUDE_AUTOARM_ATTEMPTS:-2}
 case "$AUTOARM_ATTEMPTS" in
   1|2|3) : ;;
   *) AUTOARM_ATTEMPTS=2 ;;
+esac
+# Quiet host cycles (exit 0 with output but no wake and no stand-down) retry
+# with backoff inside this bound instead of spending the hard-failure budget
+# above: each one extends the loop by one attempt, and the attempt gate keeps
+# backing off. Zero restores the old behavior of failing after the hard
+# budget; the multi-hour hook timeout bounds the worst case either way.
+AUTOARM_QUIET_ATTEMPTS=${FM_CLAUDE_AUTOARM_QUIET_ATTEMPTS:-3}
+case "$AUTOARM_QUIET_ATTEMPTS" in
+  ''|*[!0-9]*) AUTOARM_QUIET_ATTEMPTS=3 ;;
+  *) AUTOARM_QUIET_ATTEMPTS=$((10#$AUTOARM_QUIET_ATTEMPTS)) ;;
 esac
 
 # shellcheck source=bin/fm-primary-scope-lib.sh
@@ -878,6 +892,7 @@ if fm_supervision_host_enabled "$CONFIG" claude; then
   ACTIONABLE_RE='^(signal:|stale:|check:|heartbeat($|:)|supervision-host:)'
 fi
 attempt=0
+quiet=0
 run_autoarm_attempts() {
   while [ "$attempt" -lt "$AUTOARM_ATTEMPTS" ]; do
     # A superseded owner must not start or attach another watcher or mutate any
@@ -965,6 +980,15 @@ run_autoarm_attempts() {
       # A failed hand-back cannot be dismissed just because its successor
       # watcher is healthy: the close is still undelivered.
       [ "$HOST_RC" -eq 0 ] || break
+      # A quiet host cycle exited 0 with output but no wake and no
+      # stand-down. Slow I/O explains an unobservant cycle, so grant it its
+      # own bounded retry instead of failing the Stop on the hard-failure
+      # budget. The grant extends the loop bound by one per quiet cycle, and
+      # the attempt gate above keeps backing off between the retries.
+      if [ "$quiet" -lt "$AUTOARM_QUIET_ATTEMPTS" ]; then
+        quiet=$((quiet + 1))
+        AUTOARM_ATTEMPTS=$((AUTOARM_ATTEMPTS + 1))
+      fi
     fi
 
     # Health alone cannot deliver a wake. Retry through the arm so it attaches

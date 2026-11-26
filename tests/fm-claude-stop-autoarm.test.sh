@@ -2414,6 +2414,26 @@ printf 'supervision-host: the away session could not take this wake: fixture; re
 for i in 1 2 3 4 5 6 7 8 9 10; do printf 'supervision-host: outcome %s for demo [routine]: fixture %s\n' "$i" "$i"; done
 SH
         ;;
+      slow-quiet-then-boundary)
+        # The first two runs observe nothing (slow I/O), the third delivers.
+        cat <<'SH'
+runs=$(wc -l < "$FM_HOME/state/host-ran" 2>/dev/null | tr -d ' ' || true)
+case "$runs" in ''|*[!0-9]*) runs=0 ;; esac
+if [ "$runs" -lt 3 ]; then
+  sleep 1
+  printf 'host: slow cycle without observation (fixture run %s)\n' "$runs"
+  exit 0
+fi
+printf 'pending:downtime:fixture-generation\n' > "$FM_HOME/state/.watcher-down"
+touch "$FM_HOME/state/.last-watcher-beat"
+printf 'supervision-host: cycle boundary - fixture\n'
+SH
+        ;;
+      always-quiet)
+        cat <<'SH'
+printf 'host: slow cycle without observation (fixture)\n'
+SH
+        ;;
       crash)
         printf 'kill -KILL "$$"\n'
         ;;
@@ -2612,6 +2632,83 @@ test_host_lost_handback_notifies_once_per_episode() {
 test_host_lost_announced_handback_notifies_once_per_episode() {
   assert_host_lost_handback_notifies_once_per_episode lost-announced-handback
   pass "auto-arm: a lost host hand-back on an announced marker notifies once per failure episode"
+}
+
+test_manual_rearm_clears_episode_and_next_stop_succeeds() {
+  local dir out status holder identity manual manual_status i
+  dir=$(make_primary_dir "$TMP_ROOT/manual-rearm")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" failed
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the failing arm must open a failure episode"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "the failing arm did not record outcome=failed, got: $(epoch_outcome "$dir")"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "the failing arm recorded no failure episode"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 2 ] || fail "the failing arm did not exhaust its bounded attempts"
+  # The episode escalates while the mechanism stays down: an attended alarm
+  # and a spent block budget join the notice.
+  : > "$dir/state/.claude-autoarm-failure-alarmed"
+  printf 'session=sess-autoarm\ncount=3\nepoch=9\n' > "$dir/state/.turnend-claude-blocks"
+  # A manual re-arm recovers a healthy watcher: the real arm attaches to the
+  # recorded live holder, which retires the whole episode on verification.
+  cp "$ROOT/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm-real.sh"
+  sleep 60 &
+  holder=$!
+  trap 'kill "$holder" ${manual:+"$manual"} 2>/dev/null || true; fm_test_cleanup' EXIT
+  identity=$(watcher_identity "$dir" "$holder") || fail "could not identify manual-recovery watcher holder"
+  record_watcher_lock "$dir" "$holder" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  FM_HOME="$dir" FM_ARM_ATTACH_POLL=0.1 FM_ARM_SUCCESSOR_CONFIRM_TIMEOUT=2     bash "$dir/bin/fm-watch-arm-real.sh" > "$dir/manual-arm.out" 2>&1 &
+  manual=$!
+  for i in $(seq 1 100); do grep -q '^watcher: attached' "$dir/manual-arm.out" 2>/dev/null && break; sleep 0.1; done
+  grep -q '^watcher: attached' "$dir/manual-arm.out"     || fail "manual re-arm did not attach: $(cat "$dir/manual-arm.out" 2>/dev/null)"
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "manual re-arm left the failure notice"
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "manual re-arm left the attended alarm"
+  assert_absent "$dir/state/.turnend-claude-blocks" "manual re-arm left the spent block budget"
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  wait "$manual"; manual_status=$?
+  [ "$manual_status" -eq 1 ] || fail "manual re-arm did not end when its holder died: $manual_status"
+  trap fm_test_cleanup EXIT
+  # The next Stop arms cleanly and delivers its new wake with no stale episode.
+  write_arm_fixture "$dir" actionable
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the next Stop must deliver its wake after a manual recovery"
+  assert_contains "$out" "stale: fixture-win actionable" "the next Stop lost its wake"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "the next Stop did not commit rewake, got: $(epoch_outcome "$dir")"
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "the next Stop reopened the retired episode"
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "the next Stop reopened the retired alarm"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 3 ] || fail "the next Stop did not arm exactly once more"
+  pass "auto-arm: manual re-arm retires the failure episode and the next Stop succeeds"
+}
+
+test_slow_quiet_host_cycles_retry_within_quiet_bound() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/host-slow-quiet")
+  rm -f "$dir/config/supervision-host-off"
+  : > "$dir/state/task.meta"
+  write_host_fixture "$dir" slow-quiet-then-boundary
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "slow quiet host cycles must be retried until one delivers"
+  assert_contains "$out" "supervision-host: cycle boundary - fixture" "the delivering cycle did not rewake"
+  [ "$(wc -l < "$dir/state/host-ran" | tr -d ' ')" -eq 3 ] || fail "slow quiet cycles were not retried within the quiet bound: $(cat "$dir/state/host-ran" 2>/dev/null)"
+  [ "$(epoch_outcome "$dir")" = rewake ] || fail "slow quiet cycles did not commit rewake, got: $(epoch_outcome "$dir")"
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "retried quiet cycles opened a failure episode"
+  pass "auto-arm: slow quiet host cycles retry within the quiet bound instead of failing"
+}
+
+test_persistently_quiet_host_fails_after_quiet_bound() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/host-always-quiet")
+  rm -f "$dir/config/supervision-host-off"
+  : > "$dir/state/task.meta"
+  write_host_fixture "$dir" always-quiet
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "a persistently quiet host must fail closed"
+  assert_contains "$out" "5 bounded attempts" "a persistently quiet host did not exhaust the hard plus quiet bound"
+  [ "$(wc -l < "$dir/state/host-ran" | tr -d ' ')" -eq 5 ] || fail "a persistently quiet host did not run the bounded cycles: $(cat "$dir/state/host-ran" 2>/dev/null)"
+  [ "$(epoch_outcome "$dir")" = failed ] || fail "a persistently quiet host did not record outcome=failed, got: $(epoch_outcome "$dir")"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "a persistently quiet host recorded no failure episode"
+  pass "auto-arm: a persistently quiet host fails after the hard plus quiet bound"
 }
 
 test_host_crash_is_retried_then_reported() {
@@ -3258,6 +3355,9 @@ test_host_stand_down_is_silent
 test_host_benign_rewake_refusal_opens_no_failure_episode
 test_host_lost_handback_notifies_once_per_episode
 test_host_lost_announced_handback_notifies_once_per_episode
+test_manual_rearm_clears_episode_and_next_stop_succeeds
+test_slow_quiet_host_cycles_retry_within_quiet_bound
+test_persistently_quiet_host_fails_after_quiet_bound
 test_host_crash_is_retried_then_reported
 test_arguments_never_arm
 test_fm_lock_status_still_works_with_shared_lib
