@@ -45,8 +45,10 @@
 # returns the FAILED line. On started it waits the child and propagates the wake
 # reason; on attached it stays live across identity-matched successors. A
 # verified success - a started or attached watcher with a fresh beacon, or a
-# delivered wake - also retires any recorded auto-arm failure episode, so a
-# manual re-arm that recovers the watcher leaves no stale failure behind.
+# delivered wake - also retires the failure notice and spent block budget it
+# observed at startup, so a manual re-arm that recovers the watcher leaves no
+# stale failure behind. The attended alarm is never retired here, and markers
+# that changed since startup are left alone.
 #
 # Confirmation is a liveness backstop, not a fork budget: the arm keeps waiting
 # while its child is alive and unconfirmed up to CONFIRM_TIMEOUT (default the
@@ -387,18 +389,44 @@ healthy_watcher() {
   HEALTHY_IDENTITY=$FM_WATCHER_HEALTHY_IDENTITY
 }
 
-# A verified success retires any recorded failure episode, so a manual re-arm
-# that recovers the watcher leaves no stale failure behind for the next Stop
-# to re-report. Best-effort and contention-safe: fm_failure_episode_reset
-# holds only the budget lock, which excludes it across a concurrent
-# attended-alarm commit instead - the alarm then keeps the episode and this
-# arm still succeeds. The presence check keeps homes with no episode from
-# minting lock state.
+# Snapshot any recorded failure notice and spent block budget at startup, so
+# a verified success only retires the episode it observed: markers that
+# appear or change mid-run belong to a newer episode a concurrent generation
+# is handling, and this arm leaves those alone. Contents (not mtimes) are the
+# fence: a new episode rewrites the marker with its own generation's record.
+EPISODE_SNAP_NOTIFIED=; EPISODE_SNAP_NOTIFIED_SET=0
+EPISODE_SNAP_BLOCKS=; EPISODE_SNAP_BLOCKS_SET=0
+if [ -e "$STATE/.claude-autoarm-failure-notified" ]; then
+  EPISODE_SNAP_NOTIFIED=$(cat "$STATE/.claude-autoarm-failure-notified" 2>/dev/null || true)
+  EPISODE_SNAP_NOTIFIED_SET=1
+fi
+if [ -e "$STATE/.turnend-claude-blocks" ]; then
+  EPISODE_SNAP_BLOCKS=$(cat "$STATE/.turnend-claude-blocks" 2>/dev/null || true)
+  EPISODE_SNAP_BLOCKS_SET=1
+fi
+
+# A verified success retires the recorded failure notice and spent block
+# budget it observed at startup, so a manual re-arm that recovers the watcher
+# leaves no stale failure behind for the next Stop to re-report. The attended
+# alarm is deliberately never retired here: only the hook's owned reset or
+# the guard's healthy path may retire it, so a post-alarm delivery stays
+# suppressed exactly as the tested contract requires. Best-effort: files that
+# vanished or changed since startup are left alone, and the arm itself never
+# fails on this.
+note_arm_success_path() {  # <path> <snapshot-set-0/1> <snapshot-content>
+  local path=$1 had=$2 snap=$3 current
+  [ "$had" -eq 1 ] || return 0
+  [ -e "$path" ] || return 0
+  current=$(cat "$path" 2>/dev/null || true)
+  [ "$current" = "$snap" ] || return 0
+  rm -f "$path" 2>/dev/null || true
+}
+
 note_arm_success() {
-  [ -e "$STATE/.claude-autoarm-failure-notified" ] \
-    || [ -e "$STATE/.claude-autoarm-failure-alarmed" ] \
-    || [ -e "$STATE/.turnend-claude-blocks" ] || return 0
-  fm_failure_episode_reset "$STATE" 2>/dev/null || true
+  note_arm_success_path "$STATE/.claude-autoarm-failure-notified" \
+    "$EPISODE_SNAP_NOTIFIED_SET" "$EPISODE_SNAP_NOTIFIED"
+  note_arm_success_path "$STATE/.turnend-claude-blocks" \
+    "$EPISODE_SNAP_BLOCKS_SET" "$EPISODE_SNAP_BLOCKS"
 }
 
 report_attached() {

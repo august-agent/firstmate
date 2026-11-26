@@ -2649,7 +2649,8 @@ test_manual_rearm_clears_episode_and_next_stop_succeeds() {
   : > "$dir/state/.claude-autoarm-failure-alarmed"
   printf 'session=sess-autoarm\ncount=3\nepoch=9\n' > "$dir/state/.turnend-claude-blocks"
   # A manual re-arm recovers a healthy watcher: the real arm attaches to the
-  # recorded live holder, which retires the whole episode on verification.
+  # recorded live holder, which retires the observed notice and block budget
+  # on verification while preserving the attended alarm for the owned paths.
   cp "$ROOT/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm-real.sh"
   sleep 60 &
   holder=$!
@@ -2661,23 +2662,43 @@ test_manual_rearm_clears_episode_and_next_stop_succeeds() {
   manual=$!
   for i in $(seq 1 100); do grep -q '^watcher: attached' "$dir/manual-arm.out" 2>/dev/null && break; sleep 0.1; done
   grep -q '^watcher: attached' "$dir/manual-arm.out"     || fail "manual re-arm did not attach: $(cat "$dir/manual-arm.out" 2>/dev/null)"
+  for i in $(seq 1 100); do
+    [ -e "$dir/state/.claude-autoarm-failure-notified" ] && sleep 0.1 && continue
+    [ -e "$dir/state/.turnend-claude-blocks" ] && sleep 0.1 && continue
+    break
+  done
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "manual re-arm left the failure notice"
-  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "manual re-arm left the attended alarm"
   assert_absent "$dir/state/.turnend-claude-blocks" "manual re-arm left the spent block budget"
+  assert_present "$dir/state/.claude-autoarm-failure-alarmed" "manual re-arm retired the attended alarm outside the owned paths"
   kill "$holder" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
   wait "$manual"; manual_status=$?
   [ "$manual_status" -eq 1 ] || fail "manual re-arm did not end when its holder died: $manual_status"
   trap fm_test_cleanup EXIT
-  # The next Stop arms cleanly and delivers its new wake with no stale episode.
-  write_arm_fixture "$dir" actionable
+  # The next Stop attaches to the recovered watcher and delivers its new wake;
+  # that owned delivery retires the preserved alarm with the episode. The
+  # recovered-live fixture fails once first so the retry observes the healthy
+  # watcher and records attach recovery: an immediately-actionable first
+  # attempt carries no attach recovery, so the owned reset would not run and
+  # the preserved alarm would still suppress the wake.
+  sleep 60 &
+  holder=$!
+  identity=$(watcher_identity "$dir" "$holder") || fail "could not identify next-stop watcher holder"
+  record_watcher_lock "$dir" "$holder" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  trap 'kill "$holder" 2>/dev/null || true; fm_test_cleanup' EXIT
+  write_arm_fixture "$dir" recovered-live
   out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  trap fm_test_cleanup EXIT
   expect_code 2 "$status" "the next Stop must deliver its wake after a manual recovery"
-  assert_contains "$out" "stale: fixture-win actionable" "the next Stop lost its wake"
+  assert_contains "$out" "signal: recovered watcher wake" "the next Stop lost its wake"
   [ "$(epoch_outcome "$dir")" = rewake ] || fail "the next Stop did not commit rewake, got: $(epoch_outcome "$dir")"
   assert_absent "$dir/state/.claude-autoarm-failure-notified" "the next Stop reopened the retired episode"
-  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "the next Stop reopened the retired alarm"
-  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 3 ] || fail "the next Stop did not arm exactly once more"
+  assert_absent "$dir/state/.claude-autoarm-failure-alarmed" "the next Stop left the preserved alarm"
+  assert_absent "$dir/state/.turnend-claude-blocks" "the next Stop reopened the retired budget"
+  [ "$(wc -l < "$dir/state/arm-ran" | tr -d ' ')" -eq 4 ] || fail "the next Stop did not retry-then-deliver through the recovered watcher"
   pass "auto-arm: manual re-arm retires the failure episode and the next Stop succeeds"
 }
 
@@ -3355,6 +3376,30 @@ test_host_stand_down_is_silent
 test_host_benign_rewake_refusal_opens_no_failure_episode
 test_host_lost_handback_notifies_once_per_episode
 test_host_lost_announced_handback_notifies_once_per_episode
+test_real_arm_wake_preserves_attended_alarm() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/real-arm-alarm")
+  : > "$dir/state/task.meta"
+  cp "$ROOT/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm.sh"
+  cat > "$dir/bin/fm-watch.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'signal: fixture fast wake\n'
+exit 0
+SH
+  chmod +x "$dir/bin/fm-watch.sh"
+  : > "$dir/state/.claude-autoarm-failure-notified"
+  : > "$dir/state/.claude-autoarm-failure-alarmed"
+  printf 'session=sess-autoarm\ncount=3\nepoch=9\n' > "$dir/state/.turnend-claude-blocks"
+  out=$(FM_HOME="$dir" bash "$dir/bin/fm-watch-arm.sh" 2>&1); status=$?
+  expect_code 0 "$status" "a real arm that delivers a wake must succeed"
+  assert_contains "$out" "signal: fixture fast wake" "the real arm lost its wake"
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "a delivered wake left the failure notice"
+  assert_absent "$dir/state/.turnend-claude-blocks" "a delivered wake left the spent block budget"
+  assert_present "$dir/state/.claude-autoarm-failure-alarmed" "a delivered wake retired the attended alarm"
+  pass "auto-arm: a real arm delivery retires the notice but preserves the attended alarm"
+}
+
+test_real_arm_wake_preserves_attended_alarm
 test_manual_rearm_clears_episode_and_next_stop_succeeds
 test_slow_quiet_host_cycles_retry_within_quiet_bound
 test_persistently_quiet_host_fails_after_quiet_bound
