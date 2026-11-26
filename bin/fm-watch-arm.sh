@@ -427,7 +427,10 @@ snapshot_episode_markers() {
     else
       EPISODE_SNAP_BLOCKS=; EPISODE_SNAP_BLOCKS_SET=0
     fi
-    [ -n "${FM_ARM_SNAPSHOT_RACE_PAUSE:-}" ] && sleep "$FM_ARM_SNAPSHOT_RACE_PAUSE"
+    if [ -n "${FM_ARM_SNAPSHOT_RACE_PAUSE:-}" ]; then
+      echo "watcher: snapshot pausing for ${FM_ARM_SNAPSHOT_RACE_PAUSE}s (test seam)"
+      sleep "$FM_ARM_SNAPSHOT_RACE_PAUSE"
+    fi
     after=$(sed -n '1p' "$STATE/.claude-autoarm-epoch" 2>/dev/null || true)
     [ -n "$before" ] || return 1
     if [ "$before" = "$after" ]; then

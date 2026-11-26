@@ -2843,7 +2843,10 @@ test_snapshot_retries_across_concurrent_episode() {
   FM_HOME="$dir" FM_ARM_ATTACH_POLL=0.1 FM_ARM_SUCCESSOR_CONFIRM_TIMEOUT=2 FM_ARM_SNAPSHOT_RACE_PAUSE=3 \
     bash "$dir/bin/fm-watch-arm-real.sh" > "$dir/manual-arm.out" 2>&1 &
   manual=$!
-  sleep 1
+  # Wait until the arm proves it is paused mid-snapshot; only then stage
+  # episode B, so the test cannot pass without exercising the retry.
+  for i in $(seq 1 100); do grep -q 'snapshot pausing' "$dir/manual-arm.out" 2>/dev/null && break; sleep 0.1; done
+  grep -q 'snapshot pausing' "$dir/manual-arm.out" || fail "manual re-arm never reached the snapshot seam"
   # Episode B commits while the arm is paused mid-snapshot: a newer
   # generation with another empty notice and a fresh budget. A torn
   # snapshot would pair episode A's markers with episode B's record and
