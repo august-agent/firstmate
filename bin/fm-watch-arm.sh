@@ -43,7 +43,15 @@
 # stale-beacon or dead-pid holder either self-heals (the fresh child steals the
 # dead lock per the singleton self-eviction/steal path and is confirmed) or this
 # returns the FAILED line. On started it waits the child and propagates the wake
-# reason; on attached it stays live across identity-matched successors.
+# reason; on attached it stays live across identity-matched successors. A
+# verified success - a started or attached watcher with a fresh beacon, or a
+# delivered wake - also retires the failure notice and spent block budget it
+# observed at startup, so a manual re-arm that recovers the watcher leaves no
+# stale failure behind. The attended alarm is never retired here, and markers
+# from a newer episode are left alone: the epoch generation record observed at
+# startup is revalidated inside the writers' owner-then-budget lock hold, so a
+# newer generation - even one carrying another empty notice - keeps its
+# markers, and the removal cannot race a concurrent commit.
 #
 # Confirmation is a liveness backstop, not a fork budget: the arm keeps waiting
 # while its child is alive and unconfirmed up to CONFIRM_TIMEOUT (default the
@@ -384,10 +392,113 @@ healthy_watcher() {
   HEALTHY_IDENTITY=$FM_WATCHER_HEALTHY_IDENTITY
 }
 
+# Snapshot the epoch generation record plus any recorded failure notice and
+# spent block budget at startup, so a verified success only retires the
+# episode it observed: a newer generation rewrites the epoch record when it
+# commits, so any change there - or in the marker contents - means a
+# concurrent generation owns these markers now, and this arm leaves them
+# alone. Contents (not mtimes) are the fence; the epoch record is the episode
+# identity, which also covers back-to-back episodes with identical (empty)
+# marker contents. The snapshot is a seqlock-style consistent read: the epoch
+# record is read before and after the markers, and the whole snapshot repeats
+# while the two epoch reads disagree, so a commit landing mid-snapshot can
+# never pair one episode's markers with another's record. FM_ARM_SNAPSHOT_RACE_PAUSE
+# is a test-only seam that sleeps between the marker reads and the closing
+# epoch read so a regression test can stage a concurrent episode mid-snapshot.
+EPISODE_SNAP_NOTIFIED=; EPISODE_SNAP_NOTIFIED_SET=0
+EPISODE_SNAP_BLOCKS=; EPISODE_SNAP_BLOCKS_SET=0
+EPISODE_SNAP_EPOCH=; EPISODE_SNAP_EPOCH_SET=0
+snapshot_episode_markers() {
+  local before after tries=0
+  EPISODE_SNAP_NOTIFIED=; EPISODE_SNAP_NOTIFIED_SET=0
+  EPISODE_SNAP_BLOCKS=; EPISODE_SNAP_BLOCKS_SET=0
+  EPISODE_SNAP_EPOCH=; EPISODE_SNAP_EPOCH_SET=0
+  while :; do
+    before=$(sed -n '1p' "$STATE/.claude-autoarm-epoch" 2>/dev/null || true)
+    if [ -e "$STATE/.claude-autoarm-failure-notified" ]; then
+      EPISODE_SNAP_NOTIFIED=$(cat "$STATE/.claude-autoarm-failure-notified" 2>/dev/null || true)
+      EPISODE_SNAP_NOTIFIED_SET=1
+    else
+      EPISODE_SNAP_NOTIFIED=; EPISODE_SNAP_NOTIFIED_SET=0
+    fi
+    if [ -e "$STATE/.turnend-claude-blocks" ]; then
+      EPISODE_SNAP_BLOCKS=$(cat "$STATE/.turnend-claude-blocks" 2>/dev/null || true)
+      EPISODE_SNAP_BLOCKS_SET=1
+    else
+      EPISODE_SNAP_BLOCKS=; EPISODE_SNAP_BLOCKS_SET=0
+    fi
+    if [ -n "${FM_ARM_SNAPSHOT_RACE_PAUSE:-}" ]; then
+      echo "watcher: snapshot pausing for ${FM_ARM_SNAPSHOT_RACE_PAUSE}s (test seam)"
+      sleep "$FM_ARM_SNAPSHOT_RACE_PAUSE"
+    fi
+    after=$(sed -n '1p' "$STATE/.claude-autoarm-epoch" 2>/dev/null || true)
+    [ -n "$before" ] || return 1
+    if [ "$before" = "$after" ]; then
+      EPISODE_SNAP_EPOCH=$before; EPISODE_SNAP_EPOCH_SET=1
+      return 0
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -lt 5 ] || return 1
+    sleep 0.05
+  done
+}
+snapshot_episode_markers || true
+
+# A verified success retires the recorded failure notice and spent block
+# budget it observed at startup, so a manual re-arm that recovers the watcher
+# leaves no stale failure behind for the next Stop to re-report. The attended
+# alarm is deliberately never retired here: only the hook's owned reset or
+# the guard's healthy path may retire it, so a post-alarm delivery stays
+# suppressed exactly as the tested contract requires. Best-effort: files that
+# vanished or changed since startup are left alone, and the arm itself never
+# fails on this.
+note_arm_success_path() {  # <path> <snapshot-set-0/1> <snapshot-content>
+  local path=$1 had=$2 snap=$3 current
+  [ "$had" -eq 1 ] || return 0
+  [ -e "$path" ] || return 0
+  current=$(cat "$path" 2>/dev/null || true)
+  [ "$current" = "$snap" ] || return 0
+  rm -f "$path" 2>/dev/null || true
+}
+
+note_arm_success() {
+  local owner_lock budget_lock current_epoch
+  [ "$EPISODE_SNAP_NOTIFIED_SET" -eq 1 ] \
+    || [ "$EPISODE_SNAP_BLOCKS_SET" -eq 1 ] || return 0
+  [ "$EPISODE_SNAP_EPOCH_SET" -eq 1 ] || return 0
+  # Join the writers' locking protocol in owner-then-budget order, the same
+  # order the attended-alarm writers share: a concurrent hook or guard
+  # generation committing (or resetting) an episode holds one of these locks,
+  # and this best-effort reset yields instead of racing it. Never fail the
+  # arm on a lock.
+  owner_lock="$STATE/.claude-autoarm.lock"
+  budget_lock="$STATE/.turnend-claude-blocks.lock"
+  fm_lock_try_acquire "$owner_lock" 2>/dev/null || return 0
+  if ! fm_lock_try_acquire "$budget_lock" 2>/dev/null; then
+    fm_lock_release "$owner_lock" 2>/dev/null || true
+    return 0
+  fi
+  # Still the observed episode? Every generation commits its terminal outcome
+  # through the owner lock, so a rewritten epoch record - a new generation,
+  # even one carrying another empty notice - means these markers are not ours
+  # to retire. Revalidated under the same hold, nothing can interpose between
+  # this comparison and the removal below.
+  current_epoch=$(sed -n '1p' "$STATE/.claude-autoarm-epoch" 2>/dev/null || true)
+  if [ -n "$current_epoch" ] && [ "$current_epoch" = "$EPISODE_SNAP_EPOCH" ]; then
+    note_arm_success_path "$STATE/.claude-autoarm-failure-notified" \
+      "$EPISODE_SNAP_NOTIFIED_SET" "$EPISODE_SNAP_NOTIFIED"
+    note_arm_success_path "$STATE/.turnend-claude-blocks" \
+      "$EPISODE_SNAP_BLOCKS_SET" "$EPISODE_SNAP_BLOCKS"
+  fi
+  fm_lock_release "$budget_lock" 2>/dev/null || true
+  fm_lock_release "$owner_lock" 2>/dev/null || true
+}
+
 report_attached() {
   local age
   age=$(fm_path_age "$BEAT")
   echo "watcher: attached pid=$HEALTHY_PID (beacon ${age}s)"
+  note_arm_success
 }
 
 # Header, "arm ground removed". Sets ARM_GROUND_MISSING to the first missing
@@ -533,6 +644,7 @@ attach_and_wait() {
     fi
     if close_unobserved_cycle; then
       cycle_log_append unknown unknown attached-delivered-wake none
+      note_arm_success
       return 0
     fi
     cycle_log_append unknown unknown attached-cycle-ended none
@@ -713,7 +825,7 @@ if [ "$mode" = take-over ]; then
     take_over_cycle "$HEALTHY_PID" "$HEALTHY_IDENTITY"
     case $? in
       0) TAKEN_OVER=1 ;;
-      3) exit 0 ;;
+      3) note_arm_success; exit 0 ;;
     esac
   fi
 fi
@@ -814,6 +926,7 @@ owned_child_finished() {
   if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
     reason_type=$(watch_output_reason_type "$child_out")
     cycle_log_append "$rc" "$signal" "$reason_type" none
+    note_arm_success
     print_watch_output "$child_out"
     rm -f "$child_out" 2>/dev/null || true
     child=
@@ -844,6 +957,7 @@ owned_child_finished() {
     fi
     if close_unobserved_cycle; then
       cycle_log_append "$rc" "$signal" clean-exit-delivered-wake none
+      note_arm_success
       return 0
     fi
     cycle_log_append "$rc" "$signal" unexpected-clean-exit none
@@ -894,6 +1008,7 @@ while :; do
       else
         echo "watcher: started pid=$child (beacon fresh)"
       fi
+      note_arm_success
       wait "$child"
       rc=$?
       owned_child_finished "$rc"
