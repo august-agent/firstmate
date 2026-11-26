@@ -48,7 +48,10 @@
 # delivered wake - also retires the failure notice and spent block budget it
 # observed at startup, so a manual re-arm that recovers the watcher leaves no
 # stale failure behind. The attended alarm is never retired here, and markers
-# that changed since startup are left alone.
+# from a newer episode are left alone: the epoch generation record observed at
+# startup is revalidated inside the writers' owner-then-budget lock hold, so a
+# newer generation - even one carrying another empty notice - keeps its
+# markers, and the removal cannot race a concurrent commit.
 #
 # Confirmation is a liveness backstop, not a fork budget: the arm keeps waiting
 # while its child is alive and unconfirmed up to CONFIRM_TIMEOUT (default the
@@ -393,9 +396,11 @@ healthy_watcher() {
 # a verified success only retires the episode it observed: markers that
 # appear or change mid-run belong to a newer episode a concurrent generation
 # is handling, and this arm leaves those alone. Contents (not mtimes) are the
-# fence: a new episode rewrites the marker with its own generation's record.
+# fence; the epoch record is the episode identity, which also covers back-to-back
+# episodes with identical (empty) marker contents.
 EPISODE_SNAP_NOTIFIED=; EPISODE_SNAP_NOTIFIED_SET=0
 EPISODE_SNAP_BLOCKS=; EPISODE_SNAP_BLOCKS_SET=0
+EPISODE_SNAP_EPOCH=; EPISODE_SNAP_EPOCH_SET=0
 if [ -e "$STATE/.claude-autoarm-failure-notified" ]; then
   EPISODE_SNAP_NOTIFIED=$(cat "$STATE/.claude-autoarm-failure-notified" 2>/dev/null || true)
   EPISODE_SNAP_NOTIFIED_SET=1
@@ -403,6 +408,10 @@ fi
 if [ -e "$STATE/.turnend-claude-blocks" ]; then
   EPISODE_SNAP_BLOCKS=$(cat "$STATE/.turnend-claude-blocks" 2>/dev/null || true)
   EPISODE_SNAP_BLOCKS_SET=1
+fi
+if [ -e "$STATE/.claude-autoarm-epoch" ]; then
+  EPISODE_SNAP_EPOCH=$(sed -n '1p' "$STATE/.claude-autoarm-epoch" 2>/dev/null || true)
+  [ -n "$EPISODE_SNAP_EPOCH" ] && EPISODE_SNAP_EPOCH_SET=1
 fi
 
 # A verified success retires the recorded failure notice and spent block
@@ -423,10 +432,36 @@ note_arm_success_path() {  # <path> <snapshot-set-0/1> <snapshot-content>
 }
 
 note_arm_success() {
-  note_arm_success_path "$STATE/.claude-autoarm-failure-notified" \
-    "$EPISODE_SNAP_NOTIFIED_SET" "$EPISODE_SNAP_NOTIFIED"
-  note_arm_success_path "$STATE/.turnend-claude-blocks" \
-    "$EPISODE_SNAP_BLOCKS_SET" "$EPISODE_SNAP_BLOCKS"
+  local owner_lock budget_lock current_epoch
+  [ "$EPISODE_SNAP_NOTIFIED_SET" -eq 1 ] \
+    || [ "$EPISODE_SNAP_BLOCKS_SET" -eq 1 ] || return 0
+  [ "$EPISODE_SNAP_EPOCH_SET" -eq 1 ] || return 0
+  # Join the writers' locking protocol in owner-then-budget order, the same
+  # order the attended-alarm writers share: a concurrent hook or guard
+  # generation committing (or resetting) an episode holds one of these locks,
+  # and this best-effort reset yields instead of racing it. Never fail the
+  # arm on a lock.
+  owner_lock="$STATE/.claude-autoarm.lock"
+  budget_lock="$STATE/.turnend-claude-blocks.lock"
+  fm_lock_try_acquire "$owner_lock" 2>/dev/null || return 0
+  if ! fm_lock_try_acquire "$budget_lock" 2>/dev/null; then
+    fm_lock_release "$owner_lock" 2>/dev/null || true
+    return 0
+  fi
+  # Still the observed episode? Every generation commits its terminal outcome
+  # through the owner lock, so a rewritten epoch record - a new generation,
+  # even one carrying another empty notice - means these markers are not ours
+  # to retire. Revalidated under the same hold, nothing can interpose between
+  # this comparison and the removal below.
+  current_epoch=$(sed -n '1p' "$STATE/.claude-autoarm-epoch" 2>/dev/null || true)
+  if [ -n "$current_epoch" ] && [ "$current_epoch" = "$EPISODE_SNAP_EPOCH" ]; then
+    note_arm_success_path "$STATE/.claude-autoarm-failure-notified" \
+      "$EPISODE_SNAP_NOTIFIED_SET" "$EPISODE_SNAP_NOTIFIED"
+    note_arm_success_path "$STATE/.turnend-claude-blocks" \
+      "$EPISODE_SNAP_BLOCKS_SET" "$EPISODE_SNAP_BLOCKS"
+  fi
+  fm_lock_release "$budget_lock" 2>/dev/null || true
+  fm_lock_release "$owner_lock" 2>/dev/null || true
 }
 
 report_attached() {

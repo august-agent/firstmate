@@ -2702,6 +2702,126 @@ test_manual_rearm_clears_episode_and_next_stop_succeeds() {
   pass "auto-arm: manual re-arm retires the failure episode and the next Stop succeeds"
 }
 
+test_delayed_arm_success_preserves_newer_episode() {
+  local dir out status holder successor identity manual manual_status gen i
+  dir=$(make_primary_dir "$TMP_ROOT/delayed-arm-newer-episode")
+  : > "$dir/state/task.meta"
+  # Episode A: the hook fails, committing the epoch record and an empty notice.
+  write_arm_fixture "$dir" failed
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the failing arm must open episode A"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "episode A recorded no failure notice"
+  printf 'session=sess-autoarm\ncount=3\nepoch=9\n' > "$dir/state/.turnend-claude-blocks"
+  # A manual re-arm attaches to a live holder and retires episode A.
+  cp "$ROOT/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm-real.sh"
+  sleep 60 &
+  holder=$!
+  trap 'kill "$holder" ${successor:+"$successor"} ${manual:+"$manual"} 2>/dev/null || true; fm_test_cleanup' EXIT
+  identity=$(watcher_identity "$dir" "$holder") || fail "could not identify episode-A watcher holder"
+  record_watcher_lock "$dir" "$holder" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  FM_HOME="$dir" FM_ARM_ATTACH_POLL=0.1 FM_ARM_SUCCESSOR_CONFIRM_TIMEOUT=2 bash "$dir/bin/fm-watch-arm-real.sh" > "$dir/manual-arm.out" 2>&1 &
+  manual=$!
+  for i in $(seq 1 100); do grep -q '^watcher: attached' "$dir/manual-arm.out" 2>/dev/null && break; sleep 0.1; done
+  grep -q '^watcher: attached' "$dir/manual-arm.out" || fail "manual re-arm did not attach to the episode-A holder"
+  for i in $(seq 1 100); do
+    [ -e "$dir/state/.claude-autoarm-failure-notified" ] && sleep 0.1 && continue
+    [ -e "$dir/state/.turnend-claude-blocks" ] && sleep 0.1 && continue
+    break
+  done
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "manual re-arm left the episode-A notice"
+  assert_absent "$dir/state/.turnend-claude-blocks" "manual re-arm left the episode-A budget"
+  # Episode B commits while the arm is still pending: a newer generation with
+  # another empty notice and a fresh budget. The epoch record is the identity
+  # that tells the two empty notices apart.
+  gen=$(epoch_field "$dir" epoch) || fail "could not read the episode-A generation"
+  case "$gen" in ''|*[!0-9]*) fail "episode A has no numeric generation: $gen" ;; esac
+  if ! sed "1s/^epoch=$gen /epoch=$((gen + 1)) /" "$dir/state/.claude-autoarm-epoch" > "$dir/state/.claude-autoarm-epoch.tmp" \
+    || ! mv "$dir/state/.claude-autoarm-epoch.tmp" "$dir/state/.claude-autoarm-epoch"; then
+    fail "could not commit the episode-B generation"
+  fi
+  : > "$dir/state/.claude-autoarm-failure-notified"
+  printf 'session=sess-autoarm\ncount=4\nepoch=%s\n' "$((gen + 1))" > "$dir/state/.turnend-claude-blocks"
+  # A successor holder releases the delayed success: the arm attaches again,
+  # but episode B is newer, so every marker must survive.
+  sleep 60 &
+  successor=$!
+  identity=$(watcher_identity "$dir" "$successor") || fail "could not identify the successor holder"
+  record_watcher_lock "$dir" "$successor" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  for i in $(seq 1 100); do [ "$(grep -c '^watcher: attached' "$dir/manual-arm.out" 2>/dev/null)" -ge 2 ] && break; sleep 0.1; done
+  [ "$(grep -c '^watcher: attached' "$dir/manual-arm.out" 2>/dev/null)" -ge 2 ] || fail "manual re-arm never attached to the successor"
+  sleep 1
+  kill "$successor" 2>/dev/null || true
+  wait "$successor" 2>/dev/null || true
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  wait "$manual"; manual_status=$?
+  [ "$manual_status" -eq 1 ] || fail "manual re-arm did not end when its holders died: $manual_status"
+  trap fm_test_cleanup EXIT
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "the delayed success erased the episode-B notice"
+  assert_present "$dir/state/.turnend-claude-blocks" "the delayed success erased the episode-B budget"
+  [ "$(epoch_field "$dir" epoch)" = "$((gen + 1))" ] || fail "the episode-B generation moved under the test"
+  pass "auto-arm: a delayed success preserves a newer episode's markers"
+}
+
+test_arm_success_yields_to_episode_writer_lock() {
+  local dir out status holder successor identity manual manual_status i
+  dir=$(make_primary_dir "$TMP_ROOT/arm-writer-lock")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" failed
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the failing arm must open a failure episode"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "the failing arm recorded no failure episode"
+  : > "$dir/state/.claude-autoarm-failure-alarmed"
+  printf 'session=sess-autoarm\ncount=3\nepoch=9\n' > "$dir/state/.turnend-claude-blocks"
+  # A writer-equivalent holds the owner lock across the arm's success window,
+  # the way a committing hook generation does.
+  mkdir "$dir/state/.claude-autoarm.lock" || fail "could not take the owner lock for the test"
+  printf '%s\n' "$$" > "$dir/state/.claude-autoarm.lock/pid"
+  cp "$ROOT/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm-real.sh"
+  sleep 60 &
+  holder=$!
+  trap 'kill "$holder" ${successor:+"$successor"} ${manual:+"$manual"} 2>/dev/null || true; rm -rf "$dir/state/.claude-autoarm.lock"; fm_test_cleanup' EXIT
+  identity=$(watcher_identity "$dir" "$holder") || fail "could not identify the writer-lock watcher holder"
+  record_watcher_lock "$dir" "$holder" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  FM_HOME="$dir" FM_ARM_ATTACH_POLL=0.1 FM_ARM_SUCCESSOR_CONFIRM_TIMEOUT=2 bash "$dir/bin/fm-watch-arm-real.sh" > "$dir/manual-arm.out" 2>&1 &
+  manual=$!
+  for i in $(seq 1 100); do grep -q '^watcher: attached' "$dir/manual-arm.out" 2>/dev/null && break; sleep 0.1; done
+  grep -q '^watcher: attached' "$dir/manual-arm.out" || fail "manual re-arm did not attach"
+  # The attach line prints before the reset attempt runs; by now that attempt
+  # has yielded to the held lock, so both markers must still be present.
+  sleep 2
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "the arm retired the notice under a writer's lock"
+  assert_present "$dir/state/.turnend-claude-blocks" "the arm retired the budget under a writer's lock"
+  # The writer finishes; a successor releases the next success, which retires
+  # the observed episode now that the locks are free and the epoch matches.
+  rm -rf "$dir/state/.claude-autoarm.lock"
+  sleep 60 &
+  successor=$!
+  identity=$(watcher_identity "$dir" "$successor") || fail "could not identify the successor holder"
+  record_watcher_lock "$dir" "$successor" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  for i in $(seq 1 100); do [ "$(grep -c '^watcher: attached' "$dir/manual-arm.out" 2>/dev/null)" -ge 2 ] && break; sleep 0.1; done
+  for i in $(seq 1 100); do
+    [ -e "$dir/state/.claude-autoarm-failure-notified" ] && sleep 0.1 && continue
+    [ -e "$dir/state/.turnend-claude-blocks" ] && sleep 0.1 && continue
+    break
+  done
+  assert_absent "$dir/state/.claude-autoarm-failure-notified" "the released success left the failure notice"
+  assert_absent "$dir/state/.turnend-claude-blocks" "the released success left the spent block budget"
+  assert_present "$dir/state/.claude-autoarm-failure-alarmed" "the released success retired the attended alarm"
+  kill "$successor" 2>/dev/null || true
+  wait "$successor" 2>/dev/null || true
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  wait "$manual"; manual_status=$?
+  [ "$manual_status" -eq 1 ] || fail "manual re-arm did not end when its holders died: $manual_status"
+  trap fm_test_cleanup EXIT
+  pass "auto-arm: a verified success yields to a writer's lock and retires the episode once it is free"
+}
+
 test_slow_quiet_host_cycles_retry_within_quiet_bound() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/host-slow-quiet")
@@ -3380,6 +3500,12 @@ test_real_arm_wake_preserves_attended_alarm() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/real-arm-alarm")
   : > "$dir/state/task.meta"
+  # A genuine recorded episode: the hook fails, committing the epoch
+  # generation record and an empty failure notice for the arm to observe.
+  write_arm_fixture "$dir" failed
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the failing arm must open a failure episode"
+  assert_present "$dir/state/.claude-autoarm-failure-notified" "the failing arm recorded no failure episode"
   cp "$ROOT/bin/fm-watch-arm.sh" "$dir/bin/fm-watch-arm.sh"
   cat > "$dir/bin/fm-watch.sh" <<'SH'
 #!/usr/bin/env bash
@@ -3401,6 +3527,8 @@ SH
 
 test_real_arm_wake_preserves_attended_alarm
 test_manual_rearm_clears_episode_and_next_stop_succeeds
+test_delayed_arm_success_preserves_newer_episode
+test_arm_success_yields_to_episode_writer_lock
 test_slow_quiet_host_cycles_retry_within_quiet_bound
 test_persistently_quiet_host_fails_after_quiet_bound
 test_host_crash_is_retried_then_reported
