@@ -44,6 +44,8 @@
 #   INERT - not a genuine primary home (a crewmate/scout task worktree or a
 #           non-firstmate repo): exit 0 with no output, exactly like ALLOW.
 #   ESCAPE - FM_ALLOW_SUBAGENT=1 in the environment allows deliberately.
+#   NAMED ESCAPE - FM_ALLOW_SUBAGENT_TOOLS in the environment, a comma- or
+#          space-separated list of exact tool names, allows only those tools.
 #   FAIL OPEN - malformed or empty stdin, or missing jq for stdin transport.
 #
 # Claude requires stdout to remain empty on deny.
@@ -175,6 +177,15 @@ done
 # makes a genuinely intended use possible and an accidental one impossible: no
 # in-session tool call can set it for the call that follows.
 [ "${FM_ALLOW_SUBAGENT:-}" != "1" ] || exit 0
+
+# The narrow form of the same hatch: exact tool names only, compared after the
+# same normalisation as the classifier, so it can never widen to a stem or to a
+# tool the operator did not name. Like the variable above it is read from the
+# launch environment, so no in-session call can grant it.
+for named in $(printf '%s' "${FM_ALLOW_SUBAGENT_TOOLS:-}" | tr ',' ' '); do
+  LC_ALL=C named=$(printf '%s' "$named" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+  [ -z "$named" ] || [ "$NORMALIZED" != "$named" ] || exit 0
+done
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
 FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P)} || exit 0

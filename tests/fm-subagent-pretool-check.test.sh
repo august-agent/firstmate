@@ -179,6 +179,23 @@ test_escape_hatch_allows_deliberate_use() {
   pass "the single documented escape hatch releases the guard only on the exact opt-in value"
 }
 
+test_named_escape_releases_only_named_tools() {
+  local rc tool
+  expect_allow "named escape exact" RemoteTrigger FM_ALLOW_SUBAGENT_TOOLS=RemoteTrigger
+  expect_allow "named escape case and list" RemoteTrigger "FM_ALLOW_SUBAGENT_TOOLS=Agent, remotetrigger"
+  for tool in Agent Workflow CronCreate SendMessage; do
+    rc=0
+    run_tool "$tool" FM_ALLOW_SUBAGENT_TOOLS=RemoteTrigger || rc=$?
+    [ "$rc" -eq 2 ] || fail "FM_ALLOW_SUBAGENT_TOOLS=RemoteTrigger must still deny $tool, got exit $rc"
+  done
+  for value in remote trigger 'remote*' '' ','; do
+    rc=0
+    run_tool RemoteTrigger "FM_ALLOW_SUBAGENT_TOOLS=$value" || rc=$?
+    [ "$rc" -eq 2 ] || fail "FM_ALLOW_SUBAGENT_TOOLS='$value' must not release RemoteTrigger, got exit $rc"
+  done
+  pass "the named escape releases exactly the named tools and never a stem or partial name"
+}
+
 test_task_worktree_and_non_firstmate_repo_are_inert() {
   local child="$TMP_ROOT/child" plain="$TMP_ROOT/plain" rc=0
   git -C "$PRIMARY" config user.name fixture
@@ -284,6 +301,7 @@ test_plan_only_exclusion_is_exact_name
 test_guard_never_classifies_mcp_tools
 test_deny_message_defers_to_intake_classification
 test_escape_hatch_allows_deliberate_use
+test_named_escape_releases_only_named_tools
 test_task_worktree_and_non_firstmate_repo_are_inert
 test_secondmate_home_is_in_scope
 test_stdin_transports_and_output_shapes

@@ -151,7 +151,10 @@ The hook scope is the shipped enforcement boundary, and the linked-worktree nega
 ## Escape hatch
 
 `FM_ALLOW_SUBAGENT=1` in the session environment allows the call at the shipped hook.
-This is the only escape hatch and the guard fails closed on every other value, including empty, `0`, `yes`, and `true`.
+The guard fails closed on every other value, including empty, `0`, `yes`, and `true`.
+
+`FM_ALLOW_SUBAGENT_TOOLS` is the narrow form: a comma- or space-separated list of exact tool names, such as `RemoteTrigger`, released at the hook while every other delegation tool stays denied.
+Names are compared after the classifier's own normalisation and must match a whole tool name, so an entry can never widen to a stem or release a tool the operator did not name.
 
 It is an environment variable rather than a flag, a config file, or a state file because that makes it unforgeable in-session.
 The variable must be present when the harness process is launched, so no tool call the agent makes can enable it for the call that follows.
@@ -363,7 +366,7 @@ The live consequence is confirmed by the shipped-guard result above: Claude hono
 ## Automated validation
 
 `tests/fm-subagent-pretool-check.test.sh` owns the acceptance matrix and is registered in the `pure-contract-unit` family in `bin/fm-test-run.sh`.
-It covers the tracked Claude settings boundary that forbids a `permissions` key; the match-all Claude hook registration; denial of every work-creating delegation tool by shape; denial of twelve hypothetical future tool names that appear on no list; the observe-or-stop, plan-only, and MCP exclusions; the exactness of the plan-only exclusion against six near-miss names a substring or shorter-stem widening would release; the scout-present and scout-absent message variants; the escape hatch including its fail-closed values; inertness in a linked task worktree and in a non-firstmate repo; in-scope enforcement for a marked secondmate home; both stdin transports; the empty-stdout requirement; fail-open transport behavior; and the preserved `Bash` seatbelts and `Stop` guard.
+It covers the tracked Claude settings boundary that forbids a `permissions` key; the match-all Claude hook registration; denial of every work-creating delegation tool by shape; denial of twelve hypothetical future tool names that appear on no list; the observe-or-stop, plan-only, and MCP exclusions; the exactness of the plan-only exclusion against six near-miss names a substring or shorter-stem widening would release; the scout-present and scout-absent message variants; the escape hatch including its fail-closed values; the named-tool escape releasing exactly the named tools; inertness in a linked task worktree and in a non-firstmate repo; in-scope enforcement for a marked secondmate home; both stdin transports; the empty-stdout requirement; fail-open transport behavior; and the preserved `Bash` seatbelts and `Stop` guard.
 
 Run:
 
