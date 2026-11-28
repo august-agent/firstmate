@@ -182,7 +182,14 @@ done
 # same normalisation as the classifier, so it can never widen to a stem or to a
 # tool the operator did not name. Like the variable above it is read from the
 # launch environment, so no in-session call can grant it.
-for named in $(printf '%s' "${FM_ALLOW_SUBAGENT_TOOLS:-}" | tr ',' ' '); do
+# The list is split with read, not an unquoted expansion, so no entry can glob
+# against the working directory, and an entry holding anything but a tool-name
+# character is skipped whole rather than normalised into some other name.
+IFS=', ' read -r -a FM_NAMED_TOOLS <<< "${FM_ALLOW_SUBAGENT_TOOLS:-}" || true
+for named in "${FM_NAMED_TOOLS[@]+"${FM_NAMED_TOOLS[@]}"}"; do
+  case "$named" in
+    ''|*[!A-Za-z0-9_.-]*) continue ;;
+  esac
   LC_ALL=C named=$(printf '%s' "$named" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
   [ -z "$named" ] || [ "$NORMALIZED" != "$named" ] || exit 0
 done

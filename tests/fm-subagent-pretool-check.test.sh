@@ -193,7 +193,17 @@ test_named_escape_releases_only_named_tools() {
     run_tool RemoteTrigger "FM_ALLOW_SUBAGENT_TOOLS=$value" || rc=$?
     [ "$rc" -eq 2 ] || fail "FM_ALLOW_SUBAGENT_TOOLS='$value' must not release RemoteTrigger, got exit $rc"
   done
-  pass "the named escape releases exactly the named tools and never a stem or partial name"
+  for value in 'Remote*Trigger' 'Remote?rigger' '[R]emoteTrigger'; do
+    rc=0
+    run_tool RemoteTrigger "FM_ALLOW_SUBAGENT_TOOLS=$value" || rc=$?
+    [ "$rc" -eq 2 ] || fail "wildcard entry '$value' must not release RemoteTrigger, got exit $rc"
+  done
+  : > "$TMP_ROOT/RemoteTrigger"
+  rc=0
+  (cd "$TMP_ROOT" && run_tool RemoteTrigger 'FM_ALLOW_SUBAGENT_TOOLS=Remote*') || rc=$?
+  rm -f "$TMP_ROOT/RemoteTrigger"
+  [ "$rc" -eq 2 ] || fail "a glob entry must not expand against a matching file in the working directory, got exit $rc"
+  pass "the named escape releases exactly the named tools and never a stem, partial name or glob"
 }
 
 test_task_worktree_and_non_firstmate_repo_are_inert() {
